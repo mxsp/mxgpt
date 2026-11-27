@@ -131,6 +131,14 @@
       <span class="kbd">Ctrl+N</span>
     </button>
 
+    <div class="sb-projects">
+      <div class="sb-proj-head">
+        <span class="sb-label" style="padding:0">Projects</span>
+        <button class="sb-proj-add" id="addProjectBtn" title="Add a local project folder with auto Knowledge Graph &amp; workspace settings">+ Add</button>
+      </div>
+      <div class="projects-list" id="projectsList"></div>
+    </div>
+
     <div class="sb-search">
       <svg><use href="#i-search"/></svg>
       <input id="chatSearch" type="search" placeholder="Search chats" autocomplete="off" />
@@ -165,10 +173,12 @@
       <div class="top-title">
         <span id="chatTitle">New chat</span>
         <span class="model-pill" id="topModel">Copilot</span>
-        <button class="persona-pill" id="wsTopPill" title="Current OS folder — click to open OS Files &amp; Editor">
+        <button class="persona-pill" id="wsTopPill" title="Active project / OS folder — click to browse OS files">
           <svg><use href="#i-folder"/></svg>
           <span id="wsTopLabel">Documents</span>
         </button>
+        <button class="auto-edit-pill" id="autoAcceptTopPill" title="Toggle Auto-Accept File Edits for this project (every edit stays undoable)">Auto-Edit: Off</button>
+        <span class="mapping-pill" id="graphMappingPill" hidden><span class="mini-spin"></span><span id="graphMappingTxt">Mapping…</span></span>
       </div>
       <div class="top-actions">
         <button class="ghost-btn" data-panel="files" title="Navigate OS folders, find &amp; edit local files"><svg><use href="#i-folder"/></svg><span>Files</span></button>
@@ -320,8 +330,13 @@
       <section class="pane" data-pane="graph" id="graphPane">
         <div class="graph-toolbar">
           <div class="row-gap">
-            <button class="btn tiny primary" id="graphBuildBtn"><svg><use href="#i-refresh"/></svg>Map Project</button>
-            <button class="btn tiny" id="graphAiSummaryBtn"><svg><use href="#i-spark"/></svg>AI Map</button>
+            <button class="btn tiny primary" id="graphBuildBtn" title="Scan workspace &amp; map semantics with Fast model"><svg><use href="#i-spark"/></svg>Map (Fast)</button>
+            <div class="graph-layout-seg" id="graphLayoutSeg" title="Switch graph layout">
+              <button type="button" data-layout="force" class="on">Force</button>
+              <button type="button" data-layout="radial">Radial</button>
+              <button type="button" data-layout="hierarchy">Tree</button>
+            </div>
+            <button class="btn tiny" id="graphTreeEdgesBtn" title="Toggle folder containment edges">Folders: On</button>
             <button class="btn tiny" id="graphFitBtn" title="Fit graph to view">Fit</button>
             <button class="btn tiny" id="graphExpandBtn" title="Toggle fullscreen knowledge graph"><svg><use href="#i-expand"/></svg>Expand</button>
           </div>
@@ -331,7 +346,7 @@
           </div>
         </div>
         <div class="files-search">
-          <input type="text" id="graphSearchInput" placeholder="Spotlight files, folders, symbols…" />
+          <input type="text" id="graphSearchInput" placeholder="Spotlight files, folders, AI roles, symbols…" />
         </div>
         <div class="graph-filters" id="graphFilters">
           <button type="button" class="gf-chip on" data-kind="code"><i style="background:#c96442"></i>Code</button>
@@ -342,12 +357,16 @@
           <button type="button" class="gf-chip on" data-kind="folder"><i style="background:#85786c"></i>Folders</button>
           <button type="button" class="gf-chip on" data-kind="package"><i style="background:#5b67ca"></i>Packages</button>
         </div>
-        <div class="graph-stats" id="graphStats">Click "Map Project" to analyze your workspace…</div>
-        <div class="graph-ai-box prose" id="graphAiBox" hidden></div>
+        <div class="graph-clusters-bar" id="graphClustersBar" hidden></div>
+        <div class="graph-stats" id="graphStats">Click "Map (Fast)" to scan &amp; map your project with the Fast model…</div>
+        <div class="graph-ai-box" id="graphAiBox" hidden></div>
         <div class="graph-stage" id="graphStage">
           <canvas id="graphCanvas"></canvas>
           <div class="graph-legend">
-            <span>Drag nodes · Scroll to zoom · Double-click file to edit</span>
+            <span><i style="background:#c96442"></i>Imports</span>
+            <span><i style="background:#059669"></i>Imported by</span>
+            <span><i style="background:#7c3aed"></i>Fast AI Link</span>
+            <span>· Drag · Scroll · Dbl-click to edit</span>
           </div>
         </div>
         <div class="graph-inspector" id="graphInspector" hidden>
@@ -355,6 +374,7 @@
             <div>
               <b id="giTitle">file.js</b>
               <small id="giPath"></small>
+              <div class="gi-role" id="giRole" hidden></div>
             </div>
             <div class="row-gap">
               <button class="btn tiny primary" id="giEditBtn">Edit</button>
@@ -717,6 +737,92 @@
       <button class="btn" id="updOpenGithubBtn">GitHub Releases ↗</button>
       <button class="btn" id="updCheckBtn">Check Again</button>
       <button class="btn primary" id="updInstallBtn" disabled>Install &amp; Restart</button>
+    </div>
+  </div>
+</div>
+
+<!-- Project Create / Workspace Settings Modal -->
+<div class="modal-backdrop" id="projectModal" hidden>
+  <div class="modal">
+    <div class="modal-head">
+      <div>
+        <h2 id="projModalTitle">New Project</h2>
+        <p class="sub">Bind a local OS folder with automatic Fast-model Knowledge Graph mapping &amp; per-project workspace rules.</p>
+      </div>
+      <button class="icon-btn" id="closeProjectModalBtn"><svg><use href="#i-x"/></svg></button>
+    </div>
+    <div class="modal-body">
+      <div class="field-row">
+        <label class="field">
+          <span>Project Name</span>
+          <input type="text" id="projNameInput" placeholder="e.g. my-backend-app" />
+        </label>
+        <label class="field" style="flex:0.35">
+          <span>Badge Color</span>
+          <select id="projColorInput">
+            <option value="#c96442">Terracotta</option>
+            <option value="#2f855a">Sage Green</option>
+            <option value="#5b67ca">Indigo</option>
+            <option value="#c07b18">Amber</option>
+            <option value="#0d9488">Teal</option>
+            <option value="#b85c7e">Rose</option>
+          </select>
+        </label>
+      </div>
+      <div class="field">
+        <span>Local OS Folder Path</span>
+        <div class="row-gap">
+          <input type="text" id="projPathInput" style="flex:1" placeholder="/home/user/projects/app or C:\Users\...\app" />
+          <button type="button" class="btn" id="projBrowsePathBtn">Browse…</button>
+        </div>
+      </div>
+
+      <div class="tool-settings-grid">
+        <label class="tool-setting-card">
+          <input type="checkbox" id="projAutoMapChk" checked />
+          <div><b>Auto-Map Knowledge Graph</b><small>Automatically scan &amp; map semantics with the Fast model when opened or edited.</small></div>
+        </label>
+        <label class="tool-setting-card">
+          <input type="checkbox" id="projAutoAcceptChk" />
+          <div><b>Auto-Accept File Edits</b><small>Apply Copilot file edits automatically (every edit still records a 1-click Undo snapshot).</small></div>
+        </label>
+      </div>
+
+      <label class="check-field">
+        <input type="checkbox" id="projAutoContainerChk" />
+        <span>Auto-run Copilot container code executions for this project</span>
+      </label>
+
+      <div class="field-row">
+        <label class="field">
+          <span>Project Container Image</span>
+          <input type="text" id="projContainerImgInput" placeholder="python:3.12-slim" />
+        </label>
+        <label class="field" style="flex:0.75">
+          <span>Network</span>
+          <select id="projContainerNetInput">
+            <option value="none">Isolated (none)</option>
+            <option value="bridge">Bridge (online)</option>
+          </select>
+        </label>
+        <label class="field" style="flex:0.65">
+          <span>Mount</span>
+          <select id="projContainerMountInput">
+            <option value="rw">/workspace:rw</option>
+            <option value="ro">/workspace:ro</option>
+          </select>
+        </label>
+      </div>
+
+      <label class="field">
+        <span>Project Instructions (injected into Copilot for this project)</span>
+        <textarea id="projInstrInput" rows="3" placeholder="e.g. Prefer TypeScript strict types, keep tests passing, follow existing conventions…"></textarea>
+      </label>
+    </div>
+    <div class="modal-foot">
+      <button class="btn danger" id="deleteProjectBtn" style="margin-right:auto" hidden>Remove Project</button>
+      <button class="btn" id="cancelProjectBtn">Cancel</button>
+      <button class="btn primary" id="saveProjectBtn">Save &amp; Open Project</button>
     </div>
   </div>
 </div>

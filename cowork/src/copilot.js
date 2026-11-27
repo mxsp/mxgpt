@@ -416,8 +416,31 @@ async function runCoworkTurn({
 }) {
   const cfg = storage.getSettings();
   const toolsCfg = resolveEnabledTools(cfg, toolOverrides);
-  const workspace = localFiles.getWorkspace();
+  const activeProject = storage.getActiveProject();
+  const workspace = activeProject?.path || localFiles.getWorkspace();
   const today = new Date().toISOString().slice(0, 10);
+
+  // Pull compact cached project Knowledge Graph & custom project instructions
+  let projectContextBlock = '';
+  if (activeProject) {
+    const pParts = [`Active Project: "${activeProject.name}" (${activeProject.path})`];
+    if (activeProject.instructions) pParts.push(`Project Instructions:\n${activeProject.instructions}`);
+    if (toolsCfg.knowledgeGraph) {
+      const cachedGraph = storage.getProjectGraphCache(activeProject.id);
+      if (cachedGraph) {
+        const gLines = [];
+        if (cachedGraph.aiSummary) gLines.push(`Summary: ${cachedGraph.aiSummary}`);
+        if (cachedGraph.aiClusters?.length) {
+          gLines.push('Clusters: ' + cachedGraph.aiClusters.map((c) => `${c.name} (${c.description})`).join(' | '));
+        }
+        if (cachedGraph.topHubs?.length) {
+          gLines.push('Core Hubs: ' + cachedGraph.topHubs.slice(0, 8).map((h) => h.path).join(', '));
+        }
+        if (gLines.length) pParts.push(`Cached Project Knowledge Graph:\n${gLines.join('\n')}`);
+      }
+    }
+    projectContextBlock = pParts.join('\n');
+  }
 
   const fileActionsHint = toolsCfg.osFiles
     ? `If proposing local OS file edits/creates/moves/renames/deletes, include a \`\`\`file-actions JSON array: [{"type":"mkdir"|"write"|"move"|"rename"|"copy"|"delete","path":"...","from":"...","to":"...","content":"...","reason":"..."}].`
@@ -446,6 +469,7 @@ async function runCoworkTurn({
 
     const sys = [
       `You are mx-Cowork, a local desktop AI copilot. Today: ${today}. Workspace: ${workspace}.`,
+      projectContextBlock,
       `Be crisp, structured, and actionable. Use Markdown.`,
       fileActionsHint,
       codeRunHint,
@@ -625,6 +649,7 @@ Rules:
 
   const synthSys = [
     `You are mx-Cowork's ${orchestratorLabel} Orchestrator. Today: ${today}. Workspace: ${workspace}.`,
+    projectContextBlock,
     `Your local tools and fast worker models retrieved the evidence below. Synthesize a crisp, deeply helpful, accurate response using Markdown.`,
     `Cite web sources as Markdown links and reference local files by relative path.`,
     fileActionsHint,

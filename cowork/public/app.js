@@ -40,7 +40,11 @@ const S = {
   graphView: null,
   graphData: null,
   graphExpanded: false,
+  graphTreeEdges: true,
   graphFilters: new Set(['code', 'doc', 'config', 'test', 'style', 'data', 'file', 'folder', 'package']),
+  projects: [],
+  activeProject: null,
+  editingProjectId: null,
 };
 
 function esc(s) {
@@ -336,17 +340,20 @@ async function checkConnectionQuiet() {
 // ---- Boot
 async function boot() {
   if (!CW) throw new Error('Native Electron preload bridge unavailable');
-  const [info, data, prov] = await Promise.all([
+  const [info, data, prov, projData] = await Promise.all([
     CW.appInfo(),
     CW.getSettings(),
     CW.getProviderPresets(),
+    CW.listProjects(),
   ]);
   S.appInfo = info;
   S.settings = data.settings;
   S.providerPresets = prov?.presets || [];
   S.quickFolders = data.quickFolders || [];
+  S.projects = projData?.projects || [];
+  S.activeProject = projData?.activeProject || null;
 
-  $('#appVersionBadge').textContent = `v${info.version || '1.3.0'}`;
+  $('#appVersionBadge').textContent = `v${info.version || '1.4.0'}`;
   applyThemeUI(S.settings.theme || 'light');
   setMode(S.settings.defaultMode || 'copilot');
   setThink(S.settings.think || 'low');
@@ -360,7 +367,9 @@ async function boot() {
   $('#ctNet').value = S.settings.containerNetwork || 'none';
   $('#ctMount').value = S.settings.containerMountMode || 'rw';
   renderAccountUI();
+  renderProjectsList();
   renderWorkspaceUI();
+  renderAutoAcceptPill();
 
   if (shouldShowLogin()) {
     showLoginScreen();
@@ -373,6 +382,26 @@ async function boot() {
 
   CW.onUpdateProgress((p) => renderUpdateProgress(p));
   CW.onContainerOutput((ev) => handleContainerOutputChunk(ev));
+  CW.onGraphProgress((p) => {
+    const pill = $('#graphMappingPill');
+    const txt = $('#graphMappingTxt');
+    if (p.phase === 'done') {
+      pill.hidden = true;
+    } else {
+      pill.hidden = false;
+      txt.textContent = p.message || 'Mapping graph…';
+    }
+  });
+
+  // If an active project has Auto-Map enabled and no recent graph, map quietly with Fast model
+  if (S.activeProject?.autoMapGraph && !shouldShowLogin()) {
+    const cached = await CW.getCachedGraph(S.activeProject.id).catch(() => ({ graph: null }));
+    if (cached?.graph) {
+      S.graphData = cached.graph;
+    } else {
+      triggerBackgroundGraphMap(S.activeProject);
+    }
+  }
   CW.onMenuAction(({ action, payload }) => {
     if (action === 'new-task') newChat();
     else if (action === 'pick-folder') pickWorkspaceFolder();
@@ -413,12 +442,124 @@ async function boot() {
   });
 }
 
+// ---- First-Class Projects & Per-Project Workspace Controls
+function renderAutoAcceptPill() {
+  const on = S.activeProject
+    ? Boolean(S.activeProject.autoAcceptEdits)
+    : Boolean(S.settings?.autoApproveFileActions);
+  const pill = $('#autoAcceptTopPill');
+  pill.classList.toggle('on', on);
+  pill.textContent = on ? 'Auto-Edit: ON' : 'Auto-Edit: Off';
+}
+
+function renderProjectsList() {
+  const list = $('#projectsList');
+  list.innerHTML = '';
+  if (!S.projects.length) {
+    list.innerHTML = '<div class="proj-empty">Click <b>+ Add</b> to create a project with auto Knowledge Graph &amp; workspace rules.</div>';
+    return;
+  }
+  for (const p of S.projects) {
+    const active = S.activeProject?.id === p.id;
+    const row = document.createElement('div');
+    row.className = 'proj-item' + (active ? ' active' : '');
+    const badges = [
+      p.graphStats?.fileCount ? `${p.graphStats.fileCount} files` : p.path.split(/[\\/]/).slice(-2).join('/'),
+      p.autoAcceptEdits ? 'auto-edit' : '',
+    ].filter(Boolean).join(' · ');
+    row.innerHTML = `
+      <span class="proj-dot" style="background:${esc(p.color || '#c96442')}"></span>
+      <span class="proj-meta">
+        <span class="proj-name" title="${esc(p.path)}">${esc(p.name)}</span>
+        <span class="proj-sub">${esc(badges)}</span>
+      </span>
+      <button type="button" class="proj-edit-btn" title="Project workspace settings"><svg><use href="#i-settings"/></svg></button>`;
+    row.onclick = (e) => {
+      if (e.target.closest('.proj-edit-btn')) return;
+      selectProjectById(p.id);
+    };
+    row.querySelector('.proj-edit-btn').onclick = (e) => {
+      e.stopPropagation();
+      openProjectModal(p);
+    };
+    list.appendChild(row);
+  }
+}
+
+async function selectProjectById(id) {
+  try {
+    const r = await CW.selectProject(id);
+    S.activeProject = r.activeProject;
+    S.projects = r.projects || S.projects;
+    S.settings = r.settings;
+    S.cwd = '';
+    S.pinnedFiles = [];
+    closeFileEditor(true);
+    $('#ctImage').value = S.settings.containerImage || 'python:3.12-slim';
+    $('#ctNet').value = S.settings.containerNetwork || 'none';
+    $('#ctMount').value = S.settings.containerMountMode || 'rw';
+    renderProjectsList();
+    renderWorkspaceUI();
+    renderAutoAcceptPill();
+    renderPinned();
+    loadFiles('');
+
+    if (r.cachedGraph) {
+      S.graphData = r.cachedGraph;
+      if (S.panelOpen && S.panelTab === 'graph') renderGraphData(r.cachedGraph);
+    } else {
+      S.graphData = null;
+    }
+
+    toast(`Project → ${S.activeProject.name}`);
+    if (S.activeProject.autoMapGraph) {
+      const stale = !r.cachedGraph || (Date.now() - (r.cachedGraph.mappedAt || r.cachedGraph.builtAt || 0) > 5 * 60 * 1000);
+      if (stale) triggerBackgroundGraphMap(S.activeProject);
+    }
+  } catch (e) {
+    toast(e.message, 4000);
+  }
+}
+
+async function triggerBackgroundGraphMap(project) {
+  try {
+    const res = await CW.mapGraphFast({ projectId: project?.id || '', useFastModel: true });
+    if (res?.graph) {
+      S.graphData = res.graph;
+      if (res.projects) S.projects = res.projects;
+      if (res.activeProject) S.activeProject = res.activeProject;
+      renderProjectsList();
+      if (S.panelOpen && S.panelTab === 'graph') renderGraphData(res.graph);
+    }
+  } catch {}
+}
+
+function openProjectModal(proj = null) {
+  S.editingProjectId = proj?.id || null;
+  $('#projModalTitle').textContent = proj ? `Project Settings · ${proj.name}` : 'New Project';
+  $('#projNameInput').value = proj?.name || '';
+  $('#projColorInput').value = proj?.color || '#c96442';
+  $('#projPathInput').value = proj?.path || S.settings?.workspace || '';
+  $('#projAutoMapChk').checked = proj ? proj.autoMapGraph !== false : true;
+  $('#projAutoAcceptChk').checked = proj ? Boolean(proj.autoAcceptEdits) : false;
+  $('#projAutoContainerChk').checked = proj ? Boolean(proj.autoRunContainer) : false;
+  $('#projContainerImgInput').value = proj?.containerImage || S.settings?.containerImage || 'python:3.12-slim';
+  $('#projContainerNetInput').value = proj?.containerNetwork || S.settings?.containerNetwork || 'none';
+  $('#projContainerMountInput').value = proj?.containerMountMode || S.settings?.containerMountMode || 'rw';
+  $('#projInstrInput').value = proj?.instructions || '';
+  $('#deleteProjectBtn').hidden = !proj;
+  $('#projectModal').hidden = false;
+  setTimeout(() => $('#projNameInput').focus(), 30);
+}
+
 // ---- Workspace & OS Folder Navigation
 function renderWorkspaceUI() {
   const ws = S.settings?.workspace || '';
-  const base = ws.split(/[\\/]/).filter(Boolean).pop() || ws || '/';
+  const base = S.activeProject?.name || ws.split(/[\\/]/).filter(Boolean).pop() || ws || '/';
   $('#wsTopLabel').textContent = base;
-  $('#wsTopPill').title = `OS Folder: ${ws}`;
+  $('#wsTopPill').title = S.activeProject
+    ? `Project: ${S.activeProject.name} (${ws})`
+    : `OS Folder: ${ws}`;
   $('#osPathInput').value = S.cwd ? `${ws.replace(/[\\/]+$/, '')}/${S.cwd}` : ws;
 
   const q = $('#wsQuick');
@@ -1382,6 +1523,14 @@ async function saveEditorFile() {
     updateEditorStats();
     loadUndo();
     toast(r.summary || `Saved ${S.editor.name}`);
+    if (S.activeProject?.autoMapGraph) {
+      CW.mapGraphFast({ projectId: S.activeProject.id, useFastModel: false }).then((res) => {
+        if (res?.graph) {
+          S.graphData = res.graph;
+          if (S.panelOpen && S.panelTab === 'graph') renderGraphData(res.graph);
+        }
+      }).catch(() => {});
+    }
   } catch (e) {
     toast(e.message, 4000);
   }
@@ -1569,28 +1718,100 @@ function initGraphViewIfNeeded() {
 async function ensureGraphLoaded() {
   initGraphViewIfNeeded();
   setTimeout(() => S.graphView?.resize(), 60);
-  if (!S.graphData || S.graphData.workspace !== S.settings?.workspace) {
-    await buildAndRenderGraph();
-  } else {
+  if (S.graphData && S.graphData.workspace === S.settings?.workspace) {
+    renderGraphData(S.graphData);
     setTimeout(() => S.graphView?.fitToView(), 90);
+    return;
   }
+  if (S.activeProject) {
+    const cached = await CW.getCachedGraph(S.activeProject.id).catch(() => ({ graph: null }));
+    if (cached?.graph && cached.graph.workspace === S.settings?.workspace) {
+      S.graphData = cached.graph;
+      renderGraphData(cached.graph);
+      return;
+    }
+  }
+  await buildAndRenderGraph(true);
 }
 
-async function buildAndRenderGraph() {
+function renderGraphData(g) {
+  if (!g) return;
+  const st = g.stats || {};
+  const mappedNote = g.mappedByModel
+    ? ` · Fast AI (${g.mappedByModel.replace(/:latest$/, '')})`
+    : '';
+  $('#graphStats').textContent = `${g.projectName} · ${st.fileCount || 0} files · ${st.importEdges || 0} imports${st.semanticEdges ? ` + ${st.semanticEdges} AI links` : ''} · ${st.packageCount || 0} pkgs · ${(st.totalLines || 0).toLocaleString()} lines${mappedNote}`;
+
+  // Fast-model summary box
+  const aiBox = $('#graphAiBox');
+  if (g.aiSummary) {
+    aiBox.hidden = false;
+    aiBox.innerHTML = `<b style="font-size:11px;color:var(--accent-ink);text-transform:uppercase;letter-spacing:.05em">Fast Model Map</b><div style="margin-top:3px">${esc(g.aiSummary)}</div>`;
+  } else {
+    aiBox.hidden = true;
+  }
+
+  // Clickable Cluster & Core Hub spotlight bar
+  const bar = $('#graphClustersBar');
+  const clusters = g.aiClusters || [];
+  const hubs = (g.topHubs || []).slice(0, 5);
+  if (clusters.length || hubs.length) {
+    bar.hidden = false;
+    bar.innerHTML = '';
+    for (const c of clusters) {
+      const b = document.createElement('button');
+      b.type = 'button';
+      b.className = 'gc-pill';
+      b.textContent = `◈ ${c.name}`;
+      b.title = c.description || c.name;
+      b.onclick = () => {
+        S.graphView?.setClusterFocus(c.name);
+        $$('.gc-pill', bar).forEach((x) => x.classList.toggle('on', x === b && S.graphView?.activeCluster === c.name));
+      };
+      bar.appendChild(b);
+    }
+    for (const h of hubs) {
+      const b = document.createElement('button');
+      b.type = 'button';
+      b.className = 'gc-pill';
+      b.textContent = `● ${h.label}`;
+      b.title = `Core Hub: ${h.path} (${h.inDegree} in · ${h.outDegree} out)`;
+      b.onclick = () => S.graphView?.centerOnNode(h.id);
+      bar.appendChild(b);
+    }
+  } else {
+    bar.hidden = true;
+  }
+
+  $('#graphInspector').hidden = true;
+  S.graphView?.resize();
+  S.graphView?.setShowTreeEdges(S.graphTreeEdges);
+  S.graphView?.setFilters(S.graphFilters);
+  S.graphView?.setData(g);
+}
+
+async function buildAndRenderGraph(useFastModel = true) {
   initGraphViewIfNeeded();
-  $('#graphStats').textContent = 'Scanning workspace & building knowledge graph…';
+  $('#graphStats').textContent = useFastModel
+    ? 'Scanning workspace & mapping semantics with Fast model…'
+    : 'Scanning workspace…';
   $('#graphBuildBtn').disabled = true;
   try {
-    const g = await CW.buildGraph({ includePackages: true });
+    const res = await CW.mapGraphFast({
+      projectId: S.activeProject?.id || '',
+      useFastModel,
+    });
+    const g = res.graph;
     S.graphData = g;
-    const st = g.stats || {};
-    $('#graphStats').textContent = `${g.projectName} · ${st.fileCount || 0} files · ${st.folderCount || 0} folders · ${st.importEdges || 0} links · ${st.packageCount || 0} pkgs · ${(st.totalLines || 0).toLocaleString()} lines (${g.elapsedMs}ms)`;
-    $('#graphInspector').hidden = true;
-    S.graphView?.resize();
-    S.graphView?.setFilters(S.graphFilters);
-    S.graphView?.setData(g);
+    if (res.projects) S.projects = res.projects;
+    if (res.activeProject) S.activeProject = res.activeProject;
+    renderProjectsList();
+    renderGraphData(g);
+    if (g.aiError && useFastModel) {
+      toast(`Structural graph built (Fast model note: ${g.aiError})`, 3500);
+    }
   } catch (e) {
-    $('#graphStats').textContent = `Graph build failed: ${e.message}`;
+    $('#graphStats').textContent = `Graph map failed: ${e.message}`;
     toast(e.message, 4000);
   } finally {
     $('#graphBuildBtn').disabled = false;
@@ -1603,6 +1824,13 @@ function renderGraphInspector(node, { incoming = [], outgoing = [] } = {}) {
   box.hidden = false;
   $('#giTitle').textContent = node.label || node.id;
   $('#giPath').textContent = node.path || (node.kind === 'package' ? `Package ${node.version || ''}` : S.graphData?.workspace || '');
+  const roleEl = $('#giRole');
+  if (node.aiRole) {
+    roleEl.hidden = false;
+    roleEl.textContent = node.aiRole;
+  } else {
+    roleEl.hidden = true;
+  }
 
   const isFile = Boolean(node.path) && node.kind !== 'folder';
   $('#giEditBtn').hidden = !isFile;
@@ -1634,6 +1862,7 @@ function renderGraphInspector(node, { incoming = [], outgoing = [] } = {}) {
 
   const metaParts = [
     `<span class="gi-pill">${esc(node.kind || 'file')}</span>`,
+    node._cluster ? `<span class="gi-pill">${esc(node._cluster)}</span>` : '',
     node.lines ? `<span class="gi-pill">${node.lines} lines</span>` : '',
     node.sizeLabel ? `<span class="gi-pill">${esc(node.sizeLabel)}</span>` : '',
     `<span class="gi-pill">${incoming.length} in · ${outgoing.length} out</span>`,
@@ -1661,7 +1890,7 @@ function renderGraphInspector(node, { incoming = [], outgoing = [] } = {}) {
       const b = document.createElement('button');
       b.type = 'button';
       b.className = 'gi-link-btn';
-      b.textContent = item.node.label;
+      b.textContent = item.label ? `${item.node.label} (${item.label})` : item.node.label;
       b.title = `${item.type}: ${item.node.path || item.node.label}`;
       b.onclick = () => S.graphView?.centerOnNode(item.node);
       grp.appendChild(b);
@@ -2224,8 +2453,91 @@ $('#containerToggleBtn').onclick = async () => {
   toast(S.containerEnabled ? 'Container code execution enabled' : 'Container code execution paused');
 };
 
+// Projects & Auto-Accept Edits Wiring
+$('#addProjectBtn').onclick = () => openProjectModal(null);
+$('#closeProjectModalBtn').onclick = () => { $('#projectModal').hidden = true; };
+$('#cancelProjectBtn').onclick = () => { $('#projectModal').hidden = true; };
+$('#projBrowsePathBtn').onclick = async () => {
+  const r = await CW.pickProjectPath();
+  if (r.canceled) return;
+  $('#projPathInput').value = r.path;
+  if (!$('#projNameInput').value.trim()) $('#projNameInput').value = r.suggestedName || '';
+};
+$('#saveProjectBtn').onclick = async () => {
+  const pPath = $('#projPathInput').value.trim();
+  if (!pPath) { toast('Choose a local project folder path first'); return; }
+  try {
+    const res = await CW.saveProject({
+      id: S.editingProjectId || undefined,
+      name: $('#projNameInput').value.trim(),
+      color: $('#projColorInput').value,
+      path: pPath,
+      autoMapGraph: $('#projAutoMapChk').checked,
+      autoAcceptEdits: $('#projAutoAcceptChk').checked,
+      autoRunContainer: $('#projAutoContainerChk').checked,
+      containerImage: $('#projContainerImgInput').value.trim() || 'python:3.12-slim',
+      containerNetwork: $('#projContainerNetInput').value,
+      containerMountMode: $('#projContainerMountInput').value,
+      instructions: $('#projInstrInput').value.trim(),
+      activate: true,
+    });
+    S.projects = res.projects || [];
+    S.activeProject = res.activeProject;
+    S.settings = res.settings;
+    S.cwd = '';
+    S.graphData = null;
+    $('#projectModal').hidden = true;
+    renderProjectsList();
+    renderWorkspaceUI();
+    renderAutoAcceptPill();
+    loadFiles('');
+    toast(`Project "${S.activeProject.name}" ready`);
+    if (S.activeProject.autoMapGraph) {
+      triggerBackgroundGraphMap(S.activeProject);
+    }
+  } catch (e) { toast(e.message, 4000); }
+};
+$('#deleteProjectBtn').onclick = async () => {
+  if (!S.editingProjectId) return;
+  const r = await CW.deleteProject(S.editingProjectId);
+  S.projects = r.projects || [];
+  S.activeProject = r.activeProject;
+  S.settings = r.settings;
+  $('#projectModal').hidden = true;
+  renderProjectsList();
+  renderWorkspaceUI();
+  renderAutoAcceptPill();
+  toast('Project removed from sidebar (local files untouched)');
+};
+$('#autoAcceptTopPill').onclick = async () => {
+  const cur = S.activeProject
+    ? Boolean(S.activeProject.autoAcceptEdits)
+    : Boolean(S.settings?.autoApproveFileActions);
+  const r = await CW.toggleAutoAcceptEdits(!cur);
+  S.activeProject = r.activeProject || S.activeProject;
+  S.settings = r.settings;
+  if (S.activeProject) {
+    const idx = S.projects.findIndex((x) => x.id === S.activeProject.id);
+    if (idx >= 0) S.projects[idx] = S.activeProject;
+  }
+  renderProjectsList();
+  renderAutoAcceptPill();
+  toast(r.autoAcceptEdits ? 'Auto-Accept Edits enabled (with 1-click Undo)' : 'Auto-Accept Edits turned off');
+};
+
 // Knowledge Graph Controls
-$('#graphBuildBtn').onclick = buildAndRenderGraph;
+$('#graphBuildBtn').onclick = () => buildAndRenderGraph(true);
+$('#graphLayoutSeg').onclick = (e) => {
+  const b = e.target.closest('button[data-layout]');
+  if (!b) return;
+  $$('#graphLayoutSeg button').forEach((x) => x.classList.toggle('on', x === b));
+  S.graphView?.applyLayout(b.dataset.layout);
+};
+$('#graphTreeEdgesBtn').onclick = () => {
+  S.graphTreeEdges = !S.graphTreeEdges;
+  $('#graphTreeEdgesBtn').textContent = S.graphTreeEdges ? 'Folders: On' : 'Folders: Off';
+  S.graphView?.setShowTreeEdges(S.graphTreeEdges);
+};
 $('#graphFitBtn').onclick = () => S.graphView?.fitToView();
 $('#graphZoomInBtn').onclick = () => S.graphView?.zoomBy(1.22);
 $('#graphZoomOutBtn').onclick = () => S.graphView?.zoomBy(1 / 1.22);
@@ -2244,20 +2556,6 @@ $('#graphFilters').onclick = (e) => {
   else S.graphFilters.add(k);
   b.classList.toggle('on', S.graphFilters.has(k));
   S.graphView?.setFilters(S.graphFilters);
-};
-$('#graphAiSummaryBtn').onclick = async () => {
-  const box = $('#graphAiBox');
-  box.hidden = false;
-  box.innerHTML = 'Generating AI architectural summary…';
-  $('#graphAiSummaryBtn').disabled = true;
-  try {
-    const r = await CW.summarizeGraph();
-    box.innerHTML = renderMd(r.summary || 'No summary generated.');
-  } catch (e) {
-    box.innerHTML = `<span style="color:var(--red)">${esc(e.message)}</span>`;
-  } finally {
-    $('#graphAiSummaryBtn').disabled = false;
-  }
 };
 
 // Container Sandbox Controls

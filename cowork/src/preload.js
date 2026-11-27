@@ -30,6 +30,14 @@ contextBridge.exposeInMainWorld('cowork', {
   revealFile: (relPath) => ipcRenderer.invoke('shell:revealFile', relPath),
   openFile: (relPath) => ipcRenderer.invoke('shell:openFile', relPath),
 
+  // First-Class Projects & Per-Project Workspace Settings
+  listProjects: () => ipcRenderer.invoke('projects:list'),
+  pickProjectPath: () => ipcRenderer.invoke('projects:pickPath'),
+  saveProject: (proj) => ipcRenderer.invoke('projects:save', proj),
+  selectProject: (id) => ipcRenderer.invoke('projects:select', id),
+  deleteProject: (id) => ipcRenderer.invoke('projects:delete', id),
+  toggleAutoAcceptEdits: (val) => ipcRenderer.invoke('projects:toggleAutoAccept', val),
+
   // Chats & Copilot Streaming
   listChats: () => ipcRenderer.invoke('chats:list'),
   getChat: (id) => ipcRenderer.invoke('chats:get', id),
@@ -86,9 +94,16 @@ contextBridge.exposeInMainWorld('cowork', {
     return () => ipcRenderer.removeListener('container:output', listener);
   },
 
-  // Project Knowledge Graph
+  // Project Knowledge Graph (Structural + Fast Model Semantic Mapping)
+  getCachedGraph: (projectId) => ipcRenderer.invoke('graph:getCached', projectId),
   buildGraph: (opts) => ipcRenderer.invoke('graph:build', opts || {}),
+  mapGraphFast: (opts) => ipcRenderer.invoke('graph:mapFast', opts || {}),
   summarizeGraph: () => ipcRenderer.invoke('graph:summarize'),
+  onGraphProgress: (cb) => {
+    const listener = (_, msg) => cb(msg);
+    ipcRenderer.on('graph:progress', listener);
+    return () => ipcRenderer.removeListener('graph:progress', listener);
+  },
 
   // Research Desk
   researchSearch: (q) => ipcRenderer.invoke('research:search', q),

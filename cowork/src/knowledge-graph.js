@@ -14,6 +14,8 @@ const fs = require('fs');
 const fsp = fs.promises;
 const path = require('path');
 const localFiles = require('./local-files');
+const endpoint = require('./endpoint');
+const storage = require('./storage');
 
 const IGNORE_DIRS = new Set([
   'node_modules', '.git', '.svn', '.hg', '.mx-cowork-trash',
@@ -459,13 +461,176 @@ function summarizeGraphForAI(graph) {
   if (importList.length) {
     lines.push('Key Dependency Edges:\n' + importList.join('\n'));
   }
+  if (graph.aiSummary) {
+    lines.push(`AI Summary (Fast Model): ${graph.aiSummary}`);
+  }
+  if (graph.aiClusters?.length) {
+    lines.push('Architectural Clusters:\n' + graph.aiClusters.map((c) => `  - ${c.name}: ${c.description} [${(c.files || []).slice(0, 6).join(', ')}]`).join('\n'));
+  }
   if (graph.circular?.length) {
     lines.push('Circular Imports: ' + graph.circular.map((p) => `${p[0]} <-> ${p[1]}`).join(', '));
   }
   return lines.join('\n');
 }
 
+function parseJsonLoose(text) {
+  const raw = String(text || '').trim();
+  const fenced = raw.match(/```(?:json)?\s*([\s\S]*?)```/i);
+  const cand = fenced ? fenced[1].trim() : raw;
+  const s = cand.indexOf('{');
+  const e = cand.lastIndexOf('}');
+  if (s >= 0 && e > s) {
+    try { return JSON.parse(cand.slice(s, e + 1)); } catch {}
+  }
+  return null;
+}
+
+/**
+ * Enrich a structural project graph using the configured FAST model (e.g. lfm3:latest)
+ * to infer architectural clusters, per-file roles, conceptual cross-file links,
+ * and a concise project summary, then persist to the project's graph cache.
+ */
+async function mapProjectWithFastModel({ projectId = '', workspace = '', useFastModel = true, onProgress } = {}) {
+  const proj = projectId ? storage.getProject(projectId) : storage.getActiveProject();
+  const targetDir = path.resolve(workspace || proj?.path || localFiles.getWorkspace());
+
+  onProgress?.({ phase: 'scanning', message: `Scanning ${path.basename(targetDir)}…` });
+  const graph = await buildProjectGraph(targetDir, { includePackages: true });
+  graph.projectId = proj?.id || '';
+
+  if (proj) {
+    storage.saveProjectGraphCache(proj.id, graph);
+    storage.saveProject({
+      ...proj,
+      lastGraphAt: graph.builtAt,
+      graphStats: graph.stats,
+    });
+  }
+
+  if (!useFastModel || !graph.stats.fileCount) {
+    return graph;
+  }
+
+  const cfg = storage.getSettings();
+  const fastModel = cfg.fastModel || 'lfm3:latest';
+  onProgress?.({ phase: 'mapping', message: `Mapping semantics with Fast model (${fastModel.replace(/:latest$/, '')})…` });
+
+  // Build ultra-compact digest so the Fast model responds in ~1-3 seconds
+  const fileNodes = graph.nodes.filter((n) => n.id.startsWith('file:'));
+  const topFiles = [...fileNodes]
+    .sort((a, b) => (b.inDegree * 2 + b.outDegree) - (a.inDegree * 2 + a.outDegree) || (b.lines - a.lines))
+    .slice(0, 22);
+
+  const digestLines = [
+    `Project: ${graph.projectName} (${graph.stats.fileCount} files, ${graph.stats.totalLines} lines)`,
+    `Languages: ${(graph.topLanguages || []).map((l) => `${l.ext}:${l.count}`).join(', ')}`,
+    `Top Files & Symbols:`,
+    ...topFiles.map((n) => {
+      const syms = (n.symbols || []).slice(0, 5).map((s) => s.name).join(', ');
+      return `  - ${n.path} [${n.kind}, ${n.lines}L]${syms ? ` :: ${syms}` : ''}`;
+    }),
+    `Static Links:`,
+    ...(graph.edges || [])
+      .filter((e) => e.type === 'imports' || e.type === 'links_to')
+      .slice(0, 24)
+      .map((e) => `  ${e.source.replace(/^file:/, '')} -> ${e.target.replace(/^file:/, '')}`),
+  ];
+
+  const sys = `You are a fast codebase mapper building a Project Knowledge Graph.
+Return ONLY valid JSON with this exact shape:
+{
+  "summary": "2 concise sentences explaining what this project does and how it is structured.",
+  "clusters": [
+    { "name": "Cluster Name", "description": "Short 8-word purpose", "files": ["rel/path1", "rel/path2"] }
+  ],
+  "roles": {
+    "rel/path1": "Short 6-10 word role of this file"
+  },
+  "links": [
+    { "from": "rel/pathA", "to": "rel/pathB", "label": "2-3 word relation" }
+  ]
+}
+Rules: max 5 clusters, max 16 file roles, max 10 conceptual links. Use exact relative paths from the input.`;
+
+  try {
+    const res = await endpoint.chatCompletion({
+      tier: 'fast',
+      model: fastModel,
+      systemPrompt: sys,
+      messages: [{ role: 'user', content: digestLines.join('\n') }],
+      think: 'off',
+      priority: 'fast',
+    });
+
+    const parsed = parseJsonLoose(res.content);
+    if (parsed && typeof parsed === 'object') {
+      graph.aiSummary = String(parsed.summary || '').trim();
+      graph.aiClusters = Array.isArray(parsed.clusters)
+        ? parsed.clusters.slice(0, 6).map((c) => ({
+            name: String(c.name || 'Module').slice(0, 40),
+            description: String(c.description || '').slice(0, 120),
+            files: Array.isArray(c.files) ? c.files.map(String) : [],
+          }))
+        : [];
+      graph.mappedByModel = res.model || fastModel;
+      graph.mappedAt = Date.now();
+      graph.mappedMs = res.elapsedMs || 0;
+
+      // Apply per-file AI roles & cluster tags
+      const rolesMap = (parsed.roles && typeof parsed.roles === 'object') ? parsed.roles : {};
+      const clusterByPath = new Map();
+      for (const c of graph.aiClusters) {
+        for (const f of c.files) clusterByPath.set(f, c.name);
+      }
+
+      const fileIdByPath = new Map();
+      for (const n of graph.nodes) {
+        if (!n.path) continue;
+        fileIdByPath.set(n.path, n.id);
+        if (rolesMap[n.path]) n.aiRole = String(rolesMap[n.path]).slice(0, 140);
+        if (clusterByPath.has(n.path)) n.cluster = clusterByPath.get(n.path);
+      }
+
+      // Add conceptual semantic links returned by the Fast model
+      if (Array.isArray(parsed.links)) {
+        const existingKeys = new Set(graph.edges.map((e) => `${e.source}|${e.target}`));
+        for (const l of parsed.links.slice(0, 12)) {
+          const src = fileIdByPath.get(String(l.from || ''));
+          const dst = fileIdByPath.get(String(l.to || ''));
+          if (src && dst && src !== dst && !existingKeys.has(`${src}|${dst}`)) {
+            existingKeys.add(`${src}|${dst}`);
+            graph.edges.push({
+              source: src,
+              target: dst,
+              type: 'semantic',
+              label: String(l.label || 'related').slice(0, 32),
+            });
+          }
+        }
+        graph.stats.totalEdges = graph.edges.length;
+        graph.stats.semanticEdges = graph.edges.filter((e) => e.type === 'semantic').length;
+      }
+
+      if (proj) {
+        storage.saveProjectGraphCache(proj.id, graph);
+        storage.saveProject({
+          ...proj,
+          lastGraphAt: graph.mappedAt,
+          graphStats: graph.stats,
+          aiSummary: graph.aiSummary,
+        });
+      }
+    }
+  } catch (err) {
+    graph.aiError = err.message || 'Fast model mapping skipped';
+  }
+
+  onProgress?.({ phase: 'done', message: `Mapped ${graph.stats.fileCount} files` });
+  return graph;
+}
+
 module.exports = {
   buildProjectGraph,
+  mapProjectWithFastModel,
   summarizeGraphForAI,
 };

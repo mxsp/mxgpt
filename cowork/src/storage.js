@@ -17,7 +17,9 @@ function getConfigDir() {
 
 const DATA_DIR = getConfigDir();
 const CHATS_DIR = path.join(DATA_DIR, 'chats');
+const GRAPHS_DIR = path.join(DATA_DIR, 'graphs');
 const SETTINGS_FILE = path.join(DATA_DIR, 'settings.json');
+const PROJECTS_FILE = path.join(DATA_DIR, 'projects.json');
 const DRAFTS_FILE = path.join(DATA_DIR, 'email-drafts.json');
 const RESEARCH_FILE = path.join(DATA_DIR, 'research-briefs.json');
 const UNDO_FILE = path.join(DATA_DIR, 'file-undo.json');
@@ -25,6 +27,7 @@ const CONTAINER_RUNS_FILE = path.join(DATA_DIR, 'container-runs.json');
 const NOTES_FILE = path.join(DATA_DIR, 'memory-notes.json');
 
 fs.mkdirSync(CHATS_DIR, { recursive: true });
+fs.mkdirSync(GRAPHS_DIR, { recursive: true });
 
 function defaultWorkspace() {
   const docs = path.join(os.homedir(), 'Documents');
@@ -47,6 +50,7 @@ const DEFAULT_SETTINGS = {
   defaultMode: 'copilot', // 'fast' | 'smart' | 'copilot' | 'copilot_b'
   think: 'low', // 'off' | 'low' | 'medium' | 'high'
   workspace: defaultWorkspace(),
+  activeProjectId: '',
   theme: 'light',
   autoApproveFileActions: false,
   updateRepo: 'mxsp/mxgpt',
@@ -140,6 +144,7 @@ function listChats() {
         id: c.id,
         title: c.title || 'New task',
         mode: c.mode || 'copilot',
+        projectId: c.projectId || '',
         updated: c.updated || c.created || 0,
         messageCount: Array.isArray(c.messages) ? c.messages.length : 0,
       });
@@ -164,11 +169,12 @@ function saveChat(chat) {
   return chat;
 }
 
-function createChat({ title = 'New coworker session', mode = 'copilot' } = {}) {
+function createChat({ title = 'New coworker session', mode = 'copilot', projectId = '' } = {}) {
   return saveChat({
     id: newId('chat'),
     title,
     mode,
+    projectId: projectId || getSettings().activeProjectId || '',
     created: Date.now(),
     updated: Date.now(),
     messages: [],
@@ -338,6 +344,106 @@ function searchNotes(query = '') {
   });
 }
 
+// ---- First-Class Projects & Per-Project Knowledge Graph Cache
+const PROJECT_COLORS = ['#c96442', '#2f855a', '#5b67ca', '#c07b18', '#0d9488', '#b85c7e'];
+
+function listProjects() {
+  const arr = readJson(PROJECTS_FILE, []);
+  return Array.isArray(arr) ? arr.sort((a, b) => (b.updatedAt || 0) - (a.updatedAt || 0)) : [];
+}
+
+function getProject(id) {
+  if (!id) return null;
+  return listProjects().find((p) => p.id === id) || null;
+}
+
+function getActiveProject() {
+  const s = getSettings();
+  const all = listProjects();
+  if (s.activeProjectId) {
+    const found = all.find((p) => p.id === s.activeProjectId);
+    if (found) return found;
+  }
+  // Match by current workspace path if any project matches
+  const ws = path.resolve(s.workspace || defaultWorkspace());
+  return all.find((p) => path.resolve(p.path || '') === ws) || null;
+}
+
+function saveProject(proj) {
+  const all = listProjects();
+  const now = Date.now();
+  const resolvedPath = path.resolve(String(proj.path || getSettings().workspace || defaultWorkspace()).trim());
+  const existing = proj.id
+    ? all.find((x) => x.id === proj.id)
+    : all.find((x) => path.resolve(x.path || '') === resolvedPath);
+
+  const id = existing?.id || proj.id || newId('proj');
+  const defaultName = path.basename(resolvedPath) || 'Workspace';
+  const color = proj.color || existing?.color || PROJECT_COLORS[all.length % PROJECT_COLORS.length];
+
+  const item = {
+    id,
+    name: String(proj.name ?? existing?.name ?? defaultName).trim() || defaultName,
+    path: resolvedPath,
+    color,
+    description: String(proj.description ?? existing?.description ?? '').trim(),
+    instructions: String(proj.instructions ?? existing?.instructions ?? '').trim(),
+    autoMapGraph: proj.autoMapGraph !== undefined ? Boolean(proj.autoMapGraph) : (existing?.autoMapGraph !== false),
+    autoAcceptEdits: proj.autoAcceptEdits !== undefined ? Boolean(proj.autoAcceptEdits) : Boolean(existing?.autoAcceptEdits),
+    autoRunContainer: proj.autoRunContainer !== undefined ? Boolean(proj.autoRunContainer) : Boolean(existing?.autoRunContainer),
+    containerImage: String(proj.containerImage ?? existing?.containerImage ?? getSettings().containerImage ?? 'python:3.12-slim').trim(),
+    containerNetwork: (proj.containerNetwork ?? existing?.containerNetwork ?? getSettings().containerNetwork) === 'bridge' ? 'bridge' : 'none',
+    containerMountMode: (proj.containerMountMode ?? existing?.containerMountMode ?? getSettings().containerMountMode) === 'ro' ? 'ro' : 'rw',
+    lastGraphAt: proj.lastGraphAt ?? existing?.lastGraphAt ?? 0,
+    graphStats: proj.graphStats ?? existing?.graphStats ?? null,
+    aiSummary: proj.aiSummary ?? existing?.aiSummary ?? '',
+    createdAt: existing?.createdAt || now,
+    updatedAt: now,
+  };
+
+  const idx = all.findIndex((x) => x.id === id);
+  if (idx >= 0) all[idx] = item;
+  else all.unshift(item);
+  writeJson(PROJECTS_FILE, all.slice(0, 60));
+  return item;
+}
+
+function deleteProject(id) {
+  const all = listProjects();
+  const next = all.filter((x) => x.id !== id);
+  writeJson(PROJECTS_FILE, next);
+  try { fs.unlinkSync(path.join(GRAPHS_DIR, `${id}.json`)); } catch {}
+  if (getSettings().activeProjectId === id) {
+    saveSettings({ activeProjectId: next[0]?.id || '' });
+  }
+  return next.length !== all.length;
+}
+
+function setActiveProject(id) {
+  const p = getProject(id);
+  if (!p) throw new Error('Project not found');
+  saveSettings({
+    activeProjectId: p.id,
+    workspace: p.path,
+    autoApproveFileActions: Boolean(p.autoAcceptEdits),
+    autoApproveContainerRuns: Boolean(p.autoRunContainer),
+    containerImage: p.containerImage || 'python:3.12-slim',
+    containerNetwork: p.containerNetwork || 'none',
+    containerMountMode: p.containerMountMode || 'rw',
+  });
+  return saveProject({ ...p, updatedAt: Date.now() });
+}
+
+function getProjectGraphCache(projectId) {
+  if (!projectId || !/^[A-Za-z0-9_-]+$/.test(projectId)) return null;
+  return readJson(path.join(GRAPHS_DIR, `${projectId}.json`), null);
+}
+
+function saveProjectGraphCache(projectId, graph) {
+  if (!projectId || !/^[A-Za-z0-9_-]+$/.test(projectId)) return;
+  writeJson(path.join(GRAPHS_DIR, `${projectId}.json`), graph);
+}
+
 module.exports = {
   DATA_DIR,
   getSettings,
@@ -364,4 +470,12 @@ module.exports = {
   saveNote,
   deleteNote,
   searchNotes,
+  listProjects,
+  getProject,
+  getActiveProject,
+  saveProject,
+  deleteProject,
+  setActiveProject,
+  getProjectGraphCache,
+  saveProjectGraphCache,
 };

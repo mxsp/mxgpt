@@ -266,6 +266,72 @@ function registerIpc() {
     return { ok: true };
   });
 
+  // ---- First-Class Projects & Per-Project Workspace Settings
+  ipcMain.handle('projects:list', () => ({
+    projects: storage.listProjects(),
+    activeProject: storage.getActiveProject(),
+  }));
+
+  ipcMain.handle('projects:pickPath', async () => {
+    const res = await dialog.showOpenDialog(mainWindow, {
+      title: 'Choose Project Folder',
+      defaultPath: localFiles.getWorkspace(),
+      properties: ['openDirectory', 'createDirectory'],
+    });
+    if (res.canceled || !res.filePaths?.length) return { canceled: true };
+    const chosen = res.filePaths[0];
+    return { canceled: false, path: chosen, suggestedName: path.basename(chosen) || 'Project' };
+  });
+
+  ipcMain.handle('projects:save', (_, payload) => {
+    const activate = payload?.activate !== false;
+    const project = storage.saveProject(payload || {});
+    let activeProject = storage.getActiveProject();
+    if (activate || activeProject?.id === project.id) {
+      activeProject = storage.setActiveProject(project.id);
+    }
+    return {
+      ok: true,
+      project,
+      projects: storage.listProjects(),
+      activeProject,
+      settings: storage.publicSettings(),
+    };
+  });
+
+  ipcMain.handle('projects:select', (_, id) => {
+    const activeProject = storage.setActiveProject(id);
+    const cachedGraph = storage.getProjectGraphCache(activeProject.id);
+    return {
+      ok: true,
+      activeProject,
+      projects: storage.listProjects(),
+      settings: storage.publicSettings(),
+      cachedGraph,
+    };
+  });
+
+  ipcMain.handle('projects:delete', (_, id) => {
+    const ok = storage.deleteProject(id);
+    return {
+      ok,
+      projects: storage.listProjects(),
+      activeProject: storage.getActiveProject(),
+      settings: storage.publicSettings(),
+    };
+  });
+
+  ipcMain.handle('projects:toggleAutoAccept', (_, value) => {
+    const active = storage.getActiveProject();
+    if (active) {
+      const updated = storage.saveProject({ ...active, autoAcceptEdits: Boolean(value) });
+      storage.saveSettings({ autoApproveFileActions: Boolean(value) });
+      return { ok: true, autoAcceptEdits: Boolean(value), activeProject: updated, settings: storage.publicSettings() };
+    }
+    storage.saveSettings({ autoApproveFileActions: Boolean(value) });
+    return { ok: true, autoAcceptEdits: Boolean(value), activeProject: null, settings: storage.publicSettings() };
+  });
+
   // ---- Chats
   ipcMain.handle('chats:list', () => ({ chats: storage.listChats() }));
   ipcMain.handle('chats:get', (_, id) => {
@@ -346,7 +412,11 @@ function registerIpc() {
         emit('notes_saved', result.savedNotes);
       }
 
-      if (result.fileActions?.length && storage.getSettings().autoApproveFileActions) {
+      const activeProj = storage.getActiveProject();
+      const autoAcceptEdits = activeProj ? Boolean(activeProj.autoAcceptEdits) : Boolean(storage.getSettings().autoApproveFileActions);
+      const autoRunContainer = activeProj ? Boolean(activeProj.autoRunContainer) : Boolean(storage.getSettings().autoApproveContainerRuns);
+
+      if (result.fileActions?.length && autoAcceptEdits) {
         for (const act of result.fileActions) {
           try {
             const r = await localFiles.executeFileAction(act);
@@ -361,7 +431,7 @@ function registerIpc() {
         emit('file_actions', result.fileActions);
       }
 
-      if (result.codeRuns?.length && storage.getSettings().autoApproveContainerRuns) {
+      if (result.codeRuns?.length && autoRunContainer) {
         for (const cr of result.codeRuns) {
           try {
             cr.status = 'running';
@@ -506,10 +576,33 @@ function registerIpc() {
     });
   });
 
-  // ---- Interactive Project Knowledge Graph
+  // ---- Interactive Project Knowledge Graph (Structural + Fast Model Mapping)
+  ipcMain.handle('graph:getCached', (_, projectId) => {
+    const active = projectId ? storage.getProject(projectId) : storage.getActiveProject();
+    if (!active) return { graph: null };
+    return { graph: storage.getProjectGraphCache(active.id) };
+  });
   ipcMain.handle('graph:build', (_, opts) => knowledgeGraph.buildProjectGraph(localFiles.getWorkspace(), opts || {}));
+  ipcMain.handle('graph:mapFast', async (event, opts) => {
+    const graph = await knowledgeGraph.mapProjectWithFastModel({
+      projectId: opts?.projectId || '',
+      workspace: opts?.workspace || '',
+      useFastModel: opts?.useFastModel !== false,
+      onProgress: (p) => {
+        if (!event.sender.isDestroyed()) {
+          event.sender.send('graph:progress', p);
+        }
+      },
+    });
+    return {
+      graph,
+      projects: storage.listProjects(),
+      activeProject: storage.getActiveProject(),
+    };
+  });
   ipcMain.handle('graph:summarize', async () => {
-    const graph = await knowledgeGraph.buildProjectGraph(localFiles.getWorkspace());
+    const active = storage.getActiveProject();
+    const graph = (active && storage.getProjectGraphCache(active.id)) || await knowledgeGraph.buildProjectGraph(localFiles.getWorkspace());
     const summaryText = knowledgeGraph.summarizeGraphForAI(graph);
     const res = await endpoint.chatCompletion({
       tier: 'fast',
@@ -579,8 +672,10 @@ app.whenReady().then(() => {
               hasLoginScreen: Boolean(document.querySelector('#loginScreen')),
               hasFileEditor: Boolean(document.querySelector('#fileEditorView')),
               hasOsNav: typeof window.cowork.navigateOs === 'function' && typeof window.cowork.writeFile === 'function',
-              hasContainerApi: typeof window.cowork.runInContainer === 'function' && Boolean(document.querySelector('#containerCanvasWrap') || document.querySelector('[data-pane="container"]')),
-              hasGraphApi: typeof window.cowork.buildGraph === 'function' && Boolean(document.querySelector('#graphCanvas')),
+              hasContainerApi: typeof window.cowork.runInContainer === 'function' && Boolean(document.querySelector('[data-pane="container"]')),
+              hasGraphApi: typeof window.cowork.mapGraphFast === 'function' && Boolean(document.querySelector('#graphCanvas')),
+              hasProjectsApi: typeof window.cowork.listProjects === 'function' && Boolean(document.querySelector('#projectsList')),
+              hasAutoEditPill: Boolean(document.querySelector('#autoAcceptTopPill')),
               hasUpdateBtn: Boolean(document.querySelector('#openUpdatesBtn')),
               hasUpdateModal: Boolean(document.querySelector('#updatesModal')),
               updaterOk: upd.ok,
