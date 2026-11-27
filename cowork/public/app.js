@@ -570,7 +570,14 @@ function openPanel(tab, toggleIfSame = false) {
   $$('.pane').forEach((p) => p.classList.toggle('active', p.dataset.pane === tab));
 
   if (tab === 'artifact') renderArtifactPane();
-  if (tab === 'files' && !S.editor) { loadFiles(S.cwd); loadOfficeQuickStrip(); }
+  if (tab === 'files' && !S.editor) {
+    if (S.activeProject?.path && S.settings?.workspace !== S.activeProject.path) {
+      selectProjectById(S.activeProject.id, true);
+    } else {
+      loadFiles(S.cwd);
+      loadOfficeQuickStrip();
+    }
+  }
   if (tab === 'graph') ensureGraphLoaded();
   if (tab === 'container') { loadContainerStatus(false); loadContainerHistory(); }
   if (tab === 'notes') { loadTasks(); loadAutomations(); loadNotes(); }
@@ -685,7 +692,7 @@ async function boot() {
   S.projects = projData?.projects || [];
   S.activeProject = projData?.activeProject || null;
 
-  $('#appVersionBadge').textContent = `v${info.version || '1.7.0'}`;
+  $('#appVersionBadge').textContent = `v${info.version || '1.7.1'}`;
   applyThemeUI(S.settings.theme || 'light');
   setMode(S.settings.defaultMode || 'copilot');
   setThink(S.settings.think || 'low');
@@ -842,26 +849,55 @@ function renderQueuedBar() {
   q.forEach((item, idx) => {
     const row = document.createElement('div');
     row.className = 'queued-item';
-    row.innerHTML = `
-      <span class="queued-num">Queued #${idx + 1}</span>
-      <span class="queued-txt" title="${esc(item.text)}">${esc(item.text)}</span>
-      <button type="button" class="btn tiny" data-qedit>Edit</button>
-      <button type="button" class="icon-btn sm" data-qdel title="Remove from queue"><svg><use href="#i-x"/></svg></button>`;
-    row.querySelector('[data-qedit]').onclick = () => {
-      q.splice(idx, 1);
-      if (!q.length) S.queuedPrompts.delete(key);
-      const inp = $('#promptInput');
-      inp.value = item.text;
-      inp.style.height = 'auto';
-      inp.style.height = Math.min(inp.scrollHeight, 200) + 'px';
-      inp.focus();
-      renderQueuedBar();
-    };
-    row.querySelector('[data-qdel]').onclick = () => {
-      q.splice(idx, 1);
-      if (!q.length) S.queuedPrompts.delete(key);
-      renderQueuedBar();
-    };
+    if (item.editing) {
+      row.innerHTML = `
+        <span class="queued-num">Pending #${idx + 1}</span>
+        <input type="text" class="queued-edit-inp" value="${esc(item.text)}" />
+        <button type="button" class="btn tiny primary" data-qsave>Save</button>
+        <button type="button" class="btn tiny" data-qcancel>Cancel</button>`;
+      const inp = row.querySelector('.queued-edit-inp');
+      const saveEdit = () => {
+        const next = inp.value.trim();
+        if (next) item.text = next;
+        item.editing = false;
+        renderQueuedBar();
+      };
+      row.querySelector('[data-qsave]').onclick = saveEdit;
+      row.querySelector('[data-qcancel]').onclick = () => { item.editing = false; renderQueuedBar(); };
+      inp.onkeydown = (e) => {
+        if (e.key === 'Enter') { e.preventDefault(); saveEdit(); }
+        if (e.key === 'Escape') { item.editing = false; renderQueuedBar(); }
+      };
+      setTimeout(() => { inp.focus(); inp.setSelectionRange(inp.value.length, inp.value.length); }, 10);
+    } else {
+      row.innerHTML = `
+        <span class="queued-num">Pending #${idx + 1}</span>
+        <span class="queued-txt" title="${esc(item.text)}">${esc(item.text)}</span>
+        <button type="button" class="btn tiny" data-qedit title="Edit pending message before it sends">Edit</button>
+        <button type="button" class="btn tiny" data-qrevert title="Revert pre-send back to composer">Revert</button>
+        <button type="button" class="icon-btn sm" data-qdel title="Discard pending message"><svg><use href="#i-x"/></svg></button>`;
+      row.querySelector('[data-qedit]').onclick = () => {
+        item.editing = true;
+        renderQueuedBar();
+      };
+      row.querySelector('[data-qrevert]').onclick = () => {
+        q.splice(idx, 1);
+        if (!q.length) S.queuedPrompts.delete(key);
+        const inp = $('#promptInput');
+        inp.value = item.text;
+        inp.style.height = 'auto';
+        inp.style.height = Math.min(inp.scrollHeight, 200) + 'px';
+        inp.focus();
+        updateSendButtonState();
+        toast('Reverted pending message to composer');
+      };
+      row.querySelector('[data-qdel]').onclick = () => {
+        q.splice(idx, 1);
+        if (!q.length) S.queuedPrompts.delete(key);
+        renderQueuedBar();
+        toast('Discarded pending message');
+      };
+    }
     bar.appendChild(row);
   });
 }
@@ -871,21 +907,23 @@ function queuePromptForCurrentChat(rawText) {
   if (!text) return false;
   const key = getCurrentQueueKey();
   const list = S.queuedPrompts.get(key) || [];
-  list.push({ id: 'q_' + Date.now().toString(36), text });
+  list.push({ id: 'q_' + Date.now().toString(36), text, editing: false });
   S.queuedPrompts.set(key, list);
   renderQueuedBar();
-  toast(`Pre-sent & queued (#${list.length}) — will send automatically next`);
+  updateSendButtonState();
   return true;
 }
 
 function updateSendButtonState() {
   const curStream = getStreamForCurrentView();
-  const busy = Boolean(curStream);
-  $('#sendBtn').classList.toggle('stop', busy);
-  $('#sendIcon use').setAttribute('href', busy ? '#i-stop' : '#i-send');
-  $('#sendBtn').title = busy ? 'Stop generating in this chat' : 'Send (Enter)';
-  const qBtn = $('#queueSendBtn');
-  if (qBtn) qBtn.hidden = !busy;
+  const hasDraft = Boolean($('#promptInput')?.value?.trim());
+  // If Copilot is busy AND input is empty -> red Stop button; as soon as user types -> terracotta Pre-Send arrow!
+  const showStop = Boolean(curStream) && !hasDraft;
+  $('#sendBtn').classList.toggle('stop', showStop);
+  $('#sendIcon use').setAttribute('href', showStop ? '#i-stop' : '#i-send');
+  $('#sendBtn').title = showStop
+    ? 'Stop generating in this chat'
+    : (curStream ? 'Pre-send follow-up message (Enter)' : 'Send (Enter)');
   renderQueuedBar();
 }
 
@@ -1118,13 +1156,15 @@ function openProjectModal(proj = null) {
 
 // ---- Workspace & OS Folder Navigation
 function renderWorkspaceUI() {
-  const ws = S.settings?.workspace || '';
+  const ws = S.activeProject?.path || S.settings?.workspace || '';
   const base = S.activeProject?.name || ws.split(/[\\/]/).filter(Boolean).pop() || ws || '/';
   $('#wsTopLabel').textContent = base;
   $('#wsTopPill').title = S.activeProject
     ? `Project: ${S.activeProject.name} (${ws})`
     : `OS Folder: ${ws}`;
-  $('#osPathInput').value = S.cwd ? `${ws.replace(/[\\/]+$/, '')}/${S.cwd}` : ws;
+  const sep = ws.includes('\\') ? '\\' : '/';
+  const cleanCwd = S.cwd ? S.cwd.replace(/\//g, sep) : '';
+  $('#osPathInput').value = cleanCwd ? `${ws.replace(/[\\/]+$/, '')}${sep}${cleanCwd}` : ws;
 
   const q = $('#wsQuick');
   q.innerHTML = '';
@@ -1142,15 +1182,19 @@ async function navigateOsTo(targetPath) {
   try {
     const res = await CW.navigateOs(targetPath);
     S.settings = res.settings;
+    if (!S.settings.activeProjectId) S.activeProject = null;
     S.cwd = '';
     S.pinnedFiles = [];
     S.searchActive = false;
     $('#fileSearchInput').value = '';
     $('#fileSearchClearBtn').hidden = true;
     closeFileEditor(true);
+    renderSidebarTree();
     renderWorkspaceUI();
+    renderAutoAcceptPill();
     renderPinned();
     await loadFiles('');
+    loadOfficeQuickStrip();
   } catch (e) {
     toast(e.message, 3500);
   }
@@ -4113,10 +4157,11 @@ $('#saveProjectBtn').onclick = async () => {
     S.cwd = '';
     S.graphData = null;
     $('#projectModal').hidden = true;
-    renderProjectsList();
+    renderSidebarTree();
     renderWorkspaceUI();
     renderAutoAcceptPill();
     loadFiles('');
+    loadOfficeQuickStrip();
     toast(`Project "${S.activeProject.name}" ready`);
     if (S.activeProject.autoMapGraph) {
       triggerBackgroundGraphMap(S.activeProject);
@@ -4222,15 +4267,19 @@ $('#attachFileBtn').onclick = async () => {
 
 $('#modeSeg').onclick = (e) => { const b = e.target.closest('button[data-mode]'); if (b) setMode(b.dataset.mode); };
 $('#thinkSeg').onclick = (e) => { const b = e.target.closest('button[data-think]'); if (b) setThink(b.dataset.think); };
-$('#sendBtn').onclick = () => sendPrompt();
-$('#queueSendBtn').onclick = () => {
+$('#sendBtn').onclick = () => {
+  const curStream = getStreamForCurrentView();
   const inp = $('#promptInput');
   const txt = inp.value.trim();
-  if (!txt) { toast('Type a follow-up message to queue'); inp.focus(); return; }
-  if (queuePromptForCurrentChat(txt)) {
-    inp.value = '';
-    inp.style.height = 'auto';
+  if (curStream && txt) {
+    if (queuePromptForCurrentChat(txt)) {
+      inp.value = '';
+      inp.style.height = 'auto';
+      updateSendButtonState();
+    }
+    return;
   }
+  sendPrompt();
 };
 $('#promptInput').addEventListener('keydown', (e) => {
   if (e.key === 'Enter' && !e.shiftKey) {
@@ -4241,11 +4290,15 @@ $('#promptInput').addEventListener('keydown', (e) => {
       if (txt && queuePromptForCurrentChat(txt)) {
         inp.value = '';
         inp.style.height = 'auto';
+        updateSendButtonState();
       }
       return;
     }
     sendPrompt();
   }
+});
+$('#promptInput').addEventListener('input', () => {
+  if (getStreamForCurrentView()) updateSendButtonState();
 });
 $('#edAddRowBtn').onclick = () => {
   const sheet = getCurrentSheetObj();
@@ -5106,6 +5159,7 @@ projZoneDrop.addEventListener('drop', async (e) => {
       renderWorkspaceUI();
       renderAutoAcceptPill();
       loadFiles('');
+      loadOfficeQuickStrip();
       toast(`Created project "${r.project.name}" from dropped folder`);
       if (r.project.autoMapGraph) triggerBackgroundGraphMap(r.project);
     }

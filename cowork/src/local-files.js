@@ -55,15 +55,31 @@ function navigateOsFolder(targetPath) {
     next = path.dirname(cur);
   } else {
     let raw = String(targetPath || '').trim();
-    if (raw === '~' || raw.startsWith('~/')) {
+    if ((raw.startsWith('"') && raw.endsWith('"')) || (raw.startsWith("'") && raw.endsWith("'"))) {
+      raw = raw.slice(1, -1).trim();
+    }
+    if (raw === '~' || raw.startsWith('~/') || raw.startsWith('~\\')) {
       raw = path.join(os.homedir(), raw.slice(1));
     }
-    next = path.isAbsolute(raw) ? path.resolve(raw) : path.resolve(cur, raw);
+    next = (path.isAbsolute(raw) || /^[A-Za-z]:[\\/]/.test(raw))
+      ? path.resolve(raw)
+      : path.resolve(cur, raw);
   }
   if (!fs.existsSync(next) || !fs.statSync(next).isDirectory()) {
     throw new Error(`Folder not found: ${next}`);
   }
-  storage.saveSettings({ workspace: next });
+  // If user explicitly navigated outside the active project folder, detach activeProjectId so OS nav sticks
+  const activeProj = storage.getActiveProject();
+  const patch = { workspace: next };
+  if (activeProj) {
+    const pRoot = path.resolve(activeProj.path || '');
+    const cmpNext = process.platform === 'win32' ? next.toLowerCase() : next;
+    const cmpRoot = process.platform === 'win32' ? pRoot.toLowerCase() : pRoot;
+    if (cmpNext !== cmpRoot) {
+      patch.activeProjectId = '';
+    }
+  }
+  storage.saveSettings(patch);
   return next;
 }
 
@@ -106,19 +122,76 @@ async function readFileForEdit(relPath, baseDir = getWorkspace()) {
 }
 
 function getWorkspace() {
+  // Always honor the active project's folder when working inside a project!
+  const activeProj = storage.getActiveProject();
+  if (activeProj?.path) {
+    const pAbs = path.resolve(activeProj.path);
+    try {
+      if (fs.existsSync(pAbs) && fs.statSync(pAbs).isDirectory()) return pAbs;
+    } catch {}
+  }
   const ws = storage.getSettings().workspace || os.homedir();
-  return path.resolve(ws);
+  const resolved = path.resolve(ws);
+  try {
+    if (fs.existsSync(resolved) && fs.statSync(resolved).isDirectory()) return resolved;
+  } catch {}
+  return path.resolve(os.homedir());
 }
 
-function resolveSafe(relPath = '', baseDir = getWorkspace()) {
-  const root = path.resolve(baseDir);
-  const cleaned = String(relPath || '').replace(/\\/g, '/').replace(/^\/+/, '');
-  const abs = path.resolve(root, cleaned);
-  const rel = path.relative(root, abs);
-  if (rel.startsWith('..') || path.isAbsolute(rel)) {
-    throw new Error(`Path escapes workspace: ${relPath}`);
+function isInsideRoot(root, abs) {
+  const r = process.platform === 'win32' ? root.toLowerCase() : root;
+  const a = process.platform === 'win32' ? abs.toLowerCase() : abs;
+  const rel = path.relative(r, a);
+  return !rel.startsWith('..') && !path.isAbsolute(rel);
+}
+
+function resolveSafe(inputPath = '', baseDir = getWorkspace()) {
+  const root = path.resolve(baseDir || getWorkspace());
+  let raw = String(inputPath ?? '').trim();
+  if ((raw.startsWith('"') && raw.endsWith('"')) || (raw.startsWith("'") && raw.endsWith("'"))) {
+    raw = raw.slice(1, -1).trim();
   }
-  return { root, abs, rel: rel.replace(/\\/g, '/') };
+  if (!raw || raw === '.' || raw === './' || raw === '/') {
+    return { root, abs: root, rel: '' };
+  }
+
+  // Strip container mount prefix (/workspace/...) if a model references container paths
+  raw = raw.replace(/^\/workspace(?:\/|$)/i, '');
+  if (!raw) return { root, abs: root, rel: '' };
+
+  // Expand ~ home prefix
+  if (raw === '~' || raw.startsWith('~/') || raw.startsWith('~\\')) {
+    raw = path.join(os.homedir(), raw.slice(1));
+  }
+
+  const looksAbs = path.isAbsolute(raw) || /^[A-Za-z]:[\\/]/.test(raw);
+  let abs;
+  if (looksAbs) {
+    abs = path.resolve(raw);
+    if (!isInsideRoot(root, abs)) {
+      const isDrivePath = /^[A-Za-z]:[\\/]/.test(raw);
+      const asRel = !isDrivePath ? path.resolve(root, raw.replace(/^[/\\]+/, '')) : '';
+      const baseCandidate = path.resolve(root, path.basename(raw));
+      if (asRel && isInsideRoot(root, asRel) && fs.existsSync(asRel)) {
+        abs = asRel;
+      } else if (isInsideRoot(root, baseCandidate) && fs.existsSync(baseCandidate)) {
+        abs = baseCandidate;
+      } else if (asRel && isInsideRoot(root, asRel) && !fs.existsSync(abs)) {
+        abs = asRel;
+      } else {
+        throw new Error(`Path "${inputPath}" is outside active workspace (${root})`);
+      }
+    }
+  } else {
+    const cleaned = raw.replace(/\\/g, '/').replace(/^\.\//, '').replace(/^\/+/, '');
+    abs = path.resolve(root, cleaned);
+    if (!isInsideRoot(root, abs)) {
+      throw new Error(`Path "${inputPath}" escapes active workspace (${root})`);
+    }
+  }
+
+  const rel = path.relative(root, abs).replace(/\\/g, '/');
+  return { root, abs, rel };
 }
 
 // ---- Pure-JS ZIP XML text extractor for .docx / .xlsx / .pptx / .odt

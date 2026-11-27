@@ -127,7 +127,7 @@ function saveSettings(patch = {}) {
     if (k in DEFAULT_SETTINGS) next[k] = v;
   }
   if (next.endpointUrl) next.endpointUrl = String(next.endpointUrl).trim().replace(/\/+$/, '');
-  if (next.workspace) next.workspace = path.resolve(String(next.workspace).trim());
+  if (next.workspace) next.workspace = normalizeLocalPath(next.workspace);
   writeJson(SETTINGS_FILE, next);
   return next;
 }
@@ -392,6 +392,24 @@ function getProject(id) {
   return listProjects().find((p) => p.id === id) || null;
 }
 
+function normalizeLocalPath(inputPath) {
+  let raw = String(inputPath || '').trim();
+  // Strip accidental surrounding quotes from copied Windows/Linux paths
+  if ((raw.startsWith('"') && raw.endsWith('"')) || (raw.startsWith("'") && raw.endsWith("'"))) {
+    raw = raw.slice(1, -1).trim();
+  }
+  if (raw === '~' || raw.startsWith('~/') || raw.startsWith('~\\')) {
+    raw = path.join(os.homedir(), raw.slice(1));
+  }
+  return path.resolve(raw || defaultWorkspace());
+}
+
+function pathsEqual(a, b) {
+  const pa = path.resolve(String(a || ''));
+  const pb = path.resolve(String(b || ''));
+  return process.platform === 'win32' ? pa.toLowerCase() === pb.toLowerCase() : pa === pb;
+}
+
 function getActiveProject() {
   const s = getSettings();
   const all = listProjects();
@@ -399,18 +417,19 @@ function getActiveProject() {
     const found = all.find((p) => p.id === s.activeProjectId);
     if (found) return found;
   }
-  // Match by current workspace path if any project matches
   const ws = path.resolve(s.workspace || defaultWorkspace());
-  return all.find((p) => path.resolve(p.path || '') === ws) || null;
+  return all.find((p) => p.path && pathsEqual(p.path, ws)) || null;
 }
 
 function saveProject(proj) {
   const all = listProjects();
   const now = Date.now();
-  const resolvedPath = path.resolve(String(proj.path || getSettings().workspace || defaultWorkspace()).trim());
+  const resolvedPath = normalizeLocalPath(proj.path || getSettings().workspace || defaultWorkspace());
+  // Ensure the project directory exists so File Manager never hits ENOENT
+  try { fs.mkdirSync(resolvedPath, { recursive: true }); } catch {}
   const existing = proj.id
     ? all.find((x) => x.id === proj.id)
-    : all.find((x) => path.resolve(x.path || '') === resolvedPath);
+    : all.find((x) => x.path && pathsEqual(x.path, resolvedPath));
 
   const id = existing?.id || proj.id || newId('proj');
   const defaultName = path.basename(resolvedPath) || 'Workspace';

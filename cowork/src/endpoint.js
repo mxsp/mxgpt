@@ -32,6 +32,17 @@ const PROVIDER_PRESETS = [
     hint: 'Default hosted mx-GPT server at https://max.fyreflysystems.de (LFM3 Fast · Inkling Smart · nemotron-3.5-lightning Copilot B).',
   },
   {
+    id: 'opencode_go',
+    label: 'OpenCode Go',
+    badge: 'Go',
+    endpointType: 'openai',
+    endpointUrl: 'https://opencode.ai/zen/go/v1',
+    fastModel: 'glm-5',
+    smartModel: 'kimi-k2.5',
+    authMode: 'apikey',
+    hint: 'OpenCode Go subscription (https://opencode.ai/zen/go/v1) — GLM, Kimi, MiniMax & open-weight coding models with your OpenCode API key.',
+  },
+  {
     id: 'openai',
     label: 'OpenAI',
     endpointType: 'openai',
@@ -244,7 +255,12 @@ function anthropicHeaders(cfg) {
     'user-agent': USER_AGENT,
     'anthropic-version': '2023-06-01',
   };
-  if (cfg.apiKey) h['x-api-key'] = cfg.apiKey;
+  if (cfg.apiKey) {
+    h['x-api-key'] = cfg.apiKey;
+    if (/opencode\.ai\/zen\/go/i.test(cfg.endpointUrl || '')) {
+      h.authorization = `Bearer ${cfg.apiKey}`;
+    }
+  }
   return h;
 }
 
@@ -390,6 +406,20 @@ async function chatCompletion({
     });
   }
   if (cfg.endpointType === 'openai') {
+    // OpenCode Go routes MiniMax models through Anthropic-compatible /v1/messages
+    const isOpencodeGo = /opencode\.ai\/zen\/go/i.test(cfg.endpointUrl || '');
+    if (isOpencodeGo && /^minimax/i.test(chosenModel)) {
+      const goBase = String(cfg.endpointUrl).replace(/\/v1\/?$/, '');
+      return chatViaAnthropic({ ...cfg, endpointUrl: goBase }, {
+        model: chosenModel,
+        systemPrompt,
+        messages,
+        images: cleanImages,
+        think,
+        signal,
+        onEvent,
+      });
+    }
     return chatViaOpenAI(cfg, {
       model: chosenModel,
       systemPrompt,

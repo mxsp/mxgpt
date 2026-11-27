@@ -438,6 +438,12 @@ function registerIpc() {
       chat.title = prompt.slice(0, 56) + (prompt.length > 56 ? '…' : '');
     }
     chat.mode = mode;
+    if (chat.projectId && storage.getProject(chat.projectId)) {
+      const curProj = storage.getActiveProject();
+      if (!curProj || curProj.id !== chat.projectId) {
+        try { storage.setActiveProject(chat.projectId); } catch {}
+      }
+    }
 
     const userMsg = { id: storage.newId('u'), role: 'user', content: prompt, ts: Date.now() };
     const priorHistory = chat.messages.filter((m) => m.role === 'user' || m.role === 'assistant');

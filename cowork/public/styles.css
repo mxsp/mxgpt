@@ -846,8 +846,7 @@ svg { width: 20px; height: 20px; fill: none; stroke: currentColor; stroke-width:
 .queued-item { display: flex; align-items: center; gap: 8px; padding: 7px 10px; border-radius: 10px; border: 1px dashed color-mix(in srgb, var(--accent) 55%, var(--border)); background: color-mix(in srgb, var(--accent-soft) 35%, var(--bg-elev)); font-size: 12px; }
 .queued-num { font-family: var(--font-mono); font-size: 10.5px; font-weight: 700; color: var(--accent-ink); background: var(--accent-soft); padding: 2px 6px; border-radius: 999px; flex: none; }
 .queued-txt { flex: 1; min-width: 0; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; color: var(--text); }
-.queue-send-btn { height: 32px; padding: 0 11px; border-radius: 9px; border: 1px solid color-mix(in srgb, var(--accent) 45%, var(--border)); background: var(--accent-soft); color: var(--accent-ink); font-size: 12px; font-weight: 600; white-space: nowrap; transition: all .13s; }
-.queue-send-btn:hover { background: var(--accent); color: #fff; }
+.queued-edit-inp { flex: 1; min-width: 0; height: 26px; padding: 0 8px; border-radius: 7px; border: 1px solid var(--accent); background: var(--bg); color: var(--text); font-size: 12px; outline: none; }
 
 .ctx-view-pill { display: inline-flex; align-items: center; gap: 5px; padding: 3px 9px; border-radius: 999px; background: color-mix(in srgb, var(--accent-soft) 65%, var(--bg-elev)); border: 1px solid color-mix(in srgb, var(--accent) 35%, transparent); color: var(--accent-ink); font-size: 11px; font-weight: 600; }
 .ctx-view-pill .chat-live-dot { width: 6px; height: 6px; }

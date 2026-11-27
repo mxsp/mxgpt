@@ -37,17 +37,17 @@ flowchart LR
 
 Download the native Electron desktop application directly from **[GitHub Releases](https://github.com/mxsp/mxgpt/releases)** — styled identically to the `mx-GPT` web workspace, with built-in login (`https://max.fyreflysystems.de` default), multi-provider switching, local OS file navigation & live editing, and a built-in GitHub Release updater:
 
-- **Windows:** Extract `mx-Cowork-1.7.0-win-x64.zip` and double-click `mx-Cowork.exe`.
+- **Windows:** Extract `mx-Cowork-1.7.1-win-x64.zip` and double-click `mx-Cowork.exe`.
 - **Linux (AppImage — supports automatic in-app update & restart):**
   ```bash
-  chmod +x mx-Cowork-1.7.0.AppImage
-  ./mx-Cowork-1.7.0.AppImage
+  chmod +x mx-Cowork-1.7.1.AppImage
+  ./mx-Cowork-1.7.1.AppImage
   ```
 - **Linux (Debian / Ubuntu / Kali `.deb`):**
   ```bash
-  sudo apt install ./mx-cowork_1.7.0_amd64.deb
+  sudo apt install ./mx-cowork_1.7.1_amd64.deb
   ```
-- On launch, sign in to **`https://max.fyreflysystems.de`** (default) or switch to **Other Provider** (OpenAI, Anthropic, OpenRouter, Groq, Google Gemini, Mistral, Direct Ollama, LM Studio, or any OpenAI-compatible API).
+- On launch, sign in to **`https://max.fyreflysystems.de`** (default) or switch to **Other Provider** (**OpenCode Go**, OpenAI, Anthropic, OpenRouter, Groq, Google Gemini, Mistral, Direct Ollama, LM Studio, or any OpenAI-compatible API).
 
 ### Option 2: CLI One-Time Setup Script (Linux / macOS / Windows)
 
