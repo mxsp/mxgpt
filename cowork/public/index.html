@@ -37,11 +37,15 @@
   <symbol id="i-spark" viewBox="0 0 24 24"><path d="M12 2l1.9 7.1L21 11l-7.1 1.9L12 20l-1.9-7.1L3 11l7.1-1.9z"/></symbol>
   <symbol id="i-cpu" viewBox="0 0 24 24"><rect x="4" y="4" width="16" height="16" rx="2"/><rect x="9" y="9" width="6" height="6"/><path d="M9 1v3M15 1v3M9 20v3M15 20v3M20 9h3M20 14h3M1 9h3M1 14h3"/></symbol>
   <symbol id="i-agents" viewBox="0 0 24 24"><circle cx="12" cy="5" r="2.5"/><circle cx="6" cy="18" r="2.5"/><circle cx="18" cy="18" r="2.5"/><path d="M12 7.5V12M12 12L7.5 16M12 12l4.5 4"/></symbol>
-  <symbol id="i-mail" viewBox="0 0 24 24"><rect x="3" y="5" width="18" height="14" rx="2"/><path d="M3 7l9 6 9-6"/></symbol>
+  <symbol id="i-book" viewBox="0 0 24 24"><path d="M4 19.5A2.5 2.5 0 016.5 17H20M4 19.5V5a2.5 2.5 0 012.5-2.5H20v19H6.5A2.5 2.5 0 014 19.5z"/></symbol>
   <symbol id="i-undo" viewBox="0 0 24 24"><path d="M9 14L4 9l5-5"/><path d="M4 9h10.5a5.5 5.5 0 010 11H11"/></symbol>
   <symbol id="i-pin" viewBox="0 0 24 24"><path d="M12 17v5M9 10.76a2 2 0 01-1.11 1.79l-1.78.9A2 2 0 005 15.24V16h14v-.76a2 2 0 00-1.11-1.79l-1.78-.9A2 2 0 0115 10.76V7a1 1 0 011-1 2 2 0 000-4H8a2 2 0 000 4 1 1 0 011 1z"/></symbol>
   <symbol id="i-save" viewBox="0 0 24 24"><path d="M19 21H5a2 2 0 01-2-2V5a2 2 0 012-2h11l5 5v11a2 2 0 01-2 2z"/><path d="M17 21v-8H7v8M7 3v5h8"/></symbol>
   <symbol id="i-eye" viewBox="0 0 24 24"><path d="M2 12s3.5-7 10-7 10 7 10 7-3.5 7-10 7S2 12 2 12z"/><circle cx="12" cy="12" r="3"/></symbol>
+  <symbol id="i-box" viewBox="0 0 24 24"><path d="M21 16V8a2 2 0 00-1-1.73l-7-4a2 2 0 00-2 0l-7 4A2 2 0 003 8v8a2 2 0 001 1.73l7 4a2 2 0 002 0l7-4A2 2 0 0021 16z"/><path d="M3.27 6.96L12 12.01l8.73-5.05M12 22.08V12"/></symbol>
+  <symbol id="i-graph" viewBox="0 0 24 24"><circle cx="6" cy="6" r="2.5"/><circle cx="18" cy="7" r="2.5"/><circle cx="7" cy="18" r="2.5"/><circle cx="17" cy="17" r="2.5"/><path d="M8.3 6.5l7.2.4M7.2 8.2l8.1 7.1M6.4 8.5l.5 7M9.5 17.6l5-.4"/></symbol>
+  <symbol id="i-play" viewBox="0 0 24 24"><polygon points="6 4 20 12 6 20 6 4" fill="currentColor" stroke="none"/></symbol>
+  <symbol id="i-expand" viewBox="0 0 24 24"><path d="M15 3h6v6M9 21H3v-6M21 3l-7 7M3 21l7-7"/></symbol>
 </svg>
 
 <!-- Native Login Screen (identical visual style to mx-GPT login.html) -->
@@ -168,7 +172,9 @@
       </div>
       <div class="top-actions">
         <button class="ghost-btn" data-panel="files" title="Navigate OS folders, find &amp; edit local files"><svg><use href="#i-folder"/></svg><span>Files</span></button>
-        <button class="ghost-btn" data-panel="email" title="Email Studio &amp; .eml export"><svg><use href="#i-mail"/></svg><span>Email</span></button>
+        <button class="ghost-btn" data-panel="graph" title="Interactive Project Knowledge Graph"><svg><use href="#i-graph"/></svg><span>Graph</span></button>
+        <button class="ghost-btn" data-panel="container" title="Isolated Docker/Podman Container Code Execution"><svg><use href="#i-box"/></svg><span>Container</span></button>
+        <button class="ghost-btn" data-panel="notes" title="Persistent Copilot Memory Notes &amp; Quick Local Tools"><svg><use href="#i-book"/></svg><span>Notes</span></button>
         <button class="ghost-btn" data-panel="research" title="Web &amp; Wikipedia research desk"><svg><use href="#i-globe"/></svg><span>Research</span></button>
         <button class="ghost-btn" data-panel="undo" title="Undo local file edits &amp; actions"><svg><use href="#i-undo"/></svg><span>Undo</span><span class="badge-cnt" id="undoCount" hidden>0</span></button>
         <button class="icon-btn" id="themeBtn" title="Toggle theme"><svg id="themeIcon"><use href="#i-moon"/></svg></button>
@@ -180,19 +186,19 @@
         <section class="welcome" id="welcome">
           <div class="welcome-star"><svg><use href="#i-star"/></svg></div>
           <h1 id="greeting">Good evening</h1>
-          <p class="welcome-sub">Your private desktop AI coworker — local OS file access, research, and email.</p>
+          <p class="welcome-sub">Your local AI copilot — OS files, container code execution, project knowledge graphs, Git &amp; web research.</p>
           <div class="suggestions">
-            <button class="starter" data-prompt="Search my current workspace folder, summarize the key files and topics here, and highlight what looks most important.">
-              <svg><use href="#i-folder"/></svg><span>Search &amp; summarize my files</span>
+            <button class="starter" data-prompt="Map this project into a knowledge graph, explain the architecture, core hub files, and key dependencies.">
+              <svg><use href="#i-graph"/></svg><span>Map project knowledge graph</span>
             </button>
-            <button class="starter" data-prompt="Audit my current workspace folder and propose a clean subfolder organization plan using file-actions so I can approve and apply it safely.">
-              <svg><use href="#i-edit"/></svg><span>Organize &amp; edit folder files</span>
+            <button class="starter" data-prompt="Write and run a Python script in the container to inspect the files in /workspace and print a clean summary report.">
+              <svg><use href="#i-box"/></svg><span>Run code in container</span>
             </button>
-            <button class="starter" data-prompt="Research the latest open-source local LLM trends and create a concise executive brief with sources.">
-              <svg><use href="#i-globe"/></svg><span>Deep web research brief</span>
+            <button class="starter" data-prompt="Inspect my Git status, recent commits, and local workspace files to summarize what I was working on and suggest next steps.">
+              <svg><use href="#i-folder"/></svg><span>Inspect Git &amp; workspace</span>
             </button>
-            <button class="starter" data-prompt="Draft a polished, friendly follow-up email summarizing project progress and proposing two 30-minute call slots next week.">
-              <svg><use href="#i-mail"/></svg><span>Draft a polished email</span>
+            <button class="starter" data-prompt="Check my local system hardware and installed dev runtimes, then search the web for the latest local LLM optimization tips.">
+              <svg><use href="#i-globe"/></svg><span>System check &amp; web research</span>
             </button>
           </div>
         </section>
@@ -206,9 +212,10 @@
           <div class="composer-bar">
             <div class="c-left">
               <button class="icon-btn" id="attachFileBtn" title="Attach / pin local OS files to chat"><svg><use href="#i-plus"/></svg></button>
-              <button class="tool-toggle on" id="filesAccessBtn" title="Open OS File Explorer &amp; Editor"><svg><use href="#i-folder"/></svg><span>OS Files</span></button>
-              <button class="tool-toggle" id="openBrowseBtn" title="Choose another OS workspace folder"><svg><use href="#i-search"/></svg><span>Browse…</span></button>
-              <div class="think-control" id="thinkControl" title="Smart model reasoning depth">
+              <button class="tool-toggle on" id="webToggleBtn" title="Toggle Web Search &amp; URL Page Reader"><svg><use href="#i-globe"/></svg><span>Web</span></button>
+              <button class="tool-toggle on" id="filesToggleBtn" title="Toggle Local OS File Access"><svg><use href="#i-folder"/></svg><span>Files</span></button>
+              <button class="tool-toggle on" id="containerToggleBtn" title="Toggle Container Code Execution"><svg><use href="#i-box"/></svg><span>Container</span></button>
+              <div class="think-control" id="thinkControl" title="Smart / Copilot reasoning depth">
                 <span class="think-label">Think</span>
                 <div class="think-seg" id="thinkSeg" role="radiogroup" aria-label="Thinking effort">
                   <button type="button" data-think="off">Off</button>
@@ -219,12 +226,13 @@
               </div>
             </div>
             <div class="c-right">
-              <div class="mode-control" id="modeControl" data-mode="copilot" title="Fast = instant model · Smart = deep reasoning · Copilot = Smart orchestrates Fast workers">
+              <div class="mode-control" id="modeControl" data-mode="copilot" title="Fast · Smart · Copilot (Smart + Fast) · Copilot (B) (gpt-oss:20b + Fast)">
                 <div class="mode-seg" id="modeSeg" role="radiogroup" aria-label="Execution mode">
                   <span class="mode-thumb" aria-hidden="true"></span>
                   <button type="button" data-mode="fast" role="radio" aria-checked="false" title="Fast model direct"><svg><use href="#i-cpu"/></svg><span>Fast</span></button>
                   <button type="button" data-mode="smart" role="radio" aria-checked="false" title="Smart model direct"><svg><use href="#i-spark"/></svg><span>Smart</span></button>
-                  <button type="button" data-mode="copilot" class="on" role="radio" aria-checked="true" title="Copilot — Smart orchestrates Fast workers + local OS files"><svg><use href="#i-agents"/></svg><span>Copilot</span></button>
+                  <button type="button" data-mode="copilot" class="on" role="radio" aria-checked="true" title="Copilot — Smart orchestrates Fast workers &amp; local tools"><svg><use href="#i-agents"/></svg><span>Copilot</span></button>
+                  <button type="button" data-mode="copilot_b" role="radio" aria-checked="false" title="Copilot (B) — gpt-oss:20b orchestrates Fast workers &amp; local tools"><svg><use href="#i-agents"/></svg><span>Copilot (B)</span></button>
                 </div>
               </div>
               <button class="send-btn" id="sendBtn" title="Send (Enter)"><svg id="sendIcon"><use href="#i-send"/></svg></button>
@@ -308,39 +316,119 @@
         </div>
       </section>
 
-      <!-- Email Studio Pane -->
-      <section class="pane" data-pane="email">
+      <!-- Interactive Project Knowledge Graph Pane -->
+      <section class="pane" data-pane="graph" id="graphPane">
+        <div class="graph-toolbar">
+          <div class="row-gap">
+            <button class="btn tiny primary" id="graphBuildBtn"><svg><use href="#i-refresh"/></svg>Map Project</button>
+            <button class="btn tiny" id="graphAiSummaryBtn"><svg><use href="#i-spark"/></svg>AI Map</button>
+            <button class="btn tiny" id="graphFitBtn" title="Fit graph to view">Fit</button>
+            <button class="btn tiny" id="graphExpandBtn" title="Toggle fullscreen knowledge graph"><svg><use href="#i-expand"/></svg>Expand</button>
+          </div>
+          <div class="graph-zoom-btns">
+            <button class="icon-btn sm" id="graphZoomOutBtn" title="Zoom out">−</button>
+            <button class="icon-btn sm" id="graphZoomInBtn" title="Zoom in">+</button>
+          </div>
+        </div>
+        <div class="files-search">
+          <input type="text" id="graphSearchInput" placeholder="Spotlight files, folders, symbols…" />
+        </div>
+        <div class="graph-filters" id="graphFilters">
+          <button type="button" class="gf-chip on" data-kind="code"><i style="background:#c96442"></i>Code</button>
+          <button type="button" class="gf-chip on" data-kind="doc"><i style="background:#2f855a"></i>Docs</button>
+          <button type="button" class="gf-chip on" data-kind="config"><i style="background:#c07b18"></i>Config</button>
+          <button type="button" class="gf-chip on" data-kind="style"><i style="background:#b85c7e"></i>UI</button>
+          <button type="button" class="gf-chip on" data-kind="test"><i style="background:#0d9488"></i>Tests</button>
+          <button type="button" class="gf-chip on" data-kind="folder"><i style="background:#85786c"></i>Folders</button>
+          <button type="button" class="gf-chip on" data-kind="package"><i style="background:#5b67ca"></i>Packages</button>
+        </div>
+        <div class="graph-stats" id="graphStats">Click "Map Project" to analyze your workspace…</div>
+        <div class="graph-ai-box prose" id="graphAiBox" hidden></div>
+        <div class="graph-stage" id="graphStage">
+          <canvas id="graphCanvas"></canvas>
+          <div class="graph-legend">
+            <span>Drag nodes · Scroll to zoom · Double-click file to edit</span>
+          </div>
+        </div>
+        <div class="graph-inspector" id="graphInspector" hidden>
+          <div class="gi-head">
+            <div>
+              <b id="giTitle">file.js</b>
+              <small id="giPath"></small>
+            </div>
+            <div class="row-gap">
+              <button class="btn tiny primary" id="giEditBtn">Edit</button>
+              <button class="btn tiny" id="giPinBtn">Pin</button>
+              <button class="btn tiny" id="giAskBtn">Ask Cowork</button>
+            </div>
+          </div>
+          <div class="gi-meta" id="giMeta"></div>
+          <div class="gi-links" id="giLinks"></div>
+        </div>
+      </section>
+
+      <!-- Container Code Execution Sandbox Pane -->
+      <section class="pane" data-pane="container">
+        <div class="pane-pad">
+          <div class="ct-status" id="ctStatusBanner">
+            <span id="ctStatusText">Checking Docker / Podman…</span>
+            <button class="btn tiny" id="ctRefreshBtn">Re-check</button>
+          </div>
+          <div class="ct-controls">
+            <select id="ctLang">
+              <option value="python">Python 3</option>
+              <option value="javascript">Node.js</option>
+              <option value="bash">Shell / Bash</option>
+            </select>
+            <input type="text" id="ctImage" value="python:3.12-slim" placeholder="Image (e.g. python:3.12-slim)" />
+            <select id="ctNet" title="Container network isolation">
+              <option value="none">Net: Isolated (none)</option>
+              <option value="bridge">Net: Bridge (online)</option>
+            </select>
+            <select id="ctMount" title="Workspace mount permissions">
+              <option value="rw">/workspace (RW)</option>
+              <option value="ro">/workspace (Read-Only)</option>
+            </select>
+          </div>
+          <div class="ct-presets" id="ctImagePresets"></div>
+          <textarea class="ct-editor" id="ctCodeInput" rows="7" spellcheck="false" placeholder="# Code or command to execute inside isolated container mounted at /workspace&#10;import os&#10;print('Files in /workspace:', os.listdir('/workspace')[:15])"></textarea>
+          <div class="row-gap">
+            <button class="btn tiny primary" id="ctRunBtn"><svg><use href="#i-play"/></svg>Run in Container</button>
+            <button class="btn tiny danger" id="ctStopBtn" hidden>Stop Container</button>
+            <button class="btn tiny" id="ctSendOutBtn">Send Output to Cowork</button>
+            <span class="ct-meta" id="ctRunMeta"></span>
+          </div>
+          <pre class="ct-term" id="ctTerminal">Container output will stream here…</pre>
+          <div class="sb-label" style="padding:4px 0 2px">Recent Container Runs</div>
+          <div class="saved-list" id="ctHistoryList" style="max-height:140px;flex:none"></div>
+        </div>
+      </section>
+
+      <!-- Persistent Memory Notes & Quick Local Tools Pane -->
+      <section class="pane" data-pane="notes">
         <div class="pane-pad">
           <div class="pane-head-row">
-            <span class="sb-label" style="padding:0">Compose Draft</span>
-            <div class="row-gap">
-              <button class="btn tiny" id="newDraftBtn">+ New</button>
-              <button class="btn tiny primary" id="saveDraftBtn">Save</button>
-            </div>
+            <span class="sb-label" style="padding:0">Quick Local Tools</span>
+          </div>
+          <div class="row-gap">
+            <button class="btn tiny" id="quickGitBtn">Git Status &amp; Log</button>
+            <button class="btn tiny" id="quickSysBtn">System &amp; Runtimes</button>
+            <button class="btn tiny" id="quickCalcBtn">JS Eval</button>
+          </div>
+          <pre class="ct-term" id="quickToolOut" style="max-height:140px;flex:none" hidden></pre>
+
+          <div class="pane-head-row" style="margin-top:4px">
+            <span class="sb-label" style="padding:0">Persistent Copilot Memory Notes</span>
           </div>
           <div class="email-form">
-            <input type="text" id="mailTo" placeholder="To: recipient@example.com" />
-            <input type="text" id="mailCc" placeholder="Cc: (optional)" />
-            <input type="text" id="mailSubject" placeholder="Subject" />
-            <textarea id="mailBody" rows="9" placeholder="Email body… Copilot drafts appear here automatically."></textarea>
-            <div class="refine-row">
-              <span class="ref-lbl">AI Refine:</span>
-              <button class="chip-btn" data-refine="shorter">Shorter</button>
-              <button class="chip-btn" data-refine="formal">Formal</button>
-              <button class="chip-btn" data-refine="friendly">Friendly</button>
-              <button class="chip-btn" data-refine="direct">Direct</button>
-              <button class="chip-btn" data-refine="fix_grammar">Grammar</button>
-              <button class="chip-btn" data-refine="translate_de">→ DE</button>
-              <button class="chip-btn" data-refine="translate_en">→ EN</button>
-            </div>
+            <input type="text" id="noteTitleInput" placeholder="Note title (e.g. Project deploy rules, Preferences)" />
+            <input type="text" id="noteTagsInput" placeholder="Tags (comma separated, optional)" />
+            <textarea id="noteContentInput" rows="3" style="min-height:70px" placeholder="Facts or instructions Copilot should remember across chats…"></textarea>
             <div class="row-gap">
-              <button class="btn tiny" id="copyMailBtn">Copy</button>
-              <button class="btn tiny" id="mailtoBtn">Open in Mail</button>
-              <button class="btn tiny primary" id="exportEmlBtn">Export .eml</button>
+              <button class="btn tiny primary" id="saveNoteBtn">Save Note</button>
             </div>
           </div>
-          <div class="sb-label" style="padding:14px 0 6px">Saved Drafts</div>
-          <div class="saved-list" id="draftsList"></div>
+          <div class="saved-list" id="notesList"></div>
         </div>
       </section>
 
@@ -372,93 +460,209 @@
   </aside>
 </div>
 
-<!-- Settings & Providers Modal -->
+<!-- Settings, Providers & Tools Modal -->
 <div class="modal-backdrop" id="settingsModal" hidden>
   <div class="modal modal-lg">
     <div class="modal-head">
       <div>
-        <h2>Providers &amp; Settings</h2>
-        <p class="sub">Default endpoint is <b>https://max.fyreflysystems.de</b> — or switch to OpenAI, Anthropic, OpenRouter, Groq, Gemini, Mistral, or Ollama.</p>
+        <h2>Settings</h2>
+        <p class="sub">Configure AI providers, models (including Copilot B <code>gpt-oss:20b</code>), local tools, and container sandbox.</p>
       </div>
       <button class="icon-btn" id="closeSettingsBtn"><svg><use href="#i-x"/></svg></button>
     </div>
+    <div class="settings-tabs" id="settingsTabs">
+      <button type="button" data-stab="providers" class="active">Providers &amp; Models</button>
+      <button type="button" data-stab="tools">Tools &amp; Capabilities</button>
+      <button type="button" data-stab="container">Container Sandbox</button>
+    </div>
     <div class="modal-body">
-      <div class="field">
-        <div class="field-label-row">
-          <span>Provider Preset</span>
-          <button type="button" class="link-btn" id="resetDefaultProviderBtn">Reset to Default (max.fyreflysystems.de)</button>
-        </div>
-        <div class="provider-chips" id="providerChips"></div>
-        <div class="provider-hint" id="providerHint"></div>
-      </div>
-
-      <div class="field-row">
-        <label class="field" style="flex:0.85">
-          <span>Protocol</span>
-          <select id="setEndpointType">
-            <option value="mxgpt">mx-GPT (Default)</option>
-            <option value="openai">OpenAI-Compatible</option>
-            <option value="anthropic">Anthropic Claude</option>
-            <option value="ollama">Direct Ollama</option>
-          </select>
-        </label>
-        <label class="field" style="flex:1.4">
-          <span>Endpoint URL</span>
-          <input type="text" id="setEndpointUrl" placeholder="https://max.fyreflysystems.de" />
-        </label>
-      </div>
-
-      <div class="field-row" id="authFields">
-        <label class="field">
-          <span>Username / Account ID</span>
-          <input type="text" id="setUsername" placeholder="e.g. 1001" />
-        </label>
-        <label class="field">
-          <span>Password</span>
-          <input type="password" id="setPassword" placeholder="Leave blank to keep saved" />
-        </label>
-      </div>
-
-      <div class="field" id="apiKeyField" hidden>
-        <span>API Key</span>
-        <input type="password" id="setApiKey" placeholder="sk-... (stored locally on this machine)" />
-      </div>
-
-      <div class="field-row">
-        <label class="field">
-          <span>Fast Model (Workers &amp; Fast Mode)</span>
-          <input type="text" id="setFastModel" placeholder="lfm3:latest" />
-        </label>
-        <label class="field">
-          <span>Smart Model (Orchestrator &amp; Smart Mode)</span>
-          <input type="text" id="setSmartModel" placeholder="inkling-2-mini:latest" />
-        </label>
-      </div>
-
-      <div class="fetched-models" id="fetchedModelsWrap" hidden>
-        <div class="fm-head">
-          <span>Available Models (click to assign)</span>
-          <div class="fm-target" id="fmTarget">
-            <button type="button" data-target="fast" class="on">Assign → Fast</button>
-            <button type="button" data-target="smart">Assign → Smart</button>
+      <!-- Tab 1: Providers & Models -->
+      <div class="stab-pane active" data-spane="providers">
+        <div class="field">
+          <div class="field-label-row">
+            <span>Provider Preset</span>
+            <button type="button" class="link-btn" id="resetDefaultProviderBtn">Reset to Default (max.fyreflysystems.de)</button>
           </div>
+          <div class="provider-chips" id="providerChips"></div>
+          <div class="provider-hint" id="providerHint"></div>
         </div>
-        <div class="fm-list" id="fetchedModelsList"></div>
+
+        <div class="field-row">
+          <label class="field" style="flex:0.85">
+            <span>Protocol</span>
+            <select id="setEndpointType">
+              <option value="mxgpt">mx-GPT (Default)</option>
+              <option value="openai">OpenAI-Compatible</option>
+              <option value="anthropic">Anthropic Claude</option>
+              <option value="ollama">Direct Ollama</option>
+            </select>
+          </label>
+          <label class="field" style="flex:1.4">
+            <span>Endpoint URL</span>
+            <input type="text" id="setEndpointUrl" placeholder="https://max.fyreflysystems.de" />
+          </label>
+        </div>
+
+        <div class="field-row" id="authFields">
+          <label class="field">
+            <span>Username / Account ID</span>
+            <input type="text" id="setUsername" placeholder="e.g. 1001" />
+          </label>
+          <label class="field">
+            <span>Password</span>
+            <input type="password" id="setPassword" placeholder="Leave blank to keep saved" />
+          </label>
+        </div>
+
+        <div class="field" id="apiKeyField" hidden>
+          <span>API Key</span>
+          <input type="password" id="setApiKey" placeholder="sk-... (stored locally on this machine)" />
+        </div>
+
+        <div class="field-row">
+          <label class="field">
+            <span>Fast Model (Workers)</span>
+            <input type="text" id="setFastModel" placeholder="lfm3:latest" />
+          </label>
+          <label class="field">
+            <span>Smart / Copilot Model</span>
+            <input type="text" id="setSmartModel" placeholder="inkling-2-mini:latest" />
+          </label>
+        </div>
+        <label class="field">
+          <span>Copilot (B) Orchestrator Model</span>
+          <input type="text" id="setCopilotBModel" placeholder="gpt-oss:20b" />
+        </label>
+
+        <div class="fetched-models" id="fetchedModelsWrap" hidden>
+          <div class="fm-head">
+            <span>Available Models (click to assign)</span>
+            <div class="fm-target" id="fmTarget">
+              <button type="button" data-target="fast" class="on">Fast</button>
+              <button type="button" data-target="smart">Smart</button>
+              <button type="button" data-target="copilot_b">Copilot (B)</button>
+            </div>
+          </div>
+          <div class="fm-list" id="fetchedModelsList"></div>
+        </div>
+        <div class="test-out" id="testOut" hidden></div>
       </div>
 
-      <label class="field">
-        <span>Local OS Workspace Folder</span>
-        <input type="text" id="setWorkspace" placeholder="/home/user/Documents or C:\Users\...\Documents" />
-      </label>
-      <label class="field">
-        <span>Default Email Signature (optional)</span>
-        <textarea id="setSignature" rows="2" placeholder="Best regards,"></textarea>
-      </label>
-      <label class="check-field">
-        <input type="checkbox" id="setAutoApprove" />
-        <span>Auto-apply Copilot file actions without confirmation</span>
-      </label>
-      <div class="test-out" id="testOut" hidden></div>
+      <!-- Tab 2: Tools & Capabilities -->
+      <div class="stab-pane" data-spane="tools">
+        <div class="tool-settings-grid">
+          <label class="tool-setting-card">
+            <input type="checkbox" id="setToolWeb" />
+            <div><b>Web Search &amp; URL Reader</b><small>DuckDuckGo search, Wikipedia lookup, and clean full-page reading for pasted URLs.</small></div>
+          </label>
+          <label class="tool-setting-card">
+            <input type="checkbox" id="setToolOsFiles" />
+            <div><b>Local OS File Access &amp; Editor</b><small>Search PDF/DOCX/XLSX/code, audit folders, and propose undoable file edits.</small></div>
+          </label>
+          <label class="tool-setting-card">
+            <input type="checkbox" id="setToolContainer" />
+            <div><b>Container Code Execution</b><small>Let models propose/run Python, Node.js, or Shell scripts in Docker/Podman.</small></div>
+          </label>
+          <label class="tool-setting-card">
+            <input type="checkbox" id="setToolGraph" />
+            <div><b>Project Knowledge Graph</b><small>Map workspace files, imports, dependencies, and symbols for architectural awareness.</small></div>
+          </label>
+          <label class="tool-setting-card">
+            <input type="checkbox" id="setToolGit" />
+            <div><b>Local Git Inspector</b><small>Read git status, branch, recent commits, and diffs inside the workspace.</small></div>
+          </label>
+          <label class="tool-setting-card">
+            <input type="checkbox" id="setToolSystem" />
+            <div><b>System &amp; Dev Environment</b><small>Inspect OS, CPU, RAM, free disk space, and installed runtimes (Node, Python, Docker, Go…).</small></div>
+          </label>
+          <label class="tool-setting-card">
+            <input type="checkbox" id="setToolCalc" />
+            <div><b>Sandboxed JS / Math Evaluator</b><small>Instant exact calculations, JSON/regex transforms, and date math in an isolated VM.</small></div>
+          </label>
+          <label class="tool-setting-card">
+            <input type="checkbox" id="setToolNotes" />
+            <div><b>Persistent Memory Notes</b><small>Remember project notes and preferences across conversations.</small></div>
+          </label>
+        </div>
+
+        <div class="settings-sep"></div>
+        <div class="field-row">
+          <label class="field">
+            <span>Web Search Max Results</span>
+            <input type="number" id="setWebMaxResults" min="2" max="10" value="5" />
+          </label>
+          <label class="field">
+            <span>Wikipedia Language</span>
+            <select id="setWikiLang">
+              <option value="en">English (en)</option>
+              <option value="de">Deutsch (de)</option>
+              <option value="fr">Français (fr)</option>
+              <option value="es">Español (es)</option>
+            </select>
+          </label>
+        </div>
+        <label class="check-field">
+          <input type="checkbox" id="setWebFetchPages" />
+          <span>Fetch full page content for top web search results (richer answers, slightly slower)</span>
+        </label>
+        <label class="field">
+          <span>Local OS Workspace Folder</span>
+          <input type="text" id="setWorkspace" placeholder="/home/user/Documents or C:\Users\...\Documents" />
+        </label>
+        <label class="check-field">
+          <input type="checkbox" id="setAutoApprove" />
+          <span>Auto-apply Copilot file actions without confirmation</span>
+        </label>
+      </div>
+
+      <!-- Tab 3: Container Sandbox -->
+      <div class="stab-pane" data-spane="container">
+        <p class="muted-note">Containers run with <code>--cap-drop=ALL</code>, <code>--security-opt=no-new-privileges</code>, PID/RAM/CPU limits, and auto-cleanup (<code>--rm</code>).</p>
+        <div class="field-row">
+          <label class="field">
+            <span>Container Runtime</span>
+            <select id="setContainerRuntime">
+              <option value="auto">Auto-detect (Docker / Podman)</option>
+              <option value="docker">Docker</option>
+              <option value="podman">Podman</option>
+            </select>
+          </label>
+          <label class="field">
+            <span>Default Container Image</span>
+            <input type="text" id="setContainerImage" placeholder="python:3.12-slim" />
+          </label>
+        </div>
+        <div class="field-row">
+          <label class="field">
+            <span>Network Mode</span>
+            <select id="setContainerNet">
+              <option value="none">Isolated (none — safest)</option>
+              <option value="bridge">Bridge (internet access)</option>
+            </select>
+          </label>
+          <label class="field">
+            <span>Workspace Mount</span>
+            <select id="setContainerMount">
+              <option value="rw">Read-Write (/workspace:rw)</option>
+              <option value="ro">Read-Only (/workspace:ro)</option>
+            </select>
+          </label>
+        </div>
+        <div class="field-row">
+          <label class="field">
+            <span>Timeout (seconds)</span>
+            <input type="number" id="setContainerTimeout" min="5" max="180" value="30" />
+          </label>
+          <label class="field">
+            <span>Memory Limit (MB)</span>
+            <input type="number" id="setContainerMem" min="128" max="8192" value="1024" />
+          </label>
+        </div>
+        <label class="check-field">
+          <input type="checkbox" id="setAutoApproveContainer" />
+          <span>Auto-execute Copilot container code runs without confirmation</span>
+        </label>
+      </div>
     </div>
     <div class="modal-foot">
       <button class="btn danger" id="settingsLogoutBtn" style="margin-right:auto">Sign Out</button>
@@ -534,6 +738,7 @@
 </div>
 
 <div class="toast" id="toast"></div>
+<script src="./graph-ui.js"></script>
 <script src="./app.js"></script>
 </body>
 </html>

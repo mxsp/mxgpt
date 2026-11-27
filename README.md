@@ -37,15 +37,15 @@ flowchart LR
 
 Download the native Electron desktop application directly from **[GitHub Releases](https://github.com/mxsp/mxgpt/releases)** — styled identically to the `mx-GPT` web workspace, with built-in login (`https://max.fyreflysystems.de` default), multi-provider switching, local OS file navigation & live editing, and a built-in GitHub Release updater:
 
-- **Windows:** Extract `mx-Cowork-1.2.0-win-x64.zip` and double-click `mx-Cowork.exe`.
+- **Windows:** Extract `mx-Cowork-1.3.0-win-x64.zip` and double-click `mx-Cowork.exe`.
 - **Linux (AppImage — supports 1-click in-app self-update):**
   ```bash
-  chmod +x mx-Cowork-1.2.0.AppImage
-  ./mx-Cowork-1.2.0.AppImage
+  chmod +x mx-Cowork-1.3.0.AppImage
+  ./mx-Cowork-1.3.0.AppImage
   ```
 - **Linux (Debian / Ubuntu / Kali `.deb`):**
   ```bash
-  sudo apt install ./mx-cowork_1.2.0_amd64.deb
+  sudo apt install ./mx-cowork_1.3.0_amd64.deb
   ```
 - On launch, sign in to **`https://max.fyreflysystems.de`** (default) or switch to **Other Provider** (OpenAI, Anthropic, OpenRouter, Groq, Google Gemini, Mistral, Direct Ollama, LM Studio, or any OpenAI-compatible API).
 
@@ -112,10 +112,11 @@ Produces `dist/mx-cowork-linux-x64.tar.gz`, `dist/mx-cowork-windows-x64.zip`, `d
 
 ### mx-Cowork Native Desktop App (`cowork/`)
 - **Identical `mx-GPT` Visual Design + Native Login**: Warm parchment / charcoal UI matching `mx-GPT`, with a built-in login screen pre-configured for **`https://max.fyreflysystems.de`** and 1-click switching to **OpenAI**, **Anthropic**, **OpenRouter**, **Groq**, **Google Gemini**, **Mistral**, **Direct Ollama**, **LM Studio**, or any OpenAI-compatible endpoint.
-- **Copilot Orchestrator (`Fast` · `Smart` · `Copilot`)**: Smart model plans tasks and synthesizes final deliverables; Fast model handles local retrieval, document extraction, and web distillation.
-- **OS File Navigation, Find & Live Editor**: Jump across OS folders (`Home`, `Desktop`, `Documents`, `Downloads`, parent `↑`, typed path bar, native OS folder picker), search filenames & content (`.pdf`, `.docx`, `.xlsx`, `.md`, code), create/rename/delete files, and edit local files right inside the app (`Ctrl+S`) with automatic **1-click Undo** snapshots.
-- **Built-in GitHub Release Updater**: Checks `mxsp/mxgpt` Releases, verifies `SHA256SUMS.txt`, and supports 1-click self-update & relaunch on Linux AppImage and Windows (plus verified `.deb` download & install command).
-- **Email Drafting Studio & Research Desk**: Auto-filled drafts from Copilot, 1-click AI refinements, native Save As `.eml`, direct OS Mail launch, and local DuckDuckGo + Wikipedia research briefs.
+- **4 Execution Modes (`Fast` · `Smart` · `Copilot` · `Copilot (B)`)**: `Copilot` uses your Smart model (`inkling-2-mini`) as orchestrator + Fast workers; **`Copilot (B)`** uses **`gpt-oss:20b`** (configurable) as orchestrator + Fast workers.
+- **Container Code Execution (`Docker` / `Podman`)**: Isolated ephemeral containers mounted at `/workspace` (`--cap-drop=ALL`, `--security-opt=no-new-privileges`, `--network=none` default, RAM/CPU limits, live streaming output, 1-click Stop). Models propose approval-gated `code-run` cards in chat, or run Python / Node.js / Bash directly in the **Container** tab.
+- **Interactive Project Knowledge Graph**: Force-directed visual map of local files, folders, imports, Markdown links, external packages, and extracted symbols — with zoom/pan, node drag, search spotlight, type filters, fullscreen expand, clickable node inspector (`Edit`, `Pin`, `Ask Cowork`), and AI architectural summaries.
+- **OS File Navigation, Live Editor & Local Copilot Tools**: Browse anywhere on your OS, search filenames & contents (`.pdf`, `.docx`, `.xlsx`, `.md`, code), edit files live (`Ctrl+S` with automatic **1-click Undo**), plus **Git Inspector**, **System & Runtimes Info**, **Sandboxed JS Evaluator**, **Persistent Memory Notes**, **Web Search / URL Reader**, and granular **Tool Settings**.
+- **Built-in Software Updater (Gimel-style)**: Checks `mxsp/mxgpt` Releases, verifies `SHA256SUMS.txt`, and supports 1-click self-update & relaunch on Linux AppImage and Windows (plus verified `.deb` download).
 
 ---
 

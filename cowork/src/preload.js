@@ -75,6 +75,21 @@ contextBridge.exposeInMainWorld('cowork', {
     return ipcRenderer.invoke('files:pinDropped', paths);
   },
 
+  // Container Code Execution Sandbox
+  containerStatus: (opts) => ipcRenderer.invoke('container:status', opts || {}),
+  runInContainer: (opts) => ipcRenderer.invoke('container:run', opts || {}),
+  stopContainerRun: (runId) => ipcRenderer.invoke('container:stop', runId),
+  listContainerRuns: () => ipcRenderer.invoke('container:history'),
+  onContainerOutput: (cb) => {
+    const listener = (_, msg) => cb(msg);
+    ipcRenderer.on('container:output', listener);
+    return () => ipcRenderer.removeListener('container:output', listener);
+  },
+
+  // Project Knowledge Graph
+  buildGraph: (opts) => ipcRenderer.invoke('graph:build', opts || {}),
+  summarizeGraph: () => ipcRenderer.invoke('graph:summarize'),
+
   // Research Desk
   researchSearch: (q) => ipcRenderer.invoke('research:search', q),
   listBriefs: () => ipcRenderer.invoke('research:list'),
@@ -82,11 +97,11 @@ contextBridge.exposeInMainWorld('cowork', {
   deleteBrief: (id) => ipcRenderer.invoke('research:delete', id),
   exportBriefMd: (brief) => ipcRenderer.invoke('research:exportMd', brief),
 
-  // Email Studio
-  listDrafts: () => ipcRenderer.invoke('email:list'),
-  saveDraft: (draft) => ipcRenderer.invoke('email:save', draft),
-  deleteDraft: (id) => ipcRenderer.invoke('email:delete', id),
-  refineDraft: (opts) => ipcRenderer.invoke('email:refine', opts),
-  saveEml: (draft) => ipcRenderer.invoke('email:saveEml', draft),
-  openEmlInMail: (draft) => ipcRenderer.invoke('email:openEml', draft),
+  // Persistent Copilot Memory Notes & Local Tools
+  listNotes: () => ipcRenderer.invoke('notes:list'),
+  saveNote: (note) => ipcRenderer.invoke('notes:save', note),
+  deleteNote: (id) => ipcRenderer.invoke('notes:delete', id),
+  gitInspect: (focus) => ipcRenderer.invoke('tools:gitInspect', focus),
+  systemInfo: () => ipcRenderer.invoke('tools:systemInfo'),
+  calcJs: (code) => ipcRenderer.invoke('tools:calcJs', code),
 });

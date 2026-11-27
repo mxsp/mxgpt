@@ -20,9 +20,11 @@ const storage = require('./storage');
 const endpoint = require('./endpoint');
 const localFiles = require('./local-files');
 const research = require('./research');
-const emailMod = require('./email');
 const copilot = require('./copilot');
 const updater = require('./updater');
+const containerRunner = require('./container-runner');
+const knowledgeGraph = require('./knowledge-graph');
+const localTools = require('./local-tools');
 
 const ACTIVE_RUNS = new Map(); // chatId -> AbortController
 let mainWindow = null;
@@ -78,6 +80,7 @@ function buildAppMenu() {
         { label: 'Fast (LFM3 1.7B)', accelerator: 'CmdOrCtrl+1', click: () => sendMenuAction('set-mode', 'fast') },
         { label: 'Smart (Inkling 26B)', accelerator: 'CmdOrCtrl+2', click: () => sendMenuAction('set-mode', 'smart') },
         { label: 'Copilot (Smart + Fast Workers)', accelerator: 'CmdOrCtrl+3', click: () => sendMenuAction('set-mode', 'copilot') },
+        { label: 'Copilot (B) — gpt-oss:20b', accelerator: 'CmdOrCtrl+4', click: () => sendMenuAction('set-mode', 'copilot_b') },
         { type: 'separator' },
         { label: 'Toggle Studio Drawer', accelerator: 'CmdOrCtrl+B', click: () => sendMenuAction('toggle-drawer') },
         { label: 'Toggle Light / Dark Theme', accelerator: 'CmdOrCtrl+Shift+T', click: () => sendMenuAction('toggle-theme') },
@@ -294,7 +297,7 @@ function registerIpc() {
     if (!prompt) throw new Error('Prompt is required');
 
     const streamId = String(payload?.streamId || storage.newId('str'));
-    const mode = ['fast', 'smart', 'copilot'].includes(payload?.mode) ? payload.mode : storage.getSettings().defaultMode;
+    const mode = ['fast', 'smart', 'copilot', 'copilot_b'].includes(payload?.mode) ? payload.mode : storage.getSettings().defaultMode;
     const think = ['off', 'low', 'medium', 'high'].includes(payload?.think) ? payload.think : storage.getSettings().think;
 
     let chat = payload?.chatId ? storage.getChat(payload.chatId) : null;
@@ -330,16 +333,17 @@ function registerIpc() {
         prompt,
         history: priorHistory,
         pinnedFiles: Array.isArray(payload?.pinnedFiles) ? payload.pinnedFiles : [],
-        activeDraft: payload?.activeDraft || null,
+        toolOverrides: payload?.toolOverrides || {},
         think,
         signal: controller.signal,
         onEvent: emit,
       });
 
-      let savedDraft = null;
-      if (result.emailDraft) {
-        savedDraft = storage.saveDraft(result.emailDraft);
-        emit('email_draft_saved', savedDraft);
+      if (result.savedNotes?.length) {
+        for (const n of result.savedNotes) {
+          storage.saveNote(n);
+        }
+        emit('notes_saved', result.savedNotes);
       }
 
       if (result.fileActions?.length && storage.getSettings().autoApproveFileActions) {
@@ -357,6 +361,36 @@ function registerIpc() {
         emit('file_actions', result.fileActions);
       }
 
+      if (result.codeRuns?.length && storage.getSettings().autoApproveContainerRuns) {
+        for (const cr of result.codeRuns) {
+          try {
+            cr.status = 'running';
+            emit('code_runs', result.codeRuns);
+            const r = await containerRunner.runInContainer({
+              runId: cr.id,
+              title: cr.title,
+              language: cr.language,
+              code: cr.code,
+              command: cr.command,
+              image: cr.image,
+              network: cr.network,
+              mountMode: cr.mountMode,
+              onOutput: (o) => {
+                if (!event.sender.isDestroyed()) event.sender.send('container:output', o);
+              },
+            });
+            cr.status = r.ok ? 'done' : 'error';
+            cr.exitCode = r.exitCode;
+            cr.elapsedMs = r.elapsedMs;
+            cr.output = [r.stdout, r.stderr].filter(Boolean).join('\n').trim();
+          } catch (e) {
+            cr.status = 'error';
+            cr.output = e.message;
+          }
+        }
+        emit('code_runs', result.codeRuns);
+      }
+
       const assistantMsg = {
         id: storage.newId('a'),
         role: 'assistant',
@@ -368,8 +402,8 @@ function registerIpc() {
         plan: result.plan,
         workers: result.workers,
         sources: result.sources,
-        emailDraft: savedDraft || result.emailDraft || null,
         fileActions: result.fileActions || [],
+        codeRuns: result.codeRuns || [],
         ts: Date.now(),
       };
       chat.messages.push(assistantMsg);
@@ -457,6 +491,36 @@ function registerIpc() {
     return { pinned };
   });
 
+  // ---- Container Code Execution Sandbox (Docker / Podman)
+  ipcMain.handle('container:status', (_, opts) => containerRunner.detectRuntimes(Boolean(opts?.force)));
+  ipcMain.handle('container:history', () => ({ runs: storage.listContainerRuns() }));
+  ipcMain.handle('container:stop', (_, runId) => containerRunner.stopContainerRun(runId));
+  ipcMain.handle('container:run', async (event, opts) => {
+    return containerRunner.runInContainer({
+      ...(opts || {}),
+      onOutput: (chunk) => {
+        if (!event.sender.isDestroyed()) {
+          event.sender.send('container:output', chunk);
+        }
+      },
+    });
+  });
+
+  // ---- Interactive Project Knowledge Graph
+  ipcMain.handle('graph:build', (_, opts) => knowledgeGraph.buildProjectGraph(localFiles.getWorkspace(), opts || {}));
+  ipcMain.handle('graph:summarize', async () => {
+    const graph = await knowledgeGraph.buildProjectGraph(localFiles.getWorkspace());
+    const summaryText = knowledgeGraph.summarizeGraphForAI(graph);
+    const res = await endpoint.chatCompletion({
+      tier: 'fast',
+      systemPrompt: 'You are a concise software architect. Given a project knowledge graph summary, produce a crisp 5-bullet architectural overview highlighting entrypoints, core hubs, dependencies, and any risks.',
+      messages: [{ role: 'user', content: summaryText }],
+      think: 'off',
+      priority: 'fast',
+    });
+    return { ok: true, summary: res.content, stats: graph.stats };
+  });
+
   // ---- Research Desk
   ipcMain.handle('research:search', async (_, query) => {
     const [results, wiki] = await Promise.all([
@@ -480,34 +544,13 @@ function registerIpc() {
     return { canceled: false, filePath: res.filePath };
   });
 
-  // ---- Email Studio
-  ipcMain.handle('email:list', () => ({ drafts: storage.listDrafts() }));
-  ipcMain.handle('email:save', (_, draft) => ({ draft: storage.saveDraft(draft) }));
-  ipcMain.handle('email:delete', (_, id) => ({ ok: storage.deleteDraft(id) }));
-  ipcMain.handle('email:refine', (_, opts) => emailMod.refineDraft(opts || {}));
-  ipcMain.handle('email:saveEml', async (_, draft) => {
-    const fname = (String(draft?.subject || 'draft').replace(/[^a-zA-Z0-9_-]+/g, '_').slice(0, 48) || 'draft') + '.eml';
-    const res = await dialog.showSaveDialog(mainWindow, {
-      title: 'Save Email Draft (.eml)',
-      defaultPath: path.join(localFiles.getWorkspace(), fname),
-      filters: [{ name: 'Email Message (.eml)', extensions: ['eml'] }],
-    });
-    if (res.canceled || !res.filePath) return { canceled: true };
-    fs.writeFileSync(res.filePath, emailMod.toEml(draft || {}), 'utf8');
-    return { canceled: false, filePath: res.filePath };
-  });
-  ipcMain.handle('email:openEml', async (_, draft) => {
-    const fname = `mx-cowork-${Date.now()}.eml`;
-    const tmpPath = path.join(os.tmpdir(), fname);
-    fs.writeFileSync(tmpPath, emailMod.toEml(draft || {}), 'utf8');
-    const err = await shell.openPath(tmpPath);
-    if (err) {
-      // Fallback to mailto:
-      const u = `mailto:${encodeURIComponent(draft?.to || '')}?cc=${encodeURIComponent(draft?.cc || '')}&subject=${encodeURIComponent(draft?.subject || '')}&body=${encodeURIComponent(draft?.body || '')}`;
-      await shell.openExternal(u);
-    }
-    return { ok: true, tmpPath };
-  });
+  // ---- Local Copilot Tools & Persistent Memory Notes
+  ipcMain.handle('notes:list', () => ({ notes: storage.listNotes() }));
+  ipcMain.handle('notes:save', (_, note) => ({ note: storage.saveNote(note || {}) }));
+  ipcMain.handle('notes:delete', (_, id) => ({ ok: storage.deleteNote(id) }));
+  ipcMain.handle('tools:gitInspect', (_, focus) => localTools.gitInspect(localFiles.getWorkspace(), focus || ''));
+  ipcMain.handle('tools:systemInfo', () => localTools.systemInfo(localFiles.getWorkspace()));
+  ipcMain.handle('tools:calcJs', (_, code) => localTools.evalSandboxedJs(code));
 }
 
 app.whenReady().then(() => {
@@ -536,6 +579,8 @@ app.whenReady().then(() => {
               hasLoginScreen: Boolean(document.querySelector('#loginScreen')),
               hasFileEditor: Boolean(document.querySelector('#fileEditorView')),
               hasOsNav: typeof window.cowork.navigateOs === 'function' && typeof window.cowork.writeFile === 'function',
+              hasContainerApi: typeof window.cowork.runInContainer === 'function' && Boolean(document.querySelector('#containerCanvasWrap') || document.querySelector('[data-pane="container"]')),
+              hasGraphApi: typeof window.cowork.buildGraph === 'function' && Boolean(document.querySelector('#graphCanvas')),
               hasUpdateBtn: Boolean(document.querySelector('#openUpdatesBtn')),
               hasUpdateModal: Boolean(document.querySelector('#updatesModal')),
               updaterOk: upd.ok,

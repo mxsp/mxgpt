@@ -26,12 +26,21 @@ const S = {
   cwd: '',
   searchActive: false,
   editor: null, // { path, name, absPath, editable, content, savedContent }
-  drafts: [],
-  activeDraftId: null,
+  notes: [],
   briefs: [],
   undo: [],
   panelOpen: false,
   panelTab: 'files',
+  toolWebSearch: true,
+  toolOsFiles: true,
+  containerEnabled: true,
+  containerStatus: null,
+  activeContainerRunId: null,
+  containerRunOutputs: {}, // runId -> live text
+  graphView: null,
+  graphData: null,
+  graphExpanded: false,
+  graphFilters: new Set(['code', 'doc', 'config', 'test', 'style', 'data', 'file', 'folder', 'package']),
 };
 
 function esc(s) {
@@ -80,11 +89,13 @@ function askText({ title, label, value = '', placeholder = '' }) {
   });
 }
 
-// Lightweight safe Markdown renderer (hides raw email-draft / file-actions JSON blocks)
+// Lightweight safe Markdown renderer (hides raw file-actions / code-run / memory-save JSON blocks)
 function renderMd(raw) {
   let src = String(raw || '')
     .replace(/```email-draft[\s\S]*?```/gi, '')
     .replace(/```file-actions[\s\S]*?```/gi, '')
+    .replace(/```code-run[\s\S]*?```/gi, '')
+    .replace(/```memory-save[\s\S]*?```/gi, '')
     .trim();
   if (!src) return '';
 
@@ -154,9 +165,11 @@ function updateGreeting() {
 function modeHintText(m) {
   const fast = (S.settings?.fastModel || 'lfm3:latest').replace(/:latest$/, '');
   const smart = (S.settings?.smartModel || 'inkling-2-mini:latest').replace(/:latest$/, '');
+  const copB = (S.settings?.copilotBModel || 'gpt-oss:20b').replace(/:latest$/, '');
   if (m === 'fast') return `Fast: ${fast} direct`;
   if (m === 'smart') return `Smart: ${smart} direct`;
-  return `Copilot: ${smart} orchestrates · ${fast} retrieves`;
+  if (m === 'copilot_b') return `Copilot (B): ${copB} orchestrates · ${fast} & local tools`;
+  return `Copilot: ${smart} orchestrates · ${fast} & local tools`;
 }
 
 function setMode(m) {
@@ -168,7 +181,7 @@ function setMode(m) {
     b.setAttribute('aria-checked', String(on));
   });
   $('#modeHint').textContent = modeHintText(m);
-  $('#topModel').textContent = m === 'fast' ? 'Fast' : m === 'smart' ? 'Smart' : 'Copilot';
+  $('#topModel').textContent = m === 'fast' ? 'Fast' : m === 'smart' ? 'Smart' : m === 'copilot_b' ? 'Copilot (B)' : 'Copilot';
 }
 
 function setThink(t) {
@@ -180,6 +193,7 @@ function applyThemeUI(theme) {
   const t = theme === 'dark' ? 'dark' : 'light';
   document.documentElement.dataset.theme = t;
   $('#themeIcon use').setAttribute('href', t === 'dark' ? '#i-sun' : '#i-moon');
+  if (S.graphView) S.graphView.draw();
 }
 
 async function toggleTheme() {
@@ -191,7 +205,9 @@ async function toggleTheme() {
 // ---- Right Slide-Out Panel (identical to mx-GPT webapp)
 const PANEL_META = {
   files: { title: 'OS Files & Editor', icon: '#i-folder' },
-  email: { title: 'Email Studio', icon: '#i-mail' },
+  graph: { title: 'Project Knowledge Graph', icon: '#i-graph' },
+  container: { title: 'Container Sandbox', icon: '#i-box' },
+  notes: { title: 'Notes & Local Tools', icon: '#i-book' },
   research: { title: 'Research Desk', icon: '#i-globe' },
   undo: { title: 'Undo History', icon: '#i-undo' },
 };
@@ -203,6 +219,10 @@ function openPanel(tab, toggleIfSame = false) {
   }
   S.panelOpen = true;
   S.panelTab = tab;
+  if (tab !== 'graph') {
+    S.graphExpanded = false;
+    $('#panel').classList.remove('graph-expanded');
+  }
   $('#panel').classList.add('open');
   $('#panel').setAttribute('aria-hidden', 'false');
   const meta = PANEL_META[tab] || PANEL_META.files;
@@ -215,14 +235,17 @@ function openPanel(tab, toggleIfSame = false) {
   $$('.pane').forEach((p) => p.classList.toggle('active', p.dataset.pane === tab));
 
   if (tab === 'files' && !S.editor) loadFiles(S.cwd);
-  if (tab === 'email') loadDrafts();
+  if (tab === 'graph') ensureGraphLoaded();
+  if (tab === 'container') { loadContainerStatus(false); loadContainerHistory(); }
+  if (tab === 'notes') loadNotes();
   if (tab === 'research') loadBriefs();
   if (tab === 'undo') loadUndo();
 }
 
 function closePanel() {
   S.panelOpen = false;
-  $('#panel').classList.remove('open');
+  S.graphExpanded = false;
+  $('#panel').classList.remove('open', 'graph-expanded');
   $('#panel').setAttribute('aria-hidden', 'true');
   $$('.top-actions .ghost-btn[data-panel]').forEach((b) => b.classList.remove('active'));
 }
@@ -323,10 +346,19 @@ async function boot() {
   S.providerPresets = prov?.presets || [];
   S.quickFolders = data.quickFolders || [];
 
-  $('#appVersionBadge').textContent = `v${info.version || '1.2.0'}`;
+  $('#appVersionBadge').textContent = `v${info.version || '1.3.0'}`;
   applyThemeUI(S.settings.theme || 'light');
   setMode(S.settings.defaultMode || 'copilot');
   setThink(S.settings.think || 'low');
+  S.toolWebSearch = S.settings.toolWebSearch !== false;
+  S.toolOsFiles = S.settings.toolOsFiles !== false;
+  S.containerEnabled = S.settings.toolContainer !== false && S.settings.containerEnabled !== false;
+  $('#webToggleBtn').classList.toggle('on', S.toolWebSearch);
+  $('#filesToggleBtn').classList.toggle('on', S.toolOsFiles);
+  $('#containerToggleBtn').classList.toggle('on', S.containerEnabled);
+  $('#ctImage').value = S.settings.containerImage || 'python:3.12-slim';
+  $('#ctNet').value = S.settings.containerNetwork || 'none';
+  $('#ctMount').value = S.settings.containerMountMode || 'rw';
   renderAccountUI();
   renderWorkspaceUI();
 
@@ -334,11 +366,13 @@ async function boot() {
     showLoginScreen();
   }
 
-  await Promise.all([loadChats(), loadFiles(''), loadDrafts(), loadBriefs(), loadUndo()]);
+  await Promise.all([loadChats(), loadFiles(''), loadNotes(), loadBriefs(), loadUndo()]);
   checkConnectionQuiet();
   checkUpdatesQuiet();
+  loadContainerStatus(false);
 
   CW.onUpdateProgress((p) => renderUpdateProgress(p));
+  CW.onContainerOutput((ev) => handleContainerOutputChunk(ev));
   CW.onMenuAction(({ action, payload }) => {
     if (action === 'new-task') newChat();
     else if (action === 'pick-folder') pickWorkspaceFolder();
@@ -558,7 +592,7 @@ function renderCopilotPanel(msg) {
           </div>
           <div class="subagent-task">${esc(w.task || '')}</div>
         </button>
-        <div class="subagent-body">${esc(w.brief || w.stream || w.error || 'Retrieving…')}</div>`;
+        <div class="subagent-body" data-worker-body="${esc(w.id || '')}">${esc(w.brief || w.stream || w.error || 'Retrieving…')}</div>`;
       card.querySelector('.subagent-head').onclick = () => card.classList.toggle('open');
       grid.appendChild(card);
     }
@@ -691,7 +725,111 @@ function renderFileActionsCard(actions) {
   return card;
 }
 
-function renderMessages() {
+function renderCodeRunsCard(runs) {
+  const card = document.createElement('div');
+  card.className = 'action-card';
+  card.innerHTML = `<div class="ac-head"><div class="ac-title">Container Code Execution (${runs.length})</div><span class="cr-badge">/workspace mounted</span></div>`;
+
+  for (const run of runs) {
+    const box = document.createElement('div');
+    box.style.display = 'flex';
+    box.style.flexDirection = 'column';
+    box.style.gap = '6px';
+    box.style.padding = '9px 10px';
+    box.style.borderRadius = '10px';
+    box.style.background = 'var(--code-bg)';
+
+    const script = run.code || run.command || '';
+    const liveOut = S.containerRunOutputs[run.id] ?? run.output ?? '';
+    const isRunning = run.status === 'running';
+
+    box.innerHTML = `
+      <div class="ac-head">
+        <div class="cr-badges">
+          <b style="font-size:12.5px">${esc(run.title || 'Container Run')}</b>
+          <span class="cr-badge">${esc(run.language || 'bash')}</span>
+          <span class="cr-badge">${esc(run.image || 'python:3.12-slim')}</span>
+          <span class="cr-badge">net:${esc(run.network || 'none')}</span>
+          <span class="cr-badge">${esc(run.mountMode || 'rw')}</span>
+        </div>
+        <div class="row-gap">
+          ${isRunning
+            ? `<button class="btn tiny danger" data-cr-stop>Stop</button>`
+            : `<button class="btn tiny primary" data-cr-run>${run.status === 'done' || run.status === 'error' ? 'Re-run' : 'Run in Container'}</button>`}
+          ${liveOut ? `<button class="btn tiny" data-cr-send>Send Output</button>` : ''}
+        </div>
+      </div>
+      ${run.reason ? `<div class="ac-reason">${esc(run.reason)}</div>` : ''}
+      <pre class="cr-code">${esc(script)}</pre>
+      ${run.status === 'done' ? `<span class="ac-stat">✓ Exit 0 (${run.elapsedMs ? (run.elapsedMs / 1000).toFixed(1) + 's' : 'done'})</span>` : ''}
+      ${run.status === 'error' ? `<span class="ac-stat err">✗ Exit ${run.exitCode ?? 1}</span>` : ''}
+      ${liveOut ? `<pre class="cr-term" data-term-id="${esc(run.id)}">${esc(liveOut)}</pre>` : ''}`;
+
+    const runBtn = box.querySelector('[data-cr-run]');
+    if (runBtn) {
+      runBtn.onclick = async () => {
+        run.status = 'running';
+        S.containerRunOutputs[run.id] = '';
+        renderMessages();
+        try {
+          const r = await CW.runInContainer({
+            runId: run.id,
+            title: run.title,
+            language: run.language,
+            code: run.code,
+            command: run.command,
+            image: run.image,
+            network: run.network,
+            mountMode: run.mountMode,
+          });
+          run.status = r.ok ? 'done' : 'error';
+          run.exitCode = r.exitCode;
+          run.elapsedMs = r.elapsedMs;
+          run.output = [r.stdout, r.stderr].filter(Boolean).join('\n').trim() || '(no output)';
+          S.containerRunOutputs[run.id] = run.output;
+          loadContainerHistory();
+          loadFiles(S.cwd);
+          renderMessages();
+        } catch (e) {
+          run.status = 'error';
+          run.output = e.message;
+          S.containerRunOutputs[run.id] = e.message;
+          toast(e.message, 4500);
+          renderMessages();
+        }
+      };
+    }
+
+    const stopBtn = box.querySelector('[data-cr-stop]');
+    if (stopBtn) {
+      stopBtn.onclick = () => CW.stopContainerRun(run.id);
+    }
+
+    const sendBtn = box.querySelector('[data-cr-send]');
+    if (sendBtn) {
+      sendBtn.onclick = () => {
+        const out = (S.containerRunOutputs[run.id] || run.output || '').slice(0, 6000);
+        sendPrompt(`Here is the container execution output for "${run.title}" (exit ${run.exitCode ?? '?'}):\n\`\`\`\n${out}\n\`\`\`\nPlease analyze the result and suggest or take the next step.`);
+      };
+    }
+
+    card.appendChild(box);
+  }
+  return card;
+}
+
+function isNearBottom(el, threshold = 100) {
+  return (el.scrollHeight - el.scrollTop - el.clientHeight) <= threshold;
+}
+
+function scrollFeedIfNearBottom(force = false) {
+  const sc = $('#scrollArea');
+  if (force || isNearBottom(sc, 110)) {
+    sc.scrollTop = sc.scrollHeight;
+  }
+}
+
+function renderMessages(forceScroll = true) {
   const wrap = $('#messages');
   $('#welcome').classList.toggle('hidden', S.messages.length > 0);
   wrap.innerHTML = '';
@@ -706,7 +844,7 @@ function renderMessages() {
     }
 
     const av = document.createElement('div');
-    av.className = 'msg-avatar' + (m.streaming ? ' spin' : '');
+    av.className = 'msg-avatar';
     av.innerHTML = '<svg><use href="#i-star"/></svg>';
     el.appendChild(av);
 
@@ -737,8 +875,20 @@ function renderMessages() {
       body.appendChild(pr);
     }
 
-    if (m.emailDraft) body.appendChild(renderEmailCard(m.emailDraft));
     if (m.fileActions?.length) body.appendChild(renderFileActionsCard(m.fileActions));
+    if (m.codeRuns?.length) body.appendChild(renderCodeRunsCard(m.codeRuns));
+    if (m.graphReady) {
+      const gb = document.createElement('div');
+      gb.className = 'action-card';
+      gb.innerHTML = `
+        <div class="ac-head">
+          <div class="ac-title">Project Knowledge Graph Mapped (${esc(m.graphReady.projectName || 'Workspace')})</div>
+          <button class="btn tiny primary" data-open-graph>Open Interactive Graph</button>
+        </div>
+        <div class="ac-reason">${m.graphReady.stats?.fileCount || 0} files · ${m.graphReady.stats?.importEdges || 0} dependency links · ${m.graphReady.stats?.packageCount || 0} packages</div>`;
+      gb.querySelector('[data-open-graph]').onclick = () => openPanel('graph');
+      body.appendChild(gb);
+    }
 
     if (m.sources?.length) {
       const sr = document.createElement('div');
@@ -765,7 +915,8 @@ function renderMessages() {
       const foot = document.createElement('div');
       foot.className = 'msg-foot-bar';
       const spd = m.usage?.tokensPerSec ? `${m.usage.tokensPerSec} t/s` : '';
-      const info = [m.mode || 'copilot', m.model ? m.model.replace(/:latest$/, '') : '', spd].filter(Boolean).join(' · ');
+      const modeLbl = m.mode === 'copilot_b' ? 'Copilot (B)' : (m.mode || 'copilot');
+      const info = [modeLbl, m.model ? m.model.replace(/:latest$/, '') : '', spd].filter(Boolean).join(' · ');
       const span = document.createElement('span');
       span.textContent = info;
       const cpBtn = document.createElement('button');
@@ -789,11 +940,71 @@ function renderMessages() {
     el.appendChild(body);
     wrap.appendChild(el);
   }
-  const sc = $('#scrollArea');
-  sc.scrollTop = sc.scrollHeight;
+  scrollFeedIfNearBottom(forceScroll);
 }
 
-// ---- Send / Stream Cowork Turn
+// Create a dedicated, non-rebuilt DOM container for the active streaming turn (zero jitter!)
+function mountLiveAssistantDom(initialPhase) {
+  const wrap = $('#messages');
+  $('#welcome').classList.add('hidden');
+  const el = document.createElement('div');
+  el.className = 'msg assistant';
+
+  const av = document.createElement('div');
+  av.className = 'msg-avatar';
+  av.innerHTML = '<svg><use href="#i-star"/></svg>';
+  el.appendChild(av);
+
+  const body = document.createElement('div');
+  body.className = 'msg-body';
+
+  const phaseEl = document.createElement('div');
+  phaseEl.className = 'loading-state';
+  phaseEl.innerHTML = `<span class="mini-spin"></span><span class="phase-txt">${esc(initialPhase)}</span>`;
+  body.appendChild(phaseEl);
+
+  const planSlot = document.createElement('div');
+  planSlot.hidden = true;
+  body.appendChild(planSlot);
+
+  const thinkEl = document.createElement('details');
+  thinkEl.className = 'think-box';
+  thinkEl.hidden = true;
+  const thinkSummary = document.createElement('summary');
+  thinkSummary.textContent = 'Thinking…';
+  const thinkPre = document.createElement('pre');
+  thinkEl.append(thinkSummary, thinkPre);
+  body.appendChild(thinkEl);
+
+  const proseEl = document.createElement('div');
+  proseEl.className = 'prose';
+  proseEl.hidden = true;
+  body.appendChild(proseEl);
+
+  const cardsSlot = document.createElement('div');
+  cardsSlot.style.display = 'flex';
+  cardsSlot.style.flexDirection = 'column';
+  cardsSlot.style.gap = '10px';
+  body.appendChild(cardsSlot);
+
+  el.appendChild(body);
+  wrap.appendChild(el);
+  scrollFeedIfNearBottom(true);
+
+  return {
+    el,
+    phaseEl,
+    phaseTxt: phaseEl.querySelector('.phase-txt'),
+    planSlot,
+    thinkEl,
+    thinkSummary,
+    thinkPre,
+    proseEl,
+    cardsSlot,
+  };
+}
+
+// ---- Send / Stream Cowork Turn (Zero-Jitter Incremental DOM)
 async function sendPrompt(overrideText = null) {
   if (S.streaming) {
     if (S.chat?.id) CW.stopCowork(S.chat.id).catch(() => {});
@@ -807,6 +1018,16 @@ async function sendPrompt(overrideText = null) {
   const streamId = 's_' + Date.now().toString(36) + '_' + Math.random().toString(36).slice(2, 6);
   S.activeStreamId = streamId;
   S.messages.push({ id: 'tmp-u', role: 'user', content: prompt });
+
+  // Render existing messages + new user bubble once, then mount a stable live assistant DOM
+  renderMessages(true);
+
+  const initialPhase = S.mode === 'copilot_b'
+    ? 'Copilot (B) planning…'
+    : S.mode === 'copilot'
+      ? 'Copilot planning…'
+      : 'Connecting…';
+
   const assistant = {
     id: 'tmp-a',
     role: 'assistant',
@@ -816,26 +1037,54 @@ async function sendPrompt(overrideText = null) {
     plan: null,
     workers: [],
     sources: [],
-    emailDraft: null,
     fileActions: [],
-    livePhase: S.mode === 'copilot' ? 'Smart Orchestrator planning…' : 'Connecting…',
+    codeRuns: [],
+    livePhase: initialPhase,
     queuePos: 0,
     streaming: true,
   };
   S.messages.push(assistant);
+  const live = mountLiveAssistantDom(initialPhase);
+
   S.streaming = true;
   $('#sendBtn').classList.add('stop');
   $('#sendIcon use').setAttribute('href', '#i-stop');
-  renderMessages();
 
-  const activeDraft = ($('#mailSubject').value || $('#mailBody').value)
-    ? { to: $('#mailTo').value, cc: $('#mailCc').value, subject: $('#mailSubject').value, body: $('#mailBody').value }
-    : null;
+  let proseTimer = null;
+  const flushProse = () => {
+    proseTimer = null;
+    if (!assistant.content) return;
+    const sc = $('#scrollArea');
+    const stick = isNearBottom(sc, 110);
+    live.proseEl.hidden = false;
+    live.proseEl.innerHTML = renderMd(assistant.content);
+    if (stick) sc.scrollTop = sc.scrollHeight;
+  };
+  const scheduleProse = () => {
+    if (!proseTimer) proseTimer = setTimeout(flushProse, 75);
+  };
 
-  let renderTimer = null;
-  const scheduleRender = () => {
-    if (renderTimer) return;
-    renderTimer = setTimeout(() => { renderTimer = null; renderMessages(); }, 60);
+  let thinkTimer = null;
+  let pendingThink = '';
+  const flushThink = () => {
+    thinkTimer = null;
+    if (!pendingThink) return;
+    const chunk = pendingThink;
+    pendingThink = '';
+    live.thinkEl.hidden = false;
+    live.thinkSummary.textContent = `Thinking (${assistant.thinking.length} chars)`;
+    const preNearBot = isNearBottom(live.thinkPre, 40);
+    live.thinkPre.append(document.createTextNode(chunk));
+    if (preNearBot) live.thinkPre.scrollTop = live.thinkPre.scrollHeight;
+  };
+
+  const refreshPlanPanel = () => {
+    const cp = renderCopilotPanel(assistant);
+    live.planSlot.innerHTML = '';
+    if (cp) {
+      live.planSlot.hidden = false;
+      live.planSlot.appendChild(cp);
+    }
   };
 
   const off = CW.onCoworkEvent(({ streamId: sid, event: ev, data: d }) => {
@@ -847,58 +1096,77 @@ async function sendPrompt(overrideText = null) {
     } else if (ev === 'phase') {
       assistant.queuePos = 0;
       assistant.livePhase = d.label || d.phase;
-      scheduleRender();
+      live.phaseEl.hidden = false;
+      live.phaseEl.className = 'loading-state';
+      live.phaseTxt.textContent = assistant.livePhase;
     } else if (ev === 'queue') {
       if (d.acquired || !d.position) {
         assistant.queuePos = 0;
         assistant.livePhase = 'Preparing response…';
+        live.phaseEl.className = 'loading-state';
       } else {
         assistant.queuePos = d.position;
         assistant.livePhase = `Queued #${d.position}${d.runningLabel ? ` · waiting for ${d.runningLabel}` : ''}`;
+        live.phaseEl.className = 'loading-state queued';
       }
-      scheduleRender();
+      live.phaseEl.hidden = false;
+      live.phaseTxt.textContent = assistant.livePhase;
     } else if (ev === 'copilot_plan') {
       assistant.plan = d;
-      scheduleRender();
+      refreshPlanPanel();
     } else if (ev === 'worker_start') {
       assistant.workers.push({ ...d, status: 'running', stream: '' });
-      scheduleRender();
+      refreshPlanPanel();
     } else if (ev === 'worker_delta') {
       const w = assistant.workers.find((x) => x.id === d.id);
-      if (w) { w.stream = (w.stream || '') + (d.delta || ''); scheduleRender(); }
+      if (w) {
+        w.stream = (w.stream || '') + (d.delta || '');
+        const bodyEl = live.planSlot.querySelector(`[data-worker-body="${CSS.escape(d.id)}"]`);
+        if (bodyEl) bodyEl.textContent = w.stream;
+      }
     } else if (ev === 'worker_done') {
       const w = assistant.workers.find((x) => x.id === d.id);
-      if (w) { Object.assign(w, d, { status: d.ok ? 'done' : 'error' }); scheduleRender(); }
+      if (w) { Object.assign(w, d, { status: d.ok ? 'done' : 'error' }); refreshPlanPanel(); }
     } else if (ev === 'thinking') {
       assistant.queuePos = 0;
       assistant.livePhase = 'Thinking…';
-      assistant.thinking += d.delta || '';
-      scheduleRender();
+      live.phaseEl.hidden = false;
+      live.phaseEl.className = 'loading-state';
+      live.phaseTxt.textContent = 'Thinking…';
+      const delta = d.delta || '';
+      if (delta) {
+        assistant.thinking += delta;
+        pendingThink += delta;
+        if (!thinkTimer) thinkTimer = setTimeout(flushThink, 90);
+      }
     } else if (ev === 'text') {
       assistant.livePhase = '';
+      live.phaseEl.hidden = true;
       assistant.content += d.delta || '';
-      scheduleRender();
-    } else if (ev === 'email_draft_saved' || ev === 'email_draft') {
-      assistant.emailDraft = d;
-      loadDraftIntoStudio(d);
-      loadDrafts();
-      scheduleRender();
+      scheduleProse();
     } else if (ev === 'file_actions') {
       assistant.fileActions = d;
-      scheduleRender();
+    } else if (ev === 'code_runs') {
+      assistant.codeRuns = d;
+    } else if (ev === 'graph_ready') {
+      assistant.graphReady = d;
+    } else if (ev === 'notes_saved') {
+      loadNotes();
+      toast(`Saved ${d.length} memory note${d.length > 1 ? 's' : ''}`);
     } else if (ev === 'sources') {
       assistant.sources = d;
-      scheduleRender();
     } else if (ev === 'done') {
+      if (proseTimer) { clearTimeout(proseTimer); proseTimer = null; }
+      if (thinkTimer) { clearTimeout(thinkTimer); thinkTimer = null; }
       Object.assign(assistant, d.message || {}, { streaming: false, livePhase: '' });
-      renderMessages();
+      renderMessages(false);
       loadChats();
     } else if (ev === 'error') {
       assistant.livePhase = '';
       assistant.streaming = false;
       assistant.content += `\n\n> **Error:** ${d.message}`;
       toast(d.message, 4500);
-      renderMessages();
+      renderMessages(false);
     }
   });
 
@@ -910,20 +1178,26 @@ async function sendPrompt(overrideText = null) {
       think: S.think,
       prompt,
       pinnedFiles: S.pinnedFiles,
-      activeDraft,
+      toolOverrides: {
+        toolWebSearch: S.toolWebSearch,
+        toolOsFiles: S.toolOsFiles,
+        toolContainer: S.containerEnabled,
+      },
     });
   } catch (e) {
     assistant.content += `\n\n> **Error:** ${e.message}`;
     toast(e.message, 4500);
   } finally {
     off();
+    if (proseTimer) clearTimeout(proseTimer);
+    if (thinkTimer) clearTimeout(thinkTimer);
     assistant.streaming = false;
     assistant.livePhase = '';
     S.streaming = false;
     S.activeStreamId = null;
     $('#sendBtn').classList.remove('stop');
     $('#sendIcon use').setAttribute('href', '#i-send');
-    renderMessages();
+    renderMessages(false);
   }
 }
 
@@ -1167,32 +1441,28 @@ async function renameItem(relPath, currentName) {
   } catch (e) { toast(e.message); }
 }
 
-// ---- Email Studio
-function loadDraftIntoStudio(d) {
-  S.activeDraftId = d.id || null;
-  $('#mailTo').value = d.to || '';
-  $('#mailCc').value = d.cc || '';
-  $('#mailSubject').value = d.subject || '';
-  $('#mailBody').value = d.body || '';
-}
-
-async function loadDrafts() {
-  const d = await CW.listDrafts();
-  S.drafts = d.drafts || [];
-  const list = $('#draftsList');
-  list.innerHTML = S.drafts.length ? '' : '<div class="muted-note">No saved drafts yet. Ask Copilot to draft an email.</div>';
-  for (const dr of S.drafts) {
-    const card = document.createElement('div');
-    card.className = 'saved-card';
-    card.innerHTML = `<div class="sc-row"><b>${esc(dr.subject || '(No subject)')}</b><button class="btn tiny danger">✕</button></div><small>${esc(dr.to || 'No recipient')} · ${new Date(dr.updatedAt).toLocaleDateString()}</small>`;
-    card.onclick = (e) => { if (!e.target.closest('button')) loadDraftIntoStudio(dr); };
-    card.querySelector('button').onclick = async (e) => {
-      e.stopPropagation();
-      await CW.deleteDraft(dr.id);
-      loadDrafts();
-    };
-    list.appendChild(card);
-  }
+// ---- Persistent Memory Notes & Quick Local Tools
+async function loadNotes() {
+  try {
+    const d = await CW.listNotes();
+    S.notes = d.notes || [];
+    const list = $('#notesList');
+    list.innerHTML = S.notes.length ? '' : '<div class="muted-note">No saved memory notes yet. Add notes here or ask Copilot to "remember" something.</div>';
+    for (const n of S.notes) {
+      const card = document.createElement('div');
+      card.className = 'saved-card';
+      card.innerHTML = `
+        <div class="sc-row"><b>${esc(n.title)}</b><button class="btn tiny danger">✕</button></div>
+        <small style="white-space:pre-wrap;color:var(--text-2)">${esc(n.content.slice(0, 260))}${n.content.length > 260 ? '…' : ''}</small>
+        ${n.tags?.length ? `<small>${esc(n.tags.join(' · '))}</small>` : ''}`;
+      card.querySelector('button').onclick = async (e) => {
+        e.stopPropagation();
+        await CW.deleteNote(n.id);
+        loadNotes();
+      };
+      list.appendChild(card);
+    }
+  } catch {}
 }
 
 // ---- Research Desk
@@ -1209,16 +1479,11 @@ async function loadBriefs() {
       <small>${new Date(b.updatedAt).toLocaleString()}</small>
       <div class="row-gap" style="margin-top:4px">
         <button class="btn tiny" data-save-md>Save .md…</button>
-        <button class="btn tiny" data-mail>Draft Email</button>
       </div>`;
     card.querySelector('[data-del]').onclick = async () => { await CW.deleteBrief(b.id); loadBriefs(); };
     card.querySelector('[data-save-md]').onclick = async () => {
       const r = await CW.exportBriefMd(b);
       if (!r.canceled) { toast(`Saved ${r.filePath}`); loadFiles(S.cwd); }
-    };
-    card.querySelector('[data-mail]').onclick = () => {
-      loadDraftIntoStudio({ subject: b.title, body: b.markdown });
-      openPanel('email');
     };
     list.appendChild(card);
   }
@@ -1282,6 +1547,249 @@ async function loadUndo() {
   }
 }
 
+// ---- Interactive Project Knowledge Graph Controller
+function initGraphViewIfNeeded() {
+  if (S.graphView || typeof window.KnowledgeGraphView !== 'function') return;
+  const canvas = $('#graphCanvas');
+  if (!canvas) return;
+  S.graphView = new window.KnowledgeGraphView(canvas, {
+    onSelect: (node, neighbors) => renderGraphInspector(node, neighbors),
+    onOpenFile: (relPath) => {
+      S.graphExpanded = false;
+      $('#panel').classList.remove('graph-expanded');
+      openPanel('files');
+      openFileInEditor(relPath);
+    },
+  });
+  window.addEventListener('resize', () => {
+    if (S.panelOpen && S.panelTab === 'graph') S.graphView?.resize();
+  });
+}
+
+async function ensureGraphLoaded() {
+  initGraphViewIfNeeded();
+  setTimeout(() => S.graphView?.resize(), 60);
+  if (!S.graphData || S.graphData.workspace !== S.settings?.workspace) {
+    await buildAndRenderGraph();
+  } else {
+    setTimeout(() => S.graphView?.fitToView(), 90);
+  }
+}
+
+async function buildAndRenderGraph() {
+  initGraphViewIfNeeded();
+  $('#graphStats').textContent = 'Scanning workspace & building knowledge graph…';
+  $('#graphBuildBtn').disabled = true;
+  try {
+    const g = await CW.buildGraph({ includePackages: true });
+    S.graphData = g;
+    const st = g.stats || {};
+    $('#graphStats').textContent = `${g.projectName} · ${st.fileCount || 0} files · ${st.folderCount || 0} folders · ${st.importEdges || 0} links · ${st.packageCount || 0} pkgs · ${(st.totalLines || 0).toLocaleString()} lines (${g.elapsedMs}ms)`;
+    $('#graphInspector').hidden = true;
+    S.graphView?.resize();
+    S.graphView?.setFilters(S.graphFilters);
+    S.graphView?.setData(g);
+  } catch (e) {
+    $('#graphStats').textContent = `Graph build failed: ${e.message}`;
+    toast(e.message, 4000);
+  } finally {
+    $('#graphBuildBtn').disabled = false;
+  }
+}
+
+function renderGraphInspector(node, { incoming = [], outgoing = [] } = {}) {
+  const box = $('#graphInspector');
+  if (!node) { box.hidden = true; return; }
+  box.hidden = false;
+  $('#giTitle').textContent = node.label || node.id;
+  $('#giPath').textContent = node.path || (node.kind === 'package' ? `Package ${node.version || ''}` : S.graphData?.workspace || '');
+
+  const isFile = Boolean(node.path) && node.kind !== 'folder';
+  $('#giEditBtn').hidden = !isFile;
+  $('#giPinBtn').hidden = !isFile;
+  $('#giEditBtn').onclick = () => {
+    S.graphExpanded = false;
+    $('#panel').classList.remove('graph-expanded');
+    openPanel('files');
+    openFileInEditor(node.path);
+  };
+  $('#giPinBtn').onclick = () => {
+    if (!S.pinnedFiles.includes(node.path)) {
+      S.pinnedFiles.push(node.path);
+      renderPinned();
+      toast(`Pinned ${node.path}`);
+    }
+  };
+  $('#giAskBtn').onclick = () => {
+    if (isFile && !S.pinnedFiles.includes(node.path)) {
+      S.pinnedFiles.push(node.path);
+      renderPinned();
+    }
+    S.graphExpanded = false;
+    $('#panel').classList.remove('graph-expanded');
+    const neighbors = [...outgoing.map((x) => x.node.path || x.node.label), ...incoming.map((x) => x.node.path || x.node.label)].slice(0, 8);
+    setMode('copilot');
+    sendPrompt(`Explain the role of "${node.path || node.label}" in this project (connected to: ${neighbors.join(', ') || 'none'}) and suggest any improvements.`);
+  };
+
+  const metaParts = [
+    `<span class="gi-pill">${esc(node.kind || 'file')}</span>`,
+    node.lines ? `<span class="gi-pill">${node.lines} lines</span>` : '',
+    node.sizeLabel ? `<span class="gi-pill">${esc(node.sizeLabel)}</span>` : '',
+    `<span class="gi-pill">${incoming.length} in · ${outgoing.length} out</span>`,
+  ].filter(Boolean);
+  $('#giMeta').innerHTML = metaParts.join('');
+
+  const links = $('#giLinks');
+  links.innerHTML = '';
+
+  if (node.symbols?.length) {
+    const grp = document.createElement('div');
+    grp.className = 'gi-group';
+    grp.innerHTML = `<span>Symbols:</span>` + node.symbols.slice(0, 10).map((s) => `<span class="gi-pill">${esc(s.kind)}:${esc(s.name)}</span>`).join('');
+    links.appendChild(grp);
+  }
+
+  const addNeighborGroup = (label, list) => {
+    if (!list.length) return;
+    const grp = document.createElement('div');
+    grp.className = 'gi-group';
+    const lbl = document.createElement('span');
+    lbl.textContent = label;
+    grp.appendChild(lbl);
+    for (const item of list.slice(0, 12)) {
+      const b = document.createElement('button');
+      b.type = 'button';
+      b.className = 'gi-link-btn';
+      b.textContent = item.node.label;
+      b.title = `${item.type}: ${item.node.path || item.node.label}`;
+      b.onclick = () => S.graphView?.centerOnNode(item.node);
+      grp.appendChild(b);
+    }
+    links.appendChild(grp);
+  };
+  addNeighborGroup('Imports / Links →', outgoing.filter((x) => x.type !== 'contains'));
+  addNeighborGroup('Imported By ←', incoming.filter((x) => x.type !== 'contains'));
+}
+
+// ---- Container Sandbox Controller
+async function loadContainerStatus(force = false) {
+  const banner = $('#ctStatusBanner');
+  const txt = $('#ctStatusText');
+  try {
+    const st = await CW.containerStatus({ force });
+    S.containerStatus = st;
+    if (st.available) {
+      banner.className = 'ct-status ok';
+      const info = st.activeRuntime === 'docker' ? st.docker : st.podman;
+      txt.textContent = `✓ ${st.activeRuntime.toUpperCase()} ready (${info.serverVersion || info.version})`;
+    } else {
+      banner.className = 'ct-status err';
+      txt.textContent = st.docker?.installed
+        ? 'Docker installed — start Docker daemon to run containers'
+        : 'Install Docker or Podman to execute code in containers';
+    }
+    const presetsWrap = $('#ctImagePresets');
+    presetsWrap.innerHTML = '';
+    for (const p of st.presets || []) {
+      const b = document.createElement('button');
+      b.type = 'button';
+      b.className = 'chip-btn';
+      b.textContent = p.label;
+      b.title = `${p.id} — ${p.desc}`;
+      b.onclick = () => {
+        $('#ctImage').value = p.id;
+        $('#ctLang').value = p.lang;
+      };
+      presetsWrap.appendChild(b);
+    }
+  } catch (e) {
+    banner.className = 'ct-status err';
+    txt.textContent = `Container check error: ${e.message}`;
+  }
+}
+
+function handleContainerOutputChunk(ev) {
+  if (!ev || !ev.runId) return;
+  const chunk = ev.chunk || '';
+  S.containerRunOutputs[ev.runId] = (S.containerRunOutputs[ev.runId] || '') + chunk;
+
+  // Live-update sandbox terminal if this is the active sandbox run
+  if (ev.runId === S.activeContainerRunId) {
+    const term = $('#ctTerminal');
+    term.textContent = S.containerRunOutputs[ev.runId];
+    term.scrollTop = term.scrollHeight;
+  }
+
+  // Live-update inline chat container card terminal if visible
+  const inlineTerm = document.querySelector(`[data-term-id="${CSS.escape(ev.runId)}"]`);
+  if (inlineTerm) {
+    inlineTerm.textContent = S.containerRunOutputs[ev.runId];
+    inlineTerm.scrollTop = inlineTerm.scrollHeight;
+  }
+}
+
+async function runSandboxContainer() {
+  const code = $('#ctCodeInput').value.trim();
+  if (!code) { toast('Enter code or a shell command first'); return; }
+  const runId = 'sb_' + Date.now().toString(36);
+  S.activeContainerRunId = runId;
+  S.containerRunOutputs[runId] = '';
+  $('#ctTerminal').textContent = 'Starting container…\n';
+  $('#ctRunMeta').textContent = 'Running…';
+  $('#ctRunBtn').disabled = true;
+  $('#ctStopBtn').hidden = false;
+
+  try {
+    const r = await CW.runInContainer({
+      runId,
+      title: `Sandbox (${$('#ctLang').value})`,
+      language: $('#ctLang').value,
+      code,
+      image: $('#ctImage').value.trim() || 'python:3.12-slim',
+      network: $('#ctNet').value,
+      mountMode: $('#ctMount').value,
+    });
+    const combined = [r.stdout, r.stderr].filter(Boolean).join('\n').trim() || '(completed with no output)';
+    $('#ctTerminal').textContent = combined;
+    $('#ctRunMeta').textContent = `Exit ${r.exitCode} · ${(r.elapsedMs / 1000).toFixed(1)}s`;
+    loadContainerHistory();
+    loadFiles(S.cwd);
+  } catch (e) {
+    $('#ctTerminal').textContent = `Error: ${e.message}`;
+    $('#ctRunMeta').textContent = 'Failed';
+    toast(e.message, 4500);
+  } finally {
+    S.activeContainerRunId = null;
+    $('#ctRunBtn').disabled = false;
+    $('#ctStopBtn').hidden = true;
+  }
+}
+
+async function loadContainerHistory() {
+  try {
+    const d = await CW.listContainerRuns();
+    const list = $('#ctHistoryList');
+    const runs = d.runs || [];
+    list.innerHTML = runs.length ? '' : '<div class="muted-note">No container executions yet.</div>';
+    for (const r of runs.slice(0, 15)) {
+      const card = document.createElement('div');
+      card.className = 'saved-card';
+      card.innerHTML = `
+        <div class="sc-row"><b>${esc(r.title || r.language)}</b><span class="ac-stat ${r.ok ? '' : 'err'}">${r.ok ? '✓ 0' : '✗ ' + r.exitCode}</span></div>
+        <small>${esc(r.image)} · ${(r.elapsedMs / 1000).toFixed(1)}s · ${new Date(r.ts).toLocaleTimeString()}</small>`;
+      card.onclick = () => {
+        $('#ctLang').value = r.language || 'python';
+        $('#ctImage').value = r.image || 'python:3.12-slim';
+        $('#ctCodeInput').value = r.code || '';
+        $('#ctTerminal').textContent = [r.stdout, r.stderr].filter(Boolean).join('\n').trim() || '(no output)';
+        $('#ctRunMeta').textContent = `Exit ${r.exitCode} · ${(r.elapsedMs / 1000).toFixed(1)}s`;
+      };
+      list.appendChild(card);
+    }
+  } catch {}
+}
+
 // ---- Settings & Multi-Provider Modal
 function syncProviderAuthUI(endpointType) {
   $('#authFields').style.display = endpointType === 'mxgpt' ? 'flex' : 'none';
@@ -1331,6 +1839,9 @@ function renderFetchedModels(models) {
       if (S.assignModelTarget === 'smart') {
         $('#setSmartModel').value = m.name;
         toast(`Smart model → ${m.name}`);
+      } else if (S.assignModelTarget === 'copilot_b') {
+        $('#setCopilotBModel').value = m.name;
+        toast(`Copilot (B) model → ${m.name}`);
       } else {
         $('#setFastModel').value = m.name;
         toast(`Fast model → ${m.name}`);
@@ -1340,7 +1851,12 @@ function renderFetchedModels(models) {
   }
 }
 
-function openSettings() {
+function setSettingsTab(tab) {
+  $$('#settingsTabs button').forEach((b) => b.classList.toggle('active', b.dataset.stab === tab));
+  $$('.stab-pane').forEach((p) => p.classList.toggle('active', p.dataset.spane === tab));
+}
+
+function openSettings(initialTab = 'providers') {
   const s = S.settings || {};
   S.selectedPreset = s.providerPreset || s.endpointType || 'mxgpt';
   $('#setEndpointType').value = s.endpointType || 'mxgpt';
@@ -1352,18 +1868,41 @@ function openSettings() {
   $('#setApiKey').placeholder = s.hasApiKey ? '•••••••• (saved — leave blank to keep)' : 'sk-... (stored locally)';
   $('#setFastModel').value = s.fastModel || 'lfm3:latest';
   $('#setSmartModel').value = s.smartModel || 'inkling-2-mini:latest';
+  $('#setCopilotBModel').value = s.copilotBModel || 'gpt-oss:20b';
+  // Tools tab
+  $('#setToolWeb').checked = s.toolWebSearch !== false;
+  $('#setToolOsFiles').checked = s.toolOsFiles !== false;
+  $('#setToolContainer').checked = s.toolContainer !== false && s.containerEnabled !== false;
+  $('#setToolGraph').checked = s.toolKnowledgeGraph !== false;
+  $('#setToolGit').checked = s.toolGit !== false;
+  $('#setToolSystem').checked = s.toolSystem !== false;
+  $('#setToolCalc').checked = s.toolCalculator !== false;
+  $('#setToolNotes').checked = s.toolNotes !== false;
+  $('#setWebMaxResults').value = String(s.toolWebMaxResults || 5);
+  $('#setWikiLang').value = s.toolWikiLang || 'en';
+  $('#setWebFetchPages').checked = s.toolWebFetchPages !== false;
   $('#setWorkspace').value = s.workspace || '';
-  $('#setSignature').value = s.emailSignature || '';
   $('#setAutoApprove').checked = !!s.autoApproveFileActions;
+  // Container tab
+  $('#setContainerRuntime').value = s.containerRuntime || 'auto';
+  $('#setContainerImage').value = s.containerImage || 'python:3.12-slim';
+  $('#setContainerNet').value = s.containerNetwork || 'none';
+  $('#setContainerMount').value = s.containerMountMode || 'rw';
+  $('#setContainerTimeout').value = String(s.containerTimeoutSec || 30);
+  $('#setContainerMem').value = String(s.containerMemoryMb || 1024);
+  $('#setAutoApproveContainer').checked = !!s.autoApproveContainerRuns;
+
   $('#fetchedModelsWrap').hidden = true;
   $('#testOut').hidden = true;
   selectProviderPreset(S.selectedPreset, false);
+  setSettingsTab(initialTab);
   $('#settingsModal').hidden = false;
 }
 
 function collectSettingsForm() {
   const pw = $('#setPassword').value;
   const key = $('#setApiKey').value.trim();
+  const containerOn = $('#setToolContainer').checked;
   return {
     endpointType: $('#setEndpointType').value,
     providerPreset: S.selectedPreset || $('#setEndpointType').value,
@@ -1373,9 +1912,28 @@ function collectSettingsForm() {
     apiKey: key ? key : '__KEEP__',
     fastModel: $('#setFastModel').value.trim() || 'lfm3:latest',
     smartModel: $('#setSmartModel').value.trim() || 'inkling-2-mini:latest',
+    copilotBModel: $('#setCopilotBModel').value.trim() || 'gpt-oss:20b',
+    toolWebSearch: $('#setToolWeb').checked,
+    toolWebFetchPages: $('#setWebFetchPages').checked,
+    toolWebMaxResults: Math.max(2, Math.min(10, Number($('#setWebMaxResults').value) || 5)),
+    toolWikiLang: $('#setWikiLang').value || 'en',
+    toolOsFiles: $('#setToolOsFiles').checked,
+    toolContainer: containerOn,
+    containerEnabled: containerOn,
+    toolKnowledgeGraph: $('#setToolGraph').checked,
+    toolGit: $('#setToolGit').checked,
+    toolSystem: $('#setToolSystem').checked,
+    toolCalculator: $('#setToolCalc').checked,
+    toolNotes: $('#setToolNotes').checked,
     workspace: $('#setWorkspace').value.trim(),
-    emailSignature: $('#setSignature').value,
     autoApproveFileActions: $('#setAutoApprove').checked,
+    containerRuntime: $('#setContainerRuntime').value || 'auto',
+    containerImage: $('#setContainerImage').value.trim() || 'python:3.12-slim',
+    containerNetwork: $('#setContainerNet').value,
+    containerMountMode: $('#setContainerMount').value,
+    containerTimeoutSec: Math.max(5, Math.min(180, Number($('#setContainerTimeout').value) || 30)),
+    containerMemoryMb: Math.max(128, Math.min(8192, Number($('#setContainerMem').value) || 1024)),
+    autoApproveContainerRuns: $('#setAutoApproveContainer').checked,
     signedIn: true,
   };
 }
@@ -1608,8 +2166,81 @@ $$('.top-actions .ghost-btn[data-panel]').forEach((b) => {
 });
 $('#panelClose').onclick = closePanel;
 $('#wsTopPill').onclick = () => openPanel('files', false);
-$('#filesAccessBtn').onclick = () => openPanel('files', true);
-$('#openBrowseBtn').onclick = pickWorkspaceFolder;
+$('#webToggleBtn').onclick = async () => {
+  S.toolWebSearch = !S.toolWebSearch;
+  $('#webToggleBtn').classList.toggle('on', S.toolWebSearch);
+  await CW.saveSettings({ toolWebSearch: S.toolWebSearch });
+  toast(S.toolWebSearch ? 'Web Search enabled' : 'Web Search disabled');
+};
+$('#filesToggleBtn').onclick = async () => {
+  S.toolOsFiles = !S.toolOsFiles;
+  $('#filesToggleBtn').classList.toggle('on', S.toolOsFiles);
+  await CW.saveSettings({ toolOsFiles: S.toolOsFiles });
+  toast(S.toolOsFiles ? 'OS File Access enabled' : 'OS File Access disabled');
+};
+$('#containerToggleBtn').onclick = async () => {
+  S.containerEnabled = !S.containerEnabled;
+  $('#containerToggleBtn').classList.toggle('on', S.containerEnabled);
+  await CW.saveSettings({ toolContainer: S.containerEnabled, containerEnabled: S.containerEnabled });
+  toast(S.containerEnabled ? 'Container code execution enabled' : 'Container code execution paused');
+};
+
+// Knowledge Graph Controls
+$('#graphBuildBtn').onclick = buildAndRenderGraph;
+$('#graphFitBtn').onclick = () => S.graphView?.fitToView();
+$('#graphZoomInBtn').onclick = () => S.graphView?.zoomBy(1.22);
+$('#graphZoomOutBtn').onclick = () => S.graphView?.zoomBy(1 / 1.22);
+$('#graphExpandBtn').onclick = () => {
+  S.graphExpanded = !S.graphExpanded;
+  $('#panel').classList.toggle('graph-expanded', S.graphExpanded);
+  $('#graphExpandBtn').textContent = S.graphExpanded ? 'Shrink' : 'Expand';
+  setTimeout(() => { S.graphView?.resize(); S.graphView?.fitToView(); }, 80);
+};
+$('#graphSearchInput').oninput = (e) => S.graphView?.setSearch(e.target.value);
+$('#graphFilters').onclick = (e) => {
+  const b = e.target.closest('button[data-kind]');
+  if (!b) return;
+  const k = b.dataset.kind;
+  if (S.graphFilters.has(k)) S.graphFilters.delete(k);
+  else S.graphFilters.add(k);
+  b.classList.toggle('on', S.graphFilters.has(k));
+  S.graphView?.setFilters(S.graphFilters);
+};
+$('#graphAiSummaryBtn').onclick = async () => {
+  const box = $('#graphAiBox');
+  box.hidden = false;
+  box.innerHTML = 'Generating AI architectural summary…';
+  $('#graphAiSummaryBtn').disabled = true;
+  try {
+    const r = await CW.summarizeGraph();
+    box.innerHTML = renderMd(r.summary || 'No summary generated.');
+  } catch (e) {
+    box.innerHTML = `<span style="color:var(--red)">${esc(e.message)}</span>`;
+  } finally {
+    $('#graphAiSummaryBtn').disabled = false;
+  }
+};
+
+// Container Sandbox Controls
+$('#ctRefreshBtn').onclick = () => loadContainerStatus(true);
+$('#ctLang').onchange = () => {
+  const l = $('#ctLang').value;
+  if (l === 'python') $('#ctImage').value = 'python:3.12-slim';
+  else if (l === 'javascript') $('#ctImage').value = 'node:22-alpine';
+  else if (l === 'bash') $('#ctImage').value = 'ubuntu:24.04';
+};
+$('#ctRunBtn').onclick = runSandboxContainer;
+$('#ctStopBtn').onclick = () => {
+  if (S.activeContainerRunId) CW.stopContainerRun(S.activeContainerRunId);
+};
+$('#ctSendOutBtn').onclick = () => {
+  const out = ($('#ctTerminal').textContent || '').trim();
+  if (!out || out.startsWith('Container output will stream')) {
+    toast('Run something in the container first');
+    return;
+  }
+  sendPrompt(`Analyze this container execution output from my workspace:\n\`\`\`\n${out.slice(0, 6000)}\n\`\`\``);
+};
 $('#attachFileBtn').onclick = async () => {
   const res = await CW.pickFiles();
   if (res.canceled) return;
@@ -1686,56 +2317,69 @@ $('#edAskAiBtn').onclick = () => {
   inp.focus();
 };
 
-// Email / Research / Undo wiring
-$('#newDraftBtn').onclick = () => loadDraftIntoStudio({});
-$('#saveDraftBtn').onclick = async () => {
-  const d = await CW.saveDraft({
-    id: S.activeDraftId,
-    to: $('#mailTo').value,
-    cc: $('#mailCc').value,
-    subject: $('#mailSubject').value,
-    body: $('#mailBody').value,
+// Notes & Quick Local Tools / Research / Undo wiring
+$('#saveNoteBtn').onclick = async () => {
+  const title = $('#noteTitleInput').value.trim();
+  const content = $('#noteContentInput').value.trim();
+  if (!title && !content) { toast('Write a note title or content first'); return; }
+  await CW.saveNote({
+    title: title || content.slice(0, 48),
+    tags: $('#noteTagsInput').value,
+    content,
   });
-  S.activeDraftId = d.draft.id;
-  loadDrafts();
-  toast('Draft saved');
+  $('#noteTitleInput').value = '';
+  $('#noteTagsInput').value = '';
+  $('#noteContentInput').value = '';
+  loadNotes();
+  toast('Saved to Copilot memory');
 };
-$('#copyMailBtn').onclick = () => {
-  navigator.clipboard?.writeText(`To: ${$('#mailTo').value}\nSubject: ${$('#mailSubject').value}\n\n${$('#mailBody').value}`);
-  toast('Copied email');
+
+$('#quickGitBtn').onclick = async () => {
+  const out = $('#quickToolOut');
+  out.hidden = false; out.textContent = 'Running git inspect…';
+  try {
+    const r = await CW.gitInspect('status');
+    out.textContent = r.text;
+  } catch (e) { out.textContent = e.message; }
 };
-$('#mailtoBtn').onclick = () => CW.openEmlInMail({
-  to: $('#mailTo').value, cc: $('#mailCc').value, subject: $('#mailSubject').value, body: $('#mailBody').value,
-});
-$('#exportEmlBtn').onclick = async () => {
-  const r = await CW.saveEml({
-    to: $('#mailTo').value, cc: $('#mailCc').value, subject: $('#mailSubject').value, body: $('#mailBody').value,
+
+$('#quickSysBtn').onclick = async () => {
+  const out = $('#quickToolOut');
+  out.hidden = false; out.textContent = 'Inspecting local system & dev runtimes…';
+  try {
+    const r = await CW.systemInfo();
+    out.textContent = r.text;
+  } catch (e) { out.textContent = e.message; }
+};
+
+$('#quickCalcBtn').onclick = async () => {
+  const expr = await askText({
+    title: 'Sandboxed JS Evaluator',
+    label: 'JavaScript expression or snippet',
+    placeholder: '(1024 * 64) / 3.14159',
   });
-  if (!r.canceled) toast(`Saved ${r.filePath}`);
+  if (!expr) return;
+  const out = $('#quickToolOut');
+  out.hidden = false;
+  try {
+    const r = await CW.calcJs(expr);
+    out.textContent = r.text;
+  } catch (e) { out.textContent = `Error: ${e.message}`; }
 };
-$$('[data-refine]').forEach((b) => {
-  b.onclick = async () => {
-    const body = $('#mailBody').value.trim();
-    if (!body) { toast('Write or generate an email body first'); return; }
-    b.disabled = true;
-    const orig = b.textContent;
-    b.textContent = '…';
-    try {
-      const r = await CW.refineDraft({
-        action: b.dataset.refine,
-        tier: S.mode === 'smart' ? 'smart' : 'fast',
-        draft: { to: $('#mailTo').value, subject: $('#mailSubject').value, body },
-      });
-      if (r.subject) $('#mailSubject').value = r.subject;
-      if (r.body) $('#mailBody').value = r.body;
-      toast(`Refined (${r.usage?.tokensPerSec ? r.usage.tokensPerSec + ' t/s' : 'done'})`);
-    } catch (e) { toast(e.message, 4000); }
-    finally { b.disabled = false; b.textContent = orig; }
-  };
-});
+
 $('#resSearchBtn').onclick = quickResearch;
 $('#resSearchInput').addEventListener('keydown', (e) => { if (e.key === 'Enter') quickResearch(); });
 $('#refreshUndoBtn').onclick = loadUndo;
+
+// Settings Tabs & Model Focus
+$('#settingsTabs').onclick = (e) => {
+  const b = e.target.closest('button[data-stab]');
+  if (b) setSettingsTab(b.dataset.stab);
+};
+$('#setCopilotBModel').addEventListener('focus', () => {
+  S.assignModelTarget = 'copilot_b';
+  $$('#fmTarget button').forEach((x) => x.classList.toggle('on', x.dataset.target === 'copilot_b'));
+});
 
 // Settings & Providers Modal wiring
 $('#resetDefaultProviderBtn').onclick = () => {
@@ -1789,6 +2433,15 @@ $('#saveSettingsBtn').onclick = async () => {
     const d = await CW.saveSettings(collectSettingsForm());
     S.settings = d.settings;
     S.cwd = '';
+    S.toolWebSearch = S.settings.toolWebSearch !== false;
+    S.toolOsFiles = S.settings.toolOsFiles !== false;
+    S.containerEnabled = S.settings.toolContainer !== false && S.settings.containerEnabled !== false;
+    $('#webToggleBtn').classList.toggle('on', S.toolWebSearch);
+    $('#filesToggleBtn').classList.toggle('on', S.toolOsFiles);
+    $('#containerToggleBtn').classList.toggle('on', S.containerEnabled);
+    $('#ctImage').value = S.settings.containerImage || 'python:3.12-slim';
+    $('#ctNet').value = S.settings.containerNetwork || 'none';
+    $('#ctMount').value = S.settings.containerMountMode || 'rw';
     $('#settingsModal').hidden = true;
     hideLoginScreen();
     renderAccountUI();

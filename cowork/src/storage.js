@@ -21,6 +21,8 @@ const SETTINGS_FILE = path.join(DATA_DIR, 'settings.json');
 const DRAFTS_FILE = path.join(DATA_DIR, 'email-drafts.json');
 const RESEARCH_FILE = path.join(DATA_DIR, 'research-briefs.json');
 const UNDO_FILE = path.join(DATA_DIR, 'file-undo.json');
+const CONTAINER_RUNS_FILE = path.join(DATA_DIR, 'container-runs.json');
+const NOTES_FILE = path.join(DATA_DIR, 'memory-notes.json');
 
 fs.mkdirSync(CHATS_DIR, { recursive: true });
 
@@ -34,21 +36,43 @@ function defaultWorkspace() {
 
 const DEFAULT_SETTINGS = {
   endpointType: 'mxgpt', // 'mxgpt' | 'ollama' | 'openai' | 'anthropic'
-  providerPreset: 'mxgpt', // 'mxgpt' | 'ollama' | 'openai' | 'openrouter' | 'groq' | 'gemini' | 'mistral' | 'lmstudio' | 'custom_openai' | 'anthropic'
+  providerPreset: 'mxgpt',
   endpointUrl: 'https://max.fyreflysystems.de',
   username: '',
   password: '',
   apiKey: '',
   fastModel: 'lfm3:latest',
   smartModel: 'inkling-2-mini:latest',
-  defaultMode: 'copilot', // 'fast' | 'smart' | 'copilot'
+  copilotBModel: 'gpt-oss:20b',
+  defaultMode: 'copilot', // 'fast' | 'smart' | 'copilot' | 'copilot_b'
   think: 'low', // 'off' | 'low' | 'medium' | 'high'
   workspace: defaultWorkspace(),
   theme: 'light',
   autoApproveFileActions: false,
-  emailSignature: '',
   updateRepo: 'mxsp/mxgpt',
   signedIn: false,
+  // Granular Tool & Capability Settings
+  toolWebSearch: true,
+  toolWebFetchPages: true,
+  toolWebMaxResults: 5,
+  toolWikiLang: 'en',
+  toolOsFiles: true,
+  toolContainer: true,
+  toolKnowledgeGraph: true,
+  toolGit: true,
+  toolSystem: true,
+  toolCalculator: true,
+  toolNotes: true,
+  // Container code execution defaults (safe by default)
+  containerEnabled: true,
+  containerRuntime: 'auto', // 'auto' | 'docker' | 'podman'
+  containerImage: 'python:3.12-slim',
+  containerNetwork: 'none', // 'none' | 'bridge'
+  containerMountMode: 'rw', // 'rw' | 'ro'
+  containerTimeoutSec: 30,
+  containerMemoryMb: 1024,
+  containerCpus: '2',
+  autoApproveContainerRuns: false,
 };
 
 function readJson(file, fallback) {
@@ -245,6 +269,70 @@ function popUndo(id) {
   return entry;
 }
 
+// ---- Container Run History
+function listContainerRuns() {
+  const arr = readJson(CONTAINER_RUNS_FILE, []);
+  return Array.isArray(arr) ? arr : [];
+}
+
+function pushContainerRun(run) {
+  const all = listContainerRuns();
+  all.unshift({
+    ts: Date.now(),
+    ...run,
+    stdout: String(run.stdout || '').slice(0, 16000),
+    stderr: String(run.stderr || '').slice(0, 8000),
+  });
+  writeJson(CONTAINER_RUNS_FILE, all.slice(0, 40));
+  return all[0];
+}
+
+// ---- Persistent Copilot Memory / Notes
+function listNotes() {
+  const arr = readJson(NOTES_FILE, []);
+  return Array.isArray(arr) ? arr.sort((a, b) => (b.updatedAt || 0) - (a.updatedAt || 0)) : [];
+}
+
+function saveNote(note) {
+  const all = listNotes();
+  const now = Date.now();
+  const id = note.id || newId('note');
+  const tags = Array.isArray(note.tags)
+    ? note.tags.map((t) => String(t).trim()).filter(Boolean).slice(0, 8)
+    : String(note.tags || '').split(',').map((t) => t.trim()).filter(Boolean).slice(0, 8);
+  const item = {
+    id,
+    title: String(note.title || 'Untitled note').trim().slice(0, 120),
+    content: String(note.content || '').trim(),
+    tags,
+    createdAt: note.createdAt || now,
+    updatedAt: now,
+  };
+  const idx = all.findIndex((x) => x.id === id);
+  if (idx >= 0) all[idx] = { ...all[idx], ...item, createdAt: all[idx].createdAt || now };
+  else all.unshift(item);
+  writeJson(NOTES_FILE, all.slice(0, 200));
+  return item;
+}
+
+function deleteNote(id) {
+  const all = listNotes();
+  const next = all.filter((x) => x.id !== id);
+  writeJson(NOTES_FILE, next);
+  return next.length !== all.length;
+}
+
+function searchNotes(query = '') {
+  const all = listNotes();
+  const q = String(query || '').trim().toLowerCase();
+  if (!q) return all;
+  const terms = q.split(/\s+/).filter((t) => t.length >= 2);
+  return all.filter((n) => {
+    const hay = `${n.title} ${n.content} ${(n.tags || []).join(' ')}`.toLowerCase();
+    return hay.includes(q) || terms.some((t) => hay.includes(t));
+  });
+}
+
 module.exports = {
   DATA_DIR,
   getSettings,
@@ -265,4 +353,10 @@ module.exports = {
   listUndo,
   pushUndo,
   popUndo,
+  listContainerRuns,
+  pushContainerRun,
+  listNotes,
+  saveNote,
+  deleteNote,
+  searchNotes,
 };
