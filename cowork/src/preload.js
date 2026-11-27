@@ -20,8 +20,10 @@ contextBridge.exposeInMainWorld('cowork', {
   activateProvider: (id) => ipcRenderer.invoke('providers:activate', id),
   refreshProvider: (id) => ipcRenderer.invoke('providers:refresh', id),
 
-  // Token Usage Statistics & 2-Tier Limits (no reset allowed)
+  // Token Usage Statistics & Password-Protected Overboost
   getUsage: () => ipcRenderer.invoke('usage:get'),
+  unlockOverboost: (password) => ipcRenderer.invoke('overboost:unlock', password),
+  lockOverboost: () => ipcRenderer.invoke('overboost:lock'),
 
   // Artifact Canvas Actions
   saveArtifact: (art) => ipcRenderer.invoke('artifact:save', art),

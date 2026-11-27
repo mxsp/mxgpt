@@ -158,7 +158,7 @@
         <span class="upd-dot" id="updDot" hidden></span>
         <svg><use href="#i-download"/></svg>
         <span id="updBtnLabel">Updates</span>
-        <span class="upd-ver" id="appVersionBadge">v1.7.3</span>
+        <span class="upd-ver" id="appVersionBadge">v1.8.0</span>
       </button>
       <div class="user-row">
         <button class="user-chip" id="openSettingsBtn" title="Endpoint, providers &amp; account settings">
@@ -180,12 +180,13 @@
       <div class="top-title">
         <span id="chatTitle">New chat</span>
         <span class="model-pill" id="topModel">Copilot</span>
+        <select class="model-select" id="activeModelSelect" title="Select available model for the active mode"></select>
+        <span class="overboost-badge" id="overboostTopBadge" hidden title="Overboost Active — OpenCode Go models unlocked &amp; all token limits removed">⚡ Overboost</span>
         <button class="persona-pill" id="wsTopPill" title="Active project / OS folder — click to browse OS files">
           <svg><use href="#i-folder"/></svg>
           <span id="wsTopLabel">Documents</span>
         </button>
         <button class="auto-edit-pill" id="autoAcceptTopPill" title="Toggle Auto Mode — auto-run code execution (in preselected Env), file edits &amp; spreadsheet edits (edits stay 1-click undoable)">Auto: Off</button>
-        <button class="auto-edit-pill env-pill" id="execEnvTopPill" title="Preselected standard code execution environment — click to switch between Container and Host">Env: Container</button>
         <span class="mapping-pill" id="graphMappingPill" hidden><span class="mini-spin"></span><span id="graphMappingTxt">Mapping…</span></span>
       </div>
       <div class="top-actions">
@@ -240,6 +241,43 @@
         </div>
         <div class="queued-bar" id="queuedBar" hidden></div>
         <div class="slash-menu" id="slashMenu" hidden></div>
+        <div class="composer-menu" id="composerMenu" hidden>
+          <div class="cm-sec">
+            <div class="cm-row">
+              <span class="cm-label">Auto Mode</span>
+              <button class="tool-toggle auto-btn" id="autoModeToggleBtn" title="Auto Mode — auto-run code executions (in preselected Env), file edits &amp; spreadsheet edits"><svg><use href="#i-spark"/></svg><span>Auto: Off</span></button>
+            </div>
+            <div class="cm-row">
+              <span class="cm-label">Standard Env</span>
+              <div class="env-seg" id="execEnvSeg" role="radiogroup" aria-label="Standard code execution environment">
+                <button type="button" data-env="container" class="on" title="Standard env: Isolated Docker/Podman Container">Container</button>
+                <button type="button" data-env="host" title="Standard env: On-Machine Local Host">Host</button>
+              </div>
+            </div>
+            <div class="cm-row">
+              <span class="cm-label">Reasoning</span>
+              <div class="think-seg" id="thinkSeg" role="radiogroup" aria-label="Thinking effort">
+                <button type="button" data-think="off">Off</button>
+                <button type="button" data-think="low" class="on">Low</button>
+                <button type="button" data-think="medium">Med</button>
+                <button type="button" data-think="high">High</button>
+              </div>
+            </div>
+          </div>
+          <div class="cm-sec">
+            <span class="cm-label" style="margin-bottom:6px;display:block">Tools &amp; Privacy</span>
+            <div class="cm-tools-grid">
+              <button class="tool-toggle on" id="webToggleBtn" title="Toggle Web Search &amp; URL Page Reader"><svg><use href="#i-globe"/></svg><span>Web</span></button>
+              <button class="tool-toggle on" id="filesToggleBtn" title="Toggle Local OS File Access"><svg><use href="#i-folder"/></svg><span>Files</span></button>
+              <button class="tool-toggle on" id="containerToggleBtn" title="Toggle Code Execution (Container / Host)"><svg><use href="#i-box"/></svg><span>Code</span></button>
+              <button class="tool-toggle shield-btn" id="shieldToggleBtn" title="Privacy / PII Shield — mask emails, IBANs, phones, secrets &amp; custom client names locally before sending"><svg><use href="#i-shield"/></svg><span>Shield</span></button>
+            </div>
+          </div>
+          <div class="cm-foot">
+            <span class="cm-summary" id="cmFootInfo">Container · Think: Low</span>
+            <button type="button" class="link-btn" id="composerOpenSettingsBtn">All Settings…</button>
+          </div>
+        </div>
         <div class="composer" id="composer">
           <div class="attach-row" id="pinnedBar" hidden></div>
           <textarea id="promptInput" rows="1" placeholder="How can I help? Type / for workflows or Ctrl+V to paste a screenshot…" spellcheck="false"></textarea>
@@ -247,27 +285,9 @@
             <div class="c-left">
               <button class="icon-btn" id="attachFileBtn" title="Attach / pin local OS files to chat"><svg><use href="#i-plus"/></svg></button>
               <button class="tool-toggle" id="workflowsBtn" title="Open reusable /workflows &amp; prompt templates"><span>/</span></button>
-              <button class="tool-toggle on" id="webToggleBtn" title="Toggle Web Search &amp; URL Page Reader"><svg><use href="#i-globe"/></svg><span>Web</span></button>
-              <button class="tool-toggle on" id="filesToggleBtn" title="Toggle Local OS File Access"><svg><use href="#i-folder"/></svg><span>Files</span></button>
-              <button class="tool-toggle on" id="containerToggleBtn" title="Toggle Code Execution (Container / Host)"><svg><use href="#i-box"/></svg><span>Code</span></button>
-              <div class="env-control" id="execEnvControl" title="Preselect standard code execution environment: Isolated Container or On-Machine Host">
-                <span class="env-label">Env</span>
-                <div class="env-seg" id="execEnvSeg" role="radiogroup" aria-label="Standard code execution environment">
-                  <button type="button" data-env="container" class="on" title="Standard env: Isolated Docker/Podman Container">Container</button>
-                  <button type="button" data-env="host" title="Standard env: On-Machine Local Host">Host</button>
-                </div>
-              </div>
-              <button class="tool-toggle auto-btn" id="autoModeToggleBtn" title="Auto Mode — auto-run code executions (in preselected Env), file edits &amp; spreadsheet edits"><svg><use href="#i-spark"/></svg><span>Auto</span></button>
-              <button class="tool-toggle shield-btn" id="shieldToggleBtn" title="Privacy / PII Shield — mask emails, IBANs, phones, secrets &amp; custom client names locally before sending"><svg><use href="#i-shield"/></svg><span>Shield</span></button>
-              <div class="think-control" id="thinkControl" title="Smart / Copilot reasoning depth">
-                <span class="think-label">Think</span>
-                <div class="think-seg" id="thinkSeg" role="radiogroup" aria-label="Thinking effort">
-                  <button type="button" data-think="off">Off</button>
-                  <button type="button" data-think="low" class="on">Low</button>
-                  <button type="button" data-think="medium">Med</button>
-                  <button type="button" data-think="high">High</button>
-                </div>
-              </div>
+              <button class="tool-toggle cm-trigger" id="composerMenuBtn" title="Open unified controls menu (Auto Mode, Container/Host Env, Think, Tools &amp; Settings)">
+                <svg><use href="#i-settings"/></svg><span id="composerMenuSummary">Controls</span>
+              </button>
             </div>
             <div class="c-right">
               <div class="mode-control" id="modeControl" data-mode="copilot" title="Fast · Smart · Copilot (Smart + Fast) · Copilot (B) (nemotron-3.5-lightning + Fast)">
@@ -621,30 +641,31 @@
     <div class="modal-body">
       <!-- Tab 1: Models & Agent Role Routing -->
       <div class="stab-pane active" data-spane="models">
+        <datalist id="availableModelsList"></datalist>
         <div class="field-row">
           <label class="field">
             <span>Fast Model (Direct Fast Mode)</span>
-            <input type="text" id="setFastModel" placeholder="lfm3:latest" />
+            <input type="text" id="setFastModel" list="availableModelsList" placeholder="lfm3:latest" />
           </label>
           <label class="field">
             <span>Smart / Copilot Orchestrator Model</span>
-            <input type="text" id="setSmartModel" placeholder="inkling-2-mini:latest" />
+            <input type="text" id="setSmartModel" list="availableModelsList" placeholder="inkling-2-mini:latest" />
           </label>
         </div>
         <div class="field-row">
           <label class="field">
             <span>Copilot (B) Orchestrator Model</span>
-            <input type="text" id="setCopilotBModel" placeholder="nemotron-3.5-lightning" />
+            <input type="text" id="setCopilotBModel" list="availableModelsList" placeholder="nemotron-3.5-lightning" />
           </label>
           <label class="field">
             <span>Subagent / Worker Model</span>
-            <input type="text" id="setAgentModel" placeholder="lfm3:latest" />
+            <input type="text" id="setAgentModel" list="availableModelsList" placeholder="lfm3:latest" />
           </label>
         </div>
         <div class="field-row">
           <label class="field">
             <span>Knowledge Graph Mapper Model</span>
-            <input type="text" id="setGraphMapperModel" placeholder="lfm3:latest" />
+            <input type="text" id="setGraphMapperModel" list="availableModelsList" placeholder="lfm3:latest" />
           </label>
           <label class="field" style="flex:0.7">
             <span>Default Mode</span>
@@ -681,19 +702,23 @@
         </div>
 
         <div class="settings-sep"></div>
-        <div class="field-row">
-          <label class="field">
-            <span>Fast Tier Limit</span>
-            <input type="text" value="Unlimited (no cap)" disabled />
-          </label>
-          <label class="field">
-            <span>Smart Tier · 4-Hour Token Limit</span>
-            <input type="number" id="setSmartLimit4h" min="0" step="10000" value="150000" />
-          </label>
-          <label class="field">
-            <span>Smart Tier · Weekly Token Limit</span>
-            <input type="number" id="setSmartLimitWeekly" min="0" step="50000" value="2000000" />
-          </label>
+        <div class="overboost-card" id="overboostCard">
+          <div class="ob-head">
+            <div>
+              <b>⚡ Overboost</b>
+              <small id="overboostDesc">Password-protected mode that unlocks OpenCode Go cloud models and removes all token usage limits.</small>
+            </div>
+            <span class="badge-pill" id="overboostStatusBadge">Locked</span>
+          </div>
+          <div class="row-gap" id="overboostUnlockRow">
+            <input type="password" id="overboostPwInput" style="flex:1" placeholder="Enter Overboost password…" autocomplete="off" />
+            <button type="button" class="btn primary" id="overboostUnlockBtn">Unlock Overboost</button>
+          </div>
+          <div class="row-gap" id="overboostActiveRow" hidden>
+            <span class="muted-note" style="margin:0;flex:1">⚡ Energy active — all OpenCode Go models enabled &amp; all token limits removed.</span>
+            <button type="button" class="btn danger" id="overboostLockBtn">Disable Overboost</button>
+          </div>
+          <div class="ob-msg" id="overboostMsg" hidden></div>
         </div>
 
         <label class="field">

@@ -260,9 +260,12 @@ function anthropicHeaders(cfg) {
   };
   if (cfg.apiKey) {
     h['x-api-key'] = cfg.apiKey;
-    if (/opencode\.ai\/zen\/go/i.test(cfg.endpointUrl || '')) {
+    if (/opencode\.ai|\/opencode\/v1/i.test(cfg.endpointUrl || '')) {
       h.authorization = `Bearer ${cfg.apiKey}`;
     }
+  }
+  if (/opencode\.ai|\/opencode\/v1/i.test(cfg.endpointUrl || '')) {
+    h['x-opencode-session'] = `mxcw-${Date.now().toString(36)}`;
   }
   return h;
 }
@@ -359,16 +362,25 @@ async function testConnection(overrideCfg = null) {
     throw new Error(`mx-GPT HTTP ${res.status}: ${txt || res.statusText}`);
   }
   const data = await res.json();
+  const overboost = Boolean(saved.overboostEnabled);
+  const rawModels = Array.isArray(data.models) ? data.models : [];
+  const filteredModels = overboost
+    ? rawModels
+    : rawModels.filter((m) => !(/^opencode-go\//i.test(m.name || '') || m.providerId === 'opencode-go'));
   return {
     ok: true,
     endpointType: 'mxgpt',
     endpointUrl: cfg.endpointUrl,
     latencyMs: Date.now() - t0,
-    models: (data.models || []).map((m) => ({
+    overboost,
+    models: filteredModels.map((m) => ({
       name: m.name,
       displayName: m.displayName || m.name,
       mode: m.mode || '',
       params: m.params || '',
+      providerId: m.providerId || '',
+      providerName: m.providerName || '',
+      cloud: Boolean(m.cloud),
     })),
   };
 }

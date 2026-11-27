@@ -86,9 +86,10 @@ const DEFAULT_SETTINGS = {
   containerMemoryMb: 1024,
   containerCpus: '2',
   autoApproveContainerRuns: false,
-  // 2-Tier Token Usage Limits (Fast = Unlimited; Smart = 4h & Weekly caps)
+  // 2-Tier Token Usage Limits (Fast = Unlimited; Smart = 4h & Weekly caps; Overboost removes all limits)
   smartLimit4h: 150000,
   smartLimitWeekly: 2000000,
+  overboostEnabled: false,
   // Company Worker Productivity & Privacy Defaults (v1.6.0)
   piiShieldEnabled: false,
   piiCustomTerms: '',
@@ -657,29 +658,33 @@ function getUsageLimitsStatus() {
     }
   }
 
-  const exceeded4h = limit4h > 0 && smart4h >= limit4h;
-  const exceededWeekly = limitWeekly > 0 && smartWeekly >= limitWeekly;
+  const overboost = Boolean(cfg.overboostEnabled);
+  const exceeded4h = !overboost && limit4h > 0 && smart4h >= limit4h;
+  const exceededWeekly = !overboost && limitWeekly > 0 && smartWeekly >= limitWeekly;
 
   return {
+    overboost,
     fast: {
       unlimited: true,
       totalTokens: fastTotalTokens,
       requests: fastRequests,
     },
     smart: {
-      limit4h,
+      unlimited: overboost,
+      overboost,
+      limit4h: overboost ? 0 : limit4h,
       used4h: smart4h,
-      remaining4h: limit4h > 0 ? Math.max(0, limit4h - smart4h) : null,
-      pct4h: limit4h > 0 ? Math.min(100, Math.round((smart4h / limit4h) * 100)) : 0,
-      reset4hInMs: oldest4hTs ? Math.max(0, (oldest4hTs + FOUR_HOURS) - now) : 0,
-      limitWeekly,
+      remaining4h: overboost ? null : (limit4h > 0 ? Math.max(0, limit4h - smart4h) : null),
+      pct4h: overboost ? 0 : (limit4h > 0 ? Math.min(100, Math.round((smart4h / limit4h) * 100)) : 0),
+      reset4hInMs: overboost ? 0 : (oldest4hTs ? Math.max(0, (oldest4hTs + FOUR_HOURS) - now) : 0),
+      limitWeekly: overboost ? 0 : limitWeekly,
       usedWeekly: smartWeekly,
-      remainingWeekly: limitWeekly > 0 ? Math.max(0, limitWeekly - smartWeekly) : null,
-      pctWeekly: limitWeekly > 0 ? Math.min(100, Math.round((smartWeekly / limitWeekly) * 100)) : 0,
-      resetWeeklyInMs: oldestWeeklyTs ? Math.max(0, (oldestWeeklyTs + SEVEN_DAYS) - now) : 0,
+      remainingWeekly: overboost ? null : (limitWeekly > 0 ? Math.max(0, limitWeekly - smartWeekly) : null),
+      pctWeekly: overboost ? 0 : (limitWeekly > 0 ? Math.min(100, Math.round((smartWeekly / limitWeekly) * 100)) : 0),
+      resetWeeklyInMs: overboost ? 0 : (oldestWeeklyTs ? Math.max(0, (oldestWeeklyTs + SEVEN_DAYS) - now) : 0),
       exceeded4h,
       exceededWeekly,
-      allowed: !exceeded4h && !exceededWeekly,
+      allowed: overboost || (!exceeded4h && !exceededWeekly),
     },
   };
 }

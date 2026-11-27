@@ -22,6 +22,6 @@
 - **Company Worker Productivity Suite**: Reusable `/workflows` autocomplete (`/meeting-notes`, `/weekly-update`, `/rewrite`, `/translate`, `/audit-data`, `/report`, `/action-items`, `/compare` + custom templates), **Project Tasks** board, **Privacy / PII Redaction Shield** (masks emails, IBANs, phones, secrets & custom client names locally before cloud calls and restores locally), **Private Offline Document Knowledge Base** (BM25 search over PDFs/DOCX/XLSX/MD), **Local Scheduled Automations & Folder Watchers**, **System Tray + `Alt+Space` Clipboard Quick-Ask**, and **`Ctrl+V` Screenshot Paste**.
 
 ## Running
-- **Linux**: Download `mx-Cowork-1.7.3.AppImage` (`chmod +x` and run) or install `mx-cowork_1.7.3_amd64.deb` (`sudo apt install ./mx-cowork_1.7.3_amd64.deb`).
-- **Windows**: Extract `mx-Cowork-1.7.3-win-x64.zip` and double-click `mx-Cowork.exe`.
+- **Linux**: Download `mx-Cowork-1.8.0.AppImage` (`chmod +x` and run) or install `mx-cowork_1.8.0_amd64.deb` (`sudo apt install ./mx-cowork_1.8.0_amd64.deb`).
+- **Windows**: Extract `mx-Cowork-1.8.0-win-x64.zip` and double-click `mx-Cowork.exe`.
 - **From source**: `cd cowork && npm install && npm start`

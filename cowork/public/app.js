@@ -8,6 +8,7 @@ const S = {
   appInfo: null,
   settings: null,
   providerPresets: [],
+  availableModels: [],
   selectedPreset: 'mxgpt',
   loginPreset: 'openai',
   assignModelTarget: 'fast',
@@ -506,6 +507,93 @@ function modeHintText(m) {
   return `Copilot: ${smart} orchestrates · ${agent} workers & local tools`;
 }
 
+function getModelFieldForMode(m = S.mode) {
+  if (m === 'fast') return 'fastModel';
+  if (m === 'copilot_b') return 'copilotBModel';
+  return 'smartModel';
+}
+
+function getActiveModelForMode(m = S.mode) {
+  const s = S.settings || {};
+  if (m === 'fast') return s.fastModel || 'lfm3:latest';
+  if (m === 'copilot_b') return s.copilotBModel || 'nemotron-3.5-lightning';
+  return s.smartModel || 'inkling-2-mini:latest';
+}
+
+function renderAvailableModelsDropdown() {
+  const sel = $('#activeModelSelect');
+  const dl = $('#availableModelsList');
+  const overboost = Boolean(S.settings?.overboostEnabled);
+  const current = getActiveModelForMode(S.mode);
+
+  const raw = Array.isArray(S.availableModels) ? S.availableModels : [];
+  const visible = overboost
+    ? raw
+    : raw.filter((m) => !(/^opencode-go\//i.test(m.name || '') || m.providerId === 'opencode-go'));
+
+  if (dl) {
+    dl.innerHTML = visible.map((m) => `<option value="${esc(m.name)}">${esc(m.displayName || m.name)}</option>`).join('');
+  }
+  if (!sel) return;
+
+  sel.innerHTML = '';
+  const localModels = visible.filter((m) => !(/^opencode-go\//i.test(m.name || '') || m.providerId === 'opencode-go'));
+  const ocModels = visible.filter((m) => /^opencode-go\//i.test(m.name || '') || m.providerId === 'opencode-go');
+
+  const addOptions = (parent, list) => {
+    for (const m of list) {
+      const opt = document.createElement('option');
+      opt.value = m.name;
+      const short = (m.displayName || m.name).replace(/\s*·\s*OpenCode Go$/i, '');
+      opt.textContent = short;
+      parent.appendChild(opt);
+    }
+  };
+
+  if (localModels.length && ocModels.length) {
+    const g1 = document.createElement('optgroup');
+    g1.label = 'Local / Endpoint Models';
+    addOptions(g1, localModels);
+    sel.appendChild(g1);
+
+    const g2 = document.createElement('optgroup');
+    g2.label = '⚡ Overboost · OpenCode Go';
+    addOptions(g2, ocModels);
+    sel.appendChild(g2);
+  } else if (visible.length) {
+    addOptions(sel, visible);
+  }
+
+  // Ensure the currently configured model is always represented in the dropdown
+  const hasCurrent = [...sel.options].some((o) => o.value === current);
+  if (current && !hasCurrent) {
+    const opt = document.createElement('option');
+    opt.value = current;
+    opt.textContent = current.replace(/:latest$/, '');
+    sel.prepend(opt);
+  }
+  sel.value = current;
+  sel.title = `Active model for ${S.mode}: ${current}`;
+}
+
+function renderOverboostUI() {
+  const on = Boolean(S.settings?.overboostEnabled);
+  const badge = $('#overboostTopBadge');
+  if (badge) badge.hidden = !on;
+  const card = $('#overboostCard');
+  if (card) card.classList.toggle('active', on);
+  const st = $('#overboostStatusBadge');
+  if (st) {
+    st.textContent = on ? '⚡ Active' : 'Locked';
+    st.className = 'badge-pill' + (on ? ' ok' : '');
+  }
+  const uRow = $('#overboostUnlockRow');
+  const aRow = $('#overboostActiveRow');
+  if (uRow) uRow.hidden = on;
+  if (aRow) aRow.hidden = !on;
+  if (typeof renderComposerMenuSummary === 'function') renderComposerMenuSummary();
+}
+
 function setMode(m) {
   S.mode = m;
   $('#modeControl').dataset.mode = m;
@@ -516,11 +604,13 @@ function setMode(m) {
   });
   $('#modeHint').textContent = modeHintText(m);
   $('#topModel').textContent = m === 'fast' ? 'Fast' : m === 'smart' ? 'Smart' : m === 'copilot_b' ? 'Copilot (B)' : 'Copilot';
+  renderAvailableModelsDropdown();
 }
 
 function setThink(t) {
   S.think = t;
   $$('#thinkSeg button').forEach((b) => b.classList.toggle('on', b.dataset.think === t));
+  renderComposerMenuSummary();
 }
 
 function applyThemeUI(theme) {
@@ -670,9 +760,14 @@ async function checkConnectionQuiet() {
     const host = new URL(r.endpointUrl).host;
     $('#connLabel').textContent = `${host} · ${r.latencyMs}ms`;
     $('#footProviderBtn').textContent = host;
+    if (Array.isArray(r.models)) {
+      S.availableModels = r.models;
+      renderAvailableModelsDropdown();
+    }
   } catch {
     const t = S.settings?.endpointType || 'mxgpt';
     $('#connLabel').textContent = t === 'mxgpt' ? 'Not signed in — click' : 'Provider offline';
+    renderAvailableModelsDropdown();
   }
 }
 
@@ -692,7 +787,7 @@ async function boot() {
   S.projects = projData?.projects || [];
   S.activeProject = projData?.activeProject || null;
 
-  $('#appVersionBadge').textContent = `v${info.version || '1.7.3'}`;
+  $('#appVersionBadge').textContent = `v${info.version || '1.8.0'}`;
   applyThemeUI(S.settings.theme || 'light');
   setMode(S.settings.defaultMode || 'copilot');
   setThink(S.settings.think || 'low');
@@ -736,6 +831,8 @@ async function boot() {
   $('#ctExecTarget').value = getEffectiveExecTarget();
   syncCodeExecTargetUI();
   renderExecEnvUI();
+  renderOverboostUI();
+  renderAvailableModelsDropdown();
   renderAutoAcceptPill();
 
   CW.onUpdateProgress((p) => renderUpdateProgress(p));
@@ -818,6 +915,26 @@ function getEffectiveExecTarget() {
   return raw === 'host' ? 'host' : 'container';
 }
 
+function renderComposerMenuSummary() {
+  const { allOn, anyOn } = getEffectiveAutoState();
+  const env = getEffectiveExecTarget();
+  const envLabel = env === 'host' ? 'Host' : 'Container';
+  const parts = [];
+  if (allOn) parts.push('Auto');
+  else if (anyOn) parts.push('Partial Auto');
+  parts.push(envLabel);
+  if (S.piiShield) parts.push('Shield');
+  const sumEl = $('#composerMenuSummary');
+  if (sumEl) sumEl.textContent = parts.join(' · ');
+  const btn = $('#composerMenuBtn');
+  if (btn) btn.classList.toggle('has-auto', allOn);
+  const foot = $('#cmFootInfo');
+  if (foot) {
+    const thinkLbl = (S.think || 'low').replace(/^./, (c) => c.toUpperCase());
+    foot.textContent = `${envLabel} · Think: ${thinkLbl}${S.settings?.overboostEnabled ? ' · ⚡ Overboost' : ''}`;
+  }
+}
+
 function renderAutoAcceptPill() {
   const { autoEdits, autoCode, allOn, anyOn } = getEffectiveAutoState();
   const env = getEffectiveExecTarget();
@@ -836,11 +953,12 @@ function renderAutoAcceptPill() {
   if (cBtn) {
     cBtn.classList.toggle('on', anyOn);
     const sp = cBtn.querySelector('span');
-    if (sp) sp.textContent = allOn ? 'Auto ON' : (autoCode ? 'Auto Run' : (autoEdits ? 'Auto Edit' : 'Auto'));
+    if (sp) sp.textContent = allOn ? 'Auto: ON' : (autoCode ? 'Auto-Run: ON' : (autoEdits ? 'Auto-Edit: ON' : 'Auto: Off'));
     cBtn.title = allOn
       ? `Auto Mode ON (${env.toUpperCase()}) — code runs, file edits & table edits execute automatically`
       : 'Toggle Auto Mode — auto-execute code runs (in preselected Env), file edits & spreadsheet edits';
   }
+  renderComposerMenuSummary();
 }
 
 function renderExecEnvUI() {
@@ -2235,10 +2353,22 @@ function handleGlobalCoworkEvent({ streamId: sid, event: ev, data: d }) {
       toast(`Finished: ${d.chat?.title || 'Background chat'}`);
     }
     loadChats();
+    const userAskedOpenExcel = /\b(open|öffne|oeffne|zeig|show)\b/i.test(st.userMsg?.content || '')
+      && /\b(excel|xlsx|csv|tabelle|spreadsheet)\b/i.test(st.userMsg?.content || '');
     if (d.message?.codeRuns?.some((r) => r.status === 'done' || r.status === 'error')) {
       loadContainerHistory();
       loadFiles(S.cwd);
-      loadOfficeQuickStrip();
+      loadOfficeQuickStrip().then(() => {
+        if (userAskedOpenExcel && isViewingStream(st)) {
+          CW.listOfficeFiles().then((res) => {
+            const newest = (res?.files || []).find((f) => /\.(xlsx|csv|tsv)$/i.test(f.relPath));
+            if (newest) {
+              openPanel('files', false);
+              openFileInEditor(newest.relPath);
+            }
+          }).catch(() => {});
+        }
+      });
     } else if (d.message?.fileActions?.some((a) => a.status === 'applied') || d.message?.tableEdits?.some((t) => t.status === 'applied')) {
       loadFiles(S.cwd);
       loadOfficeQuickStrip();
@@ -3586,10 +3716,16 @@ function selectProviderPreset(presetId, fillFields = true) {
 function renderFetchedModels(models) {
   const wrap = $('#fetchedModelsWrap');
   const list = $('#fetchedModelsList');
-  if (!models || !models.length) { wrap.hidden = true; return; }
+  if (Array.isArray(models) && models.length) {
+    S.availableModels = models;
+    renderAvailableModelsDropdown();
+  }
+  const overboost = Boolean(S.settings?.overboostEnabled);
+  const shown = (models || []).filter((m) => overboost || !(/^opencode-go\//i.test(m.name || '') || m.providerId === 'opencode-go'));
+  if (!shown.length) { wrap.hidden = true; return; }
   wrap.hidden = false;
   list.innerHTML = '';
-  for (const m of models.slice(0, 60)) {
+  for (const m of shown.slice(0, 80)) {
     const btn = document.createElement('button');
     btn.type = 'button';
     btn.className = 'fm-pill';
@@ -3796,9 +3932,12 @@ async function renderUsagePanel() {
     };
     const barCls = (pct) => (pct >= 100 ? 'hit' : pct >= 80 ? 'warn' : 'ok');
 
-    root.innerHTML = `
+      const isOverboost = Boolean(lim.overboost || lim.smart?.overboost);
+      root.innerHTML = `
       <div class="pane-head-row" style="margin-bottom:10px">
-        <span class="muted-note" style="margin:0">2-Tier Token Telemetry &amp; Limits — Fast tier is unlimited; Smart tier enforces rolling 4-hour &amp; 7-day weekly caps.</span>
+        <span class="muted-note" style="margin:0">${isOverboost
+          ? '⚡ Overboost (Energy) Active — all token usage limits are removed for both Fast and Smart tiers.'
+          : '2-Tier Token Telemetry &amp; Limits — Fast tier is unlimited; Smart tier enforces rolling 4-hour &amp; 7-day weekly caps.'}</span>
         <div class="row-gap">
           <button type="button" class="btn tiny" id="usageRefreshBtn">Refresh</button>
         </div>
@@ -3811,17 +3950,17 @@ async function renderUsagePanel() {
           <div class="limit-bar"><div class="limit-fill ok" style="width:100%"></div></div>
           <div class="limit-sub">${lim.fast.requests} reqs · No cap (Fast, Workers, Graph)</div>
         </div>
-        <div class="limit-card">
-          <div class="limit-top"><span>Smart · 4-Hour Window</span><span>${lim.smart.limit4h > 0 ? lim.smart.pct4h + '%' : 'Off'}</span></div>
-          <div class="limit-val">${fmtTok(lim.smart.used4h)} / ${lim.smart.limit4h > 0 ? fmtTok(lim.smart.limit4h) : '∞'}</div>
-          <div class="limit-bar"><div class="limit-fill ${barCls(lim.smart.pct4h)}" style="width:${lim.smart.pct4h}%"></div></div>
-          <div class="limit-sub">${lim.smart.exceeded4h ? 'Limit reached · ' : ''}${fmtReset(lim.smart.reset4hInMs)}</div>
+        <div class="limit-card${isOverboost ? ' unlimited' : ''}">
+          <div class="limit-top"><span>Smart · 4-Hour Window</span><span>${isOverboost ? '<span class="badge-pill ok">⚡ Unlimited</span>' : (lim.smart.limit4h > 0 ? lim.smart.pct4h + '%' : 'Off')}</span></div>
+          <div class="limit-val">${isOverboost ? fmtTok(lim.smart.used4h) + ' used' : `${fmtTok(lim.smart.used4h)} / ${lim.smart.limit4h > 0 ? fmtTok(lim.smart.limit4h) : '∞'}`}</div>
+          <div class="limit-bar"><div class="limit-fill ${isOverboost ? 'ok' : barCls(lim.smart.pct4h)}" style="width:${isOverboost ? 100 : lim.smart.pct4h}%"></div></div>
+          <div class="limit-sub">${isOverboost ? '⚡ Overboost active · No limit' : `${lim.smart.exceeded4h ? 'Limit reached · ' : ''}${fmtReset(lim.smart.reset4hInMs)}`}</div>
         </div>
-        <div class="limit-card">
-          <div class="limit-top"><span>Smart · Weekly Limit</span><span>${lim.smart.limitWeekly > 0 ? lim.smart.pctWeekly + '%' : 'Off'}</span></div>
-          <div class="limit-val">${fmtTok(lim.smart.usedWeekly)} / ${lim.smart.limitWeekly > 0 ? fmtTok(lim.smart.limitWeekly) : '∞'}</div>
-          <div class="limit-bar"><div class="limit-fill ${barCls(lim.smart.pctWeekly)}" style="width:${lim.smart.pctWeekly}%"></div></div>
-          <div class="limit-sub">${lim.smart.exceededWeekly ? 'Limit reached · ' : ''}${fmtReset(lim.smart.resetWeeklyInMs)}</div>
+        <div class="limit-card${isOverboost ? ' unlimited' : ''}">
+          <div class="limit-top"><span>Smart · Weekly Limit</span><span>${isOverboost ? '<span class="badge-pill ok">⚡ Unlimited</span>' : (lim.smart.limitWeekly > 0 ? lim.smart.pctWeekly + '%' : 'Off')}</span></div>
+          <div class="limit-val">${isOverboost ? fmtTok(lim.smart.usedWeekly) + ' used' : `${fmtTok(lim.smart.usedWeekly)} / ${lim.smart.limitWeekly > 0 ? fmtTok(lim.smart.limitWeekly) : '∞'}`}</div>
+          <div class="limit-bar"><div class="limit-fill ${isOverboost ? 'ok' : barCls(lim.smart.pctWeekly)}" style="width:${isOverboost ? 100 : lim.smart.pctWeekly}%"></div></div>
+          <div class="limit-sub">${isOverboost ? '⚡ Overboost active · No limit' : `${lim.smart.exceededWeekly ? 'Limit reached · ' : ''}${fmtReset(lim.smart.resetWeeklyInMs)}`}</div>
         </div>
       </div>
 
@@ -3910,9 +4049,10 @@ function openSettings(initialTab = 'models') {
   $('#setGraphMapperModel').value = s.graphMapperModel || s.fastModel || 'lfm3:latest';
   $('#setDefaultMode').value = s.defaultMode || 'copilot';
   $('#setDefaultThink').value = s.think || 'low';
-  $('#setSmartLimit4h').value = String(s.smartLimit4h ?? 150000);
-  $('#setSmartLimitWeekly').value = String(s.smartLimitWeekly ?? 2000000);
   $('#setCustomInstr').value = s.customInstructions || '';
+  $('#overboostPwInput').value = '';
+  $('#overboostMsg').hidden = true;
+  renderOverboostUI();
   // Tab 2: Providers & API Keys
   $('#setEndpointType').value = s.endpointType || 'mxgpt';
   $('#setEndpointUrl').value = s.endpointUrl || 'https://max.fyreflysystems.de';
@@ -3949,6 +4089,7 @@ function openSettings(initialTab = 'models') {
   $('#setAutoApproveContainer').checked = !!s.autoApproveContainerRuns;
 
   $('#fetchedModelsWrap').hidden = true;
+  if (S.availableModels?.length) renderFetchedModels(S.availableModels);
   $('#testOut').hidden = true;
   selectProviderPreset(S.selectedPreset, false);
   setSettingsTab(tab);
@@ -3974,8 +4115,6 @@ function collectSettingsForm() {
     graphMapperModel: $('#setGraphMapperModel').value.trim() || fastModel,
     defaultMode: $('#setDefaultMode').value || 'copilot',
     think: $('#setDefaultThink').value || 'low',
-    smartLimit4h: Math.max(0, Math.round(Number($('#setSmartLimit4h').value) || 0)),
-    smartLimitWeekly: Math.max(0, Math.round(Number($('#setSmartLimitWeekly').value) || 0)),
     customInstructions: $('#setCustomInstr').value.trim(),
     toolWebSearch: $('#setToolWeb').checked,
     toolWebFetchPages: $('#setWebFetchPages').checked,
@@ -4353,11 +4492,112 @@ $('#deleteProjectBtn').onclick = async () => {
 };
 $('#autoAcceptTopPill').onclick = toggleUnifiedAutoMode;
 $('#autoModeToggleBtn').onclick = toggleUnifiedAutoMode;
-$('#execEnvTopPill').onclick = () => setStandardExecEnv(getEffectiveExecTarget() === 'host' ? 'container' : 'host');
+if ($('#execEnvTopPill')) {
+  $('#execEnvTopPill').onclick = () => setStandardExecEnv(getEffectiveExecTarget() === 'host' ? 'container' : 'host');
+}
 $('#execEnvSeg').onclick = (e) => {
   const b = e.target.closest('button[data-env]');
   if (!b) return;
   setStandardExecEnv(b.dataset.env);
+};
+
+// Streamlined Unified Composer Controls Menu
+$('#composerMenuBtn').onclick = (e) => {
+  e.stopPropagation();
+  const menu = $('#composerMenu');
+  const nextOpen = menu.hidden;
+  menu.hidden = !nextOpen;
+  $('#composerMenuBtn').classList.toggle('active', nextOpen);
+  if (nextOpen) renderComposerMenuSummary();
+};
+$('#composerOpenSettingsBtn').onclick = () => {
+  $('#composerMenu').hidden = true;
+  $('#composerMenuBtn').classList.remove('active');
+  openSettings('models');
+};
+document.addEventListener('click', (e) => {
+  const menu = $('#composerMenu');
+  if (!menu || menu.hidden) return;
+  if (!menu.contains(e.target) && !$('#composerMenuBtn').contains(e.target)) {
+    menu.hidden = true;
+    $('#composerMenuBtn').classList.remove('active');
+  }
+});
+document.addEventListener('keydown', (e) => {
+  if (e.key === 'Escape' && $('#composerMenu') && !$('#composerMenu').hidden) {
+    $('#composerMenu').hidden = true;
+    $('#composerMenuBtn').classList.remove('active');
+  }
+});
+
+// Topbar Available Models Dropdown
+$('#activeModelSelect').onchange = async () => {
+  const chosen = $('#activeModelSelect').value;
+  if (!chosen) return;
+  const field = getModelFieldForMode(S.mode);
+  try {
+    const r = await CW.saveSettings({ [field]: chosen });
+    S.settings = r.settings || S.settings;
+    $('#modeHint').textContent = modeHintText(S.mode);
+    renderAvailableModelsDropdown();
+    toast(`Model (${S.mode}) → ${chosen}`);
+  } catch (e) {
+    toast(e.message, 4000);
+  }
+};
+
+// Password-Protected Overboost (Energy) Unlock / Lock
+async function handleUnlockOverboost() {
+  const pwInput = $('#overboostPwInput');
+  const msg = $('#overboostMsg');
+  const pw = pwInput.value;
+  msg.hidden = true;
+  try {
+    const r = await CW.unlockOverboost(pw);
+    S.settings = r.settings || S.settings;
+    if (Array.isArray(r.models)) S.availableModels = r.models;
+    pwInput.value = '';
+    renderOverboostUI();
+    renderAvailableModelsDropdown();
+    if (S.availableModels.length) renderFetchedModels(S.availableModels);
+    msg.className = 'ob-msg ok';
+    msg.textContent = `⚡ Overboost unlocked! ${S.availableModels.length} models available & all token limits removed.`;
+    msg.hidden = false;
+    toast('⚡ Overboost unlocked — OpenCode Go models enabled & limits removed!');
+  } catch (e) {
+    msg.className = 'ob-msg';
+    msg.textContent = e.message || 'Incorrect Overboost password';
+    msg.hidden = false;
+    pwInput.select();
+    pwInput.focus();
+  }
+}
+$('#overboostUnlockBtn').onclick = handleUnlockOverboost;
+$('#overboostPwInput').addEventListener('keydown', (e) => {
+  if (e.key === 'Enter') { e.preventDefault(); handleUnlockOverboost(); }
+});
+$('#overboostLockBtn').onclick = async () => {
+  try {
+    const r = await CW.lockOverboost();
+    S.settings = r.settings || S.settings;
+    if (Array.isArray(r.models)) S.availableModels = r.models;
+    $('#setFastModel').value = S.settings.fastModel || 'lfm3:latest';
+    $('#setSmartModel').value = S.settings.smartModel || 'inkling-2-mini:latest';
+    $('#setCopilotBModel').value = S.settings.copilotBModel || 'nemotron-3.5-lightning';
+    $('#setAgentModel').value = S.settings.agentModel || 'lfm3:latest';
+    $('#setGraphMapperModel').value = S.settings.graphMapperModel || 'lfm3:latest';
+    renderOverboostUI();
+    renderAvailableModelsDropdown();
+    renderFetchedModels(S.availableModels);
+    $('#modeHint').textContent = modeHintText(S.mode);
+    const msg = $('#overboostMsg');
+    msg.className = 'ob-msg';
+    msg.textContent = 'Overboost disabled — OpenCode Go models hidden & standard token limits active.';
+    msg.hidden = false;
+    toast('Overboost disabled');
+  } catch (e) {
+    toast(e.message, 4000);
+  }
 };
 
 // Knowledge Graph Controls
@@ -4774,6 +5014,7 @@ $('#updInstallBtn').onclick = () => triggerInstallUpdate();
 $('#shieldToggleBtn').onclick = async () => {
   S.piiShield = !S.piiShield;
   $('#shieldToggleBtn').classList.toggle('on', S.piiShield);
+  renderComposerMenuSummary();
   await CW.saveSettings({ piiShieldEnabled: S.piiShield });
   toast(S.piiShield ? 'Privacy Shield ON — emails, IBANs, phones, secrets & custom terms masked locally' : 'Privacy Shield OFF');
 };

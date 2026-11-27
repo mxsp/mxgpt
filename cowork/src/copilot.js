@@ -505,8 +505,8 @@ async function runCoworkTurn({
   const cfg = storage.getSettings();
   const toolsCfg = resolveEnabledTools(cfg, toolOverrides);
 
-  // Enforce 2-Tier Usage Limits: Fast tier is UNLIMITED; Smart tier has 4-hour & Weekly limits
-  if (mode !== 'fast') {
+  // Enforce 2-Tier Usage Limits unless Overboost (Energy) is active (Overboost removes all limits)
+  if (!cfg.overboostEnabled && mode !== 'fast') {
     const lim = storage.getUsageLimitsStatus().smart;
     if (!lim.allowed) {
       const fmtReset = (ms) => {
@@ -518,11 +518,18 @@ async function runCoworkTurn({
         return h > 0 ? `${h}h ${m}m` : `${m}m`;
       };
       if (lim.exceededWeekly) {
-        throw new Error(`Smart tier weekly limit reached (${lim.usedWeekly.toLocaleString()} / ${lim.limitWeekly.toLocaleString()} tokens). Resets in ~${fmtReset(lim.resetWeeklyInMs)}. Switch to Fast mode (unlimited) or adjust limits in Settings.`);
+        throw new Error(`Smart tier weekly limit reached (${lim.usedWeekly.toLocaleString()} / ${lim.limitWeekly.toLocaleString()} tokens). Resets in ~${fmtReset(lim.resetWeeklyInMs)}. Switch to Fast mode (unlimited) or enable Overboost in Settings.`);
       }
-      throw new Error(`Smart tier 4-hour limit reached (${lim.used4h.toLocaleString()} / ${lim.limit4h.toLocaleString()} tokens). Resets in ~${fmtReset(lim.reset4hInMs)}. Switch to Fast mode (unlimited) or adjust limits in Settings.`);
+      throw new Error(`Smart tier 4-hour limit reached (${lim.used4h.toLocaleString()} / ${lim.limit4h.toLocaleString()} tokens). Resets in ~${fmtReset(lim.reset4hInMs)}. Switch to Fast mode (unlimited) or enable Overboost in Settings.`);
     }
   }
+  const guardModel = (m, fallback) => {
+    const clean = String(m || fallback || '').trim();
+    if (!cfg.overboostEnabled && /^opencode-go\//i.test(clean)) {
+      return fallback;
+    }
+    return clean;
+  };
   const activeProject = storage.getActiveProject();
   const workspace = activeProject?.path || localFiles.getWorkspace();
   const today = new Date().toISOString().slice(0, 10);
@@ -629,9 +636,10 @@ async function runCoworkTurn({
 
   const codeRunHint = toolsCfg.container
     ? (resolvedExecTarget === 'host'
-      ? `Code execution is ENABLED on the user's preselected standard environment: ON-MACHINE HOST (runs directly in ${workspace} via local python3, node, or ${process.platform === 'win32' ? 'PowerShell' : 'bash'}). When executing Python, Node.js, or Shell code on the workspace helps verify, test, compute, or automate, include a \`\`\`code-run JSON block: {"title":"short label","language":"python"|"javascript"|"bash","code":"...","reason":"why"}. Use paths relative to the working directory (${workspace}); do NOT hardcode /workspace.`
-      : `Code execution is ENABLED on the user's preselected standard environment: ISOLATED CONTAINER (Docker/Podman mounted at /workspace; default image ${cfg.containerImage || 'python:3.12-slim'}). When executing Python, Node.js, or Shell code on the workspace helps verify, test, compute, or automate, include a \`\`\`code-run JSON block: {"title":"short label","language":"python"|"javascript"|"bash","image":"python:3.12-slim","code":"...","reason":"why"}.`)
+      ? `Code execution is ENABLED on the user's preselected standard environment: ON-MACHINE HOST (runs directly in ${workspace} via local python3, node, or ${process.platform === 'win32' ? 'PowerShell' : 'bash'}). When executing Python, Node.js, or Shell code on the workspace helps verify, test, compute, create .xlsx/.pdf/.docx files, or automate, include a \`\`\`code-run JSON block: {"title":"short label","language":"python"|"javascript"|"bash","code":"...","reason":"why"}. Use paths relative to the working directory (${workspace}); do NOT hardcode /workspace.`
+      : `Code execution is ENABLED on the user's preselected standard environment: ISOLATED CONTAINER (Docker/Podman mounted at /workspace; default image ${cfg.containerImage || 'python:3.12-slim'}). When executing Python, Node.js, or Shell code on the workspace helps verify, test, compute, create .xlsx/.pdf/.docx files, or automate, include a \`\`\`code-run JSON block: {"title":"short label","language":"python"|"javascript"|"bash","image":"python:3.12-slim","code":"...","reason":"why"}.`)
     : '';
+  const noNativeToolHint = `CRITICAL: Do NOT call native function tools (none are attached) and NEVER stop after internal reasoning with an empty reply. Always output your complete final Markdown answer and any fenced \`\`\`code-run, \`\`\`file-actions, or \`\`\`table-edits blocks directly in one response.`;
   const autoModeHint = (effAutoEdits || effAutoCode)
     ? `AUTO MODE IS ACTIVE (${[effAutoCode ? `auto-run code on ${resolvedExecTarget.toUpperCase()}` : '', effAutoEdits ? 'auto-apply file & spreadsheet edits with 1-click Undo' : ''].filter(Boolean).join(' + ')}): emit executable \`\`\`code-run, \`\`\`file-actions, and \`\`\`table-edits blocks directly — they execute automatically right after your response.`
     : '';
@@ -640,12 +648,21 @@ async function runCoworkTurn({
     : '';
   const artifactHint = `When creating interactive dashboards, web apps, charts, diagrams, or visual UI mockups, output a complete self-contained fenced \`\`\`html, \`\`\`svg, \`\`\`jsx, or \`\`\`mermaid code block so mx-Cowork opens it automatically in the live Artifact Preview Canvas.`;
   const globalCustomInstr = cfg.customInstructions ? `User Custom Instructions:\n${cfg.customInstructions}` : '';
-  const workerModel = cfg.agentModel || cfg.fastModel || 'lfm3:latest';
+  const workerModel = guardModel(cfg.agentModel || cfg.fastModel, 'lfm3:latest');
 
   // ---- Direct Fast or Smart modes
   if (mode === 'fast' || mode === 'smart') {
-    const chosenModel = mode === 'fast' ? cfg.fastModel : cfg.smartModel;
+    const chosenModel = mode === 'fast'
+      ? guardModel(cfg.fastModel, 'lfm3:latest')
+      : guardModel(cfg.smartModel, 'inkling-2-mini:latest');
     onEvent('phase', { phase: 'preparing', label: `${mode === 'fast' ? 'Fast' : 'Smart'} · ${chosenModel.replace(/:latest$/, '')}` });
+    let directWsSnapshot = '';
+    if (toolsCfg.osFiles) {
+      try {
+        const ls = await localFiles.listDir('', workspace);
+        directWsSnapshot = ls.items.slice(0, 35).map((it) => (it.isDir ? `${it.name}/` : it.name)).join(', ');
+      } catch {}
+    }
     const ctxParts = [];
     if (toolsCfg.osFiles) {
       for (const rel of (pinnedFiles || []).slice(0, 3)) {
@@ -659,10 +676,12 @@ async function runCoworkTurn({
 
     const sys = [
       `You are mx-Cowork, a context-aware local desktop AI copilot. Today: ${today}. Workspace: ${workspace}.`,
+      directWsSnapshot ? `Workspace top-level items: ${directWsSnapshot}` : '',
       globalCustomInstr,
       projectContextBlock,
       activeViewContextBlock,
       `Be crisp, structured, and actionable. Use Markdown.`,
+      noNativeToolHint,
       artifactHint,
       tableEditsHint,
       fileActionsHint,
@@ -681,7 +700,7 @@ async function runCoworkTurn({
       onEvent('shield', shield.summary());
     }
 
-    const res = await endpoint.chatCompletion({
+    let res = await endpoint.chatCompletion({
       tier: mode,
       model: chosenModel,
       systemPrompt: maskedSys,
@@ -696,6 +715,37 @@ async function runCoworkTurn({
         else if (ev.type === 'text') onEvent('text', { delta: ev.delta });
       },
     });
+
+    // Guard against reasoning-only cutoffs (model produced thinking but empty content)
+    if (!String(res.content || '').trim() && !signal?.aborted) {
+      onEvent('phase', { phase: 'synthesizing', label: 'Completing response…' });
+      const thoughtHint = String(res.thinking || '').trim().slice(0, 1200);
+      const recoverRes = await endpoint.chatCompletion({
+        tier: mode,
+        model: chosenModel,
+        systemPrompt: maskedSys,
+        messages: [
+          ...msgs,
+          {
+            role: 'user',
+            content: mask(
+              `${thoughtHint ? `Your internal plan was:\n${thoughtHint}\n\n` : ''}You stopped after thinking without writing a visible answer. Now output the complete final Markdown answer and any required fenced \`\`\`code-run, \`\`\`file-actions, or \`\`\`table-edits blocks immediately.`
+            ),
+          },
+        ],
+        think: 'off',
+        priority: mode,
+        signal,
+        onEvent: (ev) => {
+          if (ev.type === 'text') onEvent('text', { delta: ev.delta });
+        },
+      });
+      res = {
+        ...recoverRes,
+        thinking: [res.thinking, recoverRes.thinking].filter(Boolean).join('\n'),
+        elapsedMs: (res.elapsedMs || 0) + (recoverRes.elapsedMs || 0),
+      };
+    }
 
     const finalContent = unmask(res.content);
     const finalThinking = unmask(res.thinking);
@@ -738,8 +788,8 @@ async function runCoworkTurn({
   // ---- COPILOT (Smart) or COPILOT (B) (nemotron-3.5-lightning) Orchestrator -> Fast Workers -> Synthesis
   const isCopilotB = mode === 'copilot_b';
   const orchestratorModel = isCopilotB
-    ? (cfg.copilotBModel || 'nemotron-3.5-lightning')
-    : (cfg.smartModel || 'inkling-2-mini:latest');
+    ? guardModel(cfg.copilotBModel, 'nemotron-3.5-lightning')
+    : guardModel(cfg.smartModel, 'inkling-2-mini:latest');
   const orchestratorLabel = isCopilotB
     ? `Copilot (B) · ${orchestratorModel.replace(/:latest$/, '')}`
     : `Copilot · ${orchestratorModel.replace(/:latest$/, '')}`;
@@ -875,6 +925,7 @@ Rules:
     activeViewContextBlock,
     `Your local tools and fast worker models retrieved the evidence below. Synthesize a crisp, deeply helpful, accurate response using Markdown.`,
     `Cite web sources as Markdown links and reference local files by relative path.`,
+    noNativeToolHint,
     artifactHint,
     tableEditsHint,
     fileActionsHint,
@@ -902,7 +953,7 @@ Rules:
     onEvent('shield', shield.summary());
   }
 
-  const finalRes = await endpoint.chatCompletion({
+  let finalRes = await endpoint.chatCompletion({
     tier: 'smart',
     model: orchestratorModel,
     systemPrompt: maskedSynthSys,
@@ -917,6 +968,37 @@ Rules:
       else if (ev.type === 'text') onEvent('text', { delta: ev.delta });
     },
   });
+
+  // Guard against reasoning-only cutoffs in Copilot synthesis
+  if (!String(finalRes.content || '').trim() && !signal?.aborted) {
+    onEvent('phase', { phase: 'synthesizing', label: 'Completing response…' });
+    const thoughtHint = String(finalRes.thinking || '').trim().slice(0, 1200);
+    const recoverRes = await endpoint.chatCompletion({
+      tier: 'smart',
+      model: orchestratorModel,
+      systemPrompt: maskedSynthSys,
+      messages: [
+        ...synthMessages,
+        {
+          role: 'user',
+          content: mask(
+            `${thoughtHint ? `Your internal plan was:\n${thoughtHint}\n\n` : ''}You stopped after thinking without writing a visible answer. Now output the complete final Markdown answer and any required fenced \`\`\`code-run, \`\`\`file-actions, or \`\`\`table-edits blocks immediately.`
+          ),
+        },
+      ],
+      think: 'off',
+      priority: 'smart',
+      signal,
+      onEvent: (ev) => {
+        if (ev.type === 'text') onEvent('text', { delta: ev.delta });
+      },
+    });
+    finalRes = {
+      ...recoverRes,
+      thinking: [finalRes.thinking, recoverRes.thinking].filter(Boolean).join('\n'),
+      elapsedMs: (finalRes.elapsedMs || 0) + (recoverRes.elapsedMs || 0),
+    };
+  }
 
   const finalContent = unmask(finalRes.content);
   const finalThinking = unmask(finalRes.thinking);

@@ -15,6 +15,9 @@ const { app, BrowserWindow, ipcMain, dialog, shell, Menu, Tray, globalShortcut, 
 const path = require('path');
 const fs = require('fs');
 const os = require('os');
+const crypto = require('crypto');
+
+const OVERBOOST_HASH_HEX = 'f2fcd3f7dccadd194c4c5a54a5102c9559487743ac236a6236301e4418d0dd7c';
 
 const storage = require('./storage');
 const endpoint = require('./endpoint');
@@ -166,7 +169,11 @@ function registerIpc() {
   }));
 
   ipcMain.handle('settings:save', (_, patch) => {
-    const p = patch || {};
+    const p = { ...(patch || {}) };
+    // Token limits & Overboost are protected and cannot be overwritten directly from Settings UI
+    delete p.overboostEnabled;
+    delete p.smartLimit4h;
+    delete p.smartLimitWeekly;
     storage.saveSettings(p);
     const active = storage.getActiveProject();
     if (active && ('autoApproveFileActions' in p || 'autoApproveContainerRuns' in p || 'codeExecutionTarget' in p)) {
@@ -178,6 +185,39 @@ function registerIpc() {
     }
     endpoint.resetSession();
     return { ok: true, settings: storage.publicSettings(), activeProject: storage.getActiveProject() };
+  });
+
+  // ---- Password-Protected Overboost (unlocks OpenCode Go models & removes all token limits)
+  ipcMain.handle('overboost:unlock', async (_, password) => {
+    const candidate = crypto.createHash('sha256').update(String(password || '')).digest();
+    const expected = Buffer.from(OVERBOOST_HASH_HEX, 'hex');
+    if (candidate.length !== expected.length || !crypto.timingSafeEqual(candidate, expected)) {
+      throw new Error('Incorrect Overboost password');
+    }
+    storage.saveSettings({ overboostEnabled: true });
+    let models = [];
+    try {
+      const r = await endpoint.testConnection(null);
+      models = r.models || [];
+    } catch {}
+    return { ok: true, overboostEnabled: true, settings: storage.publicSettings(), models };
+  });
+
+  ipcMain.handle('overboost:lock', async () => {
+    const cur = storage.getSettings();
+    const patch = { overboostEnabled: false };
+    if (/^opencode-go\//i.test(cur.fastModel || '')) patch.fastModel = 'lfm3:latest';
+    if (/^opencode-go\//i.test(cur.smartModel || '')) patch.smartModel = 'inkling-2-mini:latest';
+    if (/^opencode-go\//i.test(cur.copilotBModel || '')) patch.copilotBModel = 'nemotron-3.5-lightning';
+    if (/^opencode-go\//i.test(cur.agentModel || '')) patch.agentModel = 'lfm3:latest';
+    if (/^opencode-go\//i.test(cur.graphMapperModel || '')) patch.graphMapperModel = 'lfm3:latest';
+    storage.saveSettings(patch);
+    let models = [];
+    try {
+      const r = await endpoint.testConnection(null);
+      models = r.models || [];
+    } catch {}
+    return { ok: true, overboostEnabled: false, settings: storage.publicSettings(), models };
   });
 
   ipcMain.handle('endpoint:test', async (_, overrideCfg) => {
@@ -1107,6 +1147,10 @@ app.whenReady().then(() => {
               hasAutoEditPill: Boolean(document.querySelector('#autoAcceptTopPill')),
               hasAutoModeBtn: typeof window.cowork.setAutoMode === 'function' && Boolean(document.querySelector('#autoModeToggleBtn')),
               hasExecEnvControl: typeof window.cowork.setExecTarget === 'function' && Boolean(document.querySelector('#execEnvSeg')),
+              hasModelDropdown: Boolean(document.querySelector('#activeModelSelect')),
+              hasComposerMenu: Boolean(document.querySelector('#composerMenuBtn') && document.querySelector('#composerMenu')),
+              hasOverboostApi: typeof window.cowork.unlockOverboost === 'function' && typeof window.cowork.lockOverboost === 'function' && Boolean(document.querySelector('#overboostUnlockBtn')),
+              hasLimitInputsRemoved: !document.querySelector('#setSmartLimit4h') && !document.querySelector('#setSmartLimitWeekly'),
               hasArtifactCanvas: Boolean(document.querySelector('[data-pane="artifact"]')),
               hasUsageApi: typeof window.cowork.getUsage === 'function',
               hasDiffApi: typeof window.cowork.compareFiles === 'function' && Boolean(document.querySelector('#compareModal')),
