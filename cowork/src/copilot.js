@@ -498,18 +498,20 @@ async function runCoworkTurn({
   const cfg = storage.getSettings();
   const toolsCfg = resolveEnabledTools(cfg, toolOverrides);
 
-  // Enforce 2-Tier Usage Limits: Fast tier is UNLIMITED; Smart tier has 4-hour & Daily limits
+  // Enforce 2-Tier Usage Limits: Fast tier is UNLIMITED; Smart tier has 4-hour & Weekly limits
   if (mode !== 'fast') {
     const lim = storage.getUsageLimitsStatus().smart;
     if (!lim.allowed) {
       const fmtReset = (ms) => {
         const mins = Math.max(1, Math.ceil(ms / 60000));
-        const h = Math.floor(mins / 60);
+        const d = Math.floor(mins / 1440);
+        const h = Math.floor((mins % 1440) / 60);
         const m = mins % 60;
+        if (d > 0) return `${d}d ${h}h`;
         return h > 0 ? `${h}h ${m}m` : `${m}m`;
       };
-      if (lim.exceededDaily) {
-        throw new Error(`Smart tier daily limit reached (${lim.usedDaily.toLocaleString()} / ${lim.limitDaily.toLocaleString()} tokens). Resets in ~${fmtReset(lim.resetDailyInMs)}. Switch to Fast mode (unlimited) or adjust limits in Settings.`);
+      if (lim.exceededWeekly) {
+        throw new Error(`Smart tier weekly limit reached (${lim.usedWeekly.toLocaleString()} / ${lim.limitWeekly.toLocaleString()} tokens). Resets in ~${fmtReset(lim.resetWeeklyInMs)}. Switch to Fast mode (unlimited) or adjust limits in Settings.`);
       }
       throw new Error(`Smart tier 4-hour limit reached (${lim.used4h.toLocaleString()} / ${lim.limit4h.toLocaleString()} tokens). Resets in ~${fmtReset(lim.reset4hInMs)}. Switch to Fast mode (unlimited) or adjust limits in Settings.`);
     }

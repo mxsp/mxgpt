@@ -86,9 +86,9 @@ const DEFAULT_SETTINGS = {
   containerMemoryMb: 1024,
   containerCpus: '2',
   autoApproveContainerRuns: false,
-  // 2-Tier Token Usage Limits (Fast = Unlimited; Smart = 4h & Daily caps)
+  // 2-Tier Token Usage Limits (Fast = Unlimited; Smart = 4h & Weekly caps)
   smartLimit4h: 150000,
-  smartLimitDaily: 500000,
+  smartLimitWeekly: 2000000,
   // Company Worker Productivity & Privacy Defaults (v1.6.0)
   piiShieldEnabled: false,
   piiCustomTerms: '',
@@ -623,17 +623,17 @@ function getUsageLimitsStatus() {
   const arr = Array.isArray(log) ? log : [];
   const now = Date.now();
   const FOUR_HOURS = 4 * 60 * 60 * 1000;
-  const ONE_DAY = 24 * 60 * 60 * 1000;
+  const SEVEN_DAYS = 7 * 24 * 60 * 60 * 1000;
 
   const limit4h = Math.max(0, Math.round(Number(cfg.smartLimit4h ?? 150000)));
-  const limitDaily = Math.max(0, Math.round(Number(cfg.smartLimitDaily ?? 500000)));
+  const limitWeekly = Math.max(0, Math.round(Number(cfg.smartLimitWeekly ?? 2000000)));
 
   let fastTotalTokens = 0;
   let fastRequests = 0;
   let smart4h = 0;
-  let smartDaily = 0;
+  let smartWeekly = 0;
   let oldest4hTs = 0;
-  let oldestDailyTs = 0;
+  let oldestWeeklyTs = 0;
 
   for (const e of arr) {
     const tot = Number(e.totalTokens) || ((Number(e.promptTokens) || 0) + (Number(e.evalTokens) || 0));
@@ -648,14 +648,14 @@ function getUsageLimitsStatus() {
       smart4h += tot;
       if (!oldest4hTs || ts < oldest4hTs) oldest4hTs = ts;
     }
-    if (now - ts <= ONE_DAY) {
-      smartDaily += tot;
-      if (!oldestDailyTs || ts < oldestDailyTs) oldestDailyTs = ts;
+    if (now - ts <= SEVEN_DAYS) {
+      smartWeekly += tot;
+      if (!oldestWeeklyTs || ts < oldestWeeklyTs) oldestWeeklyTs = ts;
     }
   }
 
   const exceeded4h = limit4h > 0 && smart4h >= limit4h;
-  const exceededDaily = limitDaily > 0 && smartDaily >= limitDaily;
+  const exceededWeekly = limitWeekly > 0 && smartWeekly >= limitWeekly;
 
   return {
     fast: {
@@ -669,14 +669,14 @@ function getUsageLimitsStatus() {
       remaining4h: limit4h > 0 ? Math.max(0, limit4h - smart4h) : null,
       pct4h: limit4h > 0 ? Math.min(100, Math.round((smart4h / limit4h) * 100)) : 0,
       reset4hInMs: oldest4hTs ? Math.max(0, (oldest4hTs + FOUR_HOURS) - now) : 0,
-      limitDaily,
-      usedDaily: smartDaily,
-      remainingDaily: limitDaily > 0 ? Math.max(0, limitDaily - smartDaily) : null,
-      pctDaily: limitDaily > 0 ? Math.min(100, Math.round((smartDaily / limitDaily) * 100)) : 0,
-      resetDailyInMs: oldestDailyTs ? Math.max(0, (oldestDailyTs + ONE_DAY) - now) : 0,
+      limitWeekly,
+      usedWeekly: smartWeekly,
+      remainingWeekly: limitWeekly > 0 ? Math.max(0, limitWeekly - smartWeekly) : null,
+      pctWeekly: limitWeekly > 0 ? Math.min(100, Math.round((smartWeekly / limitWeekly) * 100)) : 0,
+      resetWeeklyInMs: oldestWeeklyTs ? Math.max(0, (oldestWeeklyTs + SEVEN_DAYS) - now) : 0,
       exceeded4h,
-      exceededDaily,
-      allowed: !exceeded4h && !exceededDaily,
+      exceededWeekly,
+      allowed: !exceeded4h && !exceededWeekly,
     },
   };
 }

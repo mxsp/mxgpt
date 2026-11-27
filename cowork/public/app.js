@@ -692,7 +692,7 @@ async function boot() {
   S.projects = projData?.projects || [];
   S.activeProject = projData?.activeProject || null;
 
-  $('#appVersionBadge').textContent = `v${info.version || '1.7.1'}`;
+  $('#appVersionBadge').textContent = `v${info.version || '1.7.2'}`;
   applyThemeUI(S.settings.theme || 'light');
   setMode(S.settings.defaultMode || 'copilot');
   setThink(S.settings.think || 'low');
@@ -3617,19 +3617,21 @@ async function renderUsagePanel() {
         </tr>`).join('')
       : '<tr><td colspan="4" style="color:var(--muted);text-align:center;padding:10px">No per-chat usage recorded yet.</td></tr>';
 
-    const lim = u?.limits || { fast: { unlimited: true, totalTokens: 0, requests: 0 }, smart: { limit4h: 150000, used4h: 0, pct4h: 0, reset4hInMs: 0, limitDaily: 500000, usedDaily: 0, pctDaily: 0, resetDailyInMs: 0 } };
+    const lim = u?.limits || { fast: { unlimited: true, totalTokens: 0, requests: 0 }, smart: { limit4h: 150000, used4h: 0, pct4h: 0, reset4hInMs: 0, limitWeekly: 2000000, usedWeekly: 0, pctWeekly: 0, resetWeeklyInMs: 0 } };
     const fmtReset = (ms) => {
       if (!ms || ms <= 0) return 'ready';
       const mins = Math.ceil(ms / 60000);
-      const h = Math.floor(mins / 60);
+      const d = Math.floor(mins / 1440);
+      const h = Math.floor((mins % 1440) / 60);
       const m = mins % 60;
+      if (d > 0) return `resets in ~${d}d ${h}h`;
       return h > 0 ? `resets in ~${h}h ${m}m` : `resets in ~${m}m`;
     };
     const barCls = (pct) => (pct >= 100 ? 'hit' : pct >= 80 ? 'warn' : 'ok');
 
     root.innerHTML = `
       <div class="pane-head-row" style="margin-bottom:10px">
-        <span class="muted-note" style="margin:0">2-Tier Token Telemetry &amp; Limits — Fast tier is unlimited; Smart tier enforces rolling 4-hour &amp; daily caps.</span>
+        <span class="muted-note" style="margin:0">2-Tier Token Telemetry &amp; Limits — Fast tier is unlimited; Smart tier enforces rolling 4-hour &amp; 7-day weekly caps.</span>
         <div class="row-gap">
           <button type="button" class="btn tiny" id="usageRefreshBtn">Refresh</button>
         </div>
@@ -3649,10 +3651,10 @@ async function renderUsagePanel() {
           <div class="limit-sub">${lim.smart.exceeded4h ? 'Limit reached · ' : ''}${fmtReset(lim.smart.reset4hInMs)}</div>
         </div>
         <div class="limit-card">
-          <div class="limit-top"><span>Smart · Daily Limit</span><span>${lim.smart.limitDaily > 0 ? lim.smart.pctDaily + '%' : 'Off'}</span></div>
-          <div class="limit-val">${fmtTok(lim.smart.usedDaily)} / ${lim.smart.limitDaily > 0 ? fmtTok(lim.smart.limitDaily) : '∞'}</div>
-          <div class="limit-bar"><div class="limit-fill ${barCls(lim.smart.pctDaily)}" style="width:${lim.smart.pctDaily}%"></div></div>
-          <div class="limit-sub">${lim.smart.exceededDaily ? 'Limit reached · ' : ''}${fmtReset(lim.smart.resetDailyInMs)}</div>
+          <div class="limit-top"><span>Smart · Weekly Limit</span><span>${lim.smart.limitWeekly > 0 ? lim.smart.pctWeekly + '%' : 'Off'}</span></div>
+          <div class="limit-val">${fmtTok(lim.smart.usedWeekly)} / ${lim.smart.limitWeekly > 0 ? fmtTok(lim.smart.limitWeekly) : '∞'}</div>
+          <div class="limit-bar"><div class="limit-fill ${barCls(lim.smart.pctWeekly)}" style="width:${lim.smart.pctWeekly}%"></div></div>
+          <div class="limit-sub">${lim.smart.exceededWeekly ? 'Limit reached · ' : ''}${fmtReset(lim.smart.resetWeeklyInMs)}</div>
         </div>
       </div>
 
@@ -3742,7 +3744,7 @@ function openSettings(initialTab = 'models') {
   $('#setDefaultMode').value = s.defaultMode || 'copilot';
   $('#setDefaultThink').value = s.think || 'low';
   $('#setSmartLimit4h').value = String(s.smartLimit4h ?? 150000);
-  $('#setSmartLimitDaily').value = String(s.smartLimitDaily ?? 500000);
+  $('#setSmartLimitWeekly').value = String(s.smartLimitWeekly ?? 2000000);
   $('#setCustomInstr').value = s.customInstructions || '';
   // Tab 2: Providers & API Keys
   $('#setEndpointType').value = s.endpointType || 'mxgpt';
@@ -3806,7 +3808,7 @@ function collectSettingsForm() {
     defaultMode: $('#setDefaultMode').value || 'copilot',
     think: $('#setDefaultThink').value || 'low',
     smartLimit4h: Math.max(0, Math.round(Number($('#setSmartLimit4h').value) || 0)),
-    smartLimitDaily: Math.max(0, Math.round(Number($('#setSmartLimitDaily').value) || 0)),
+    smartLimitWeekly: Math.max(0, Math.round(Number($('#setSmartLimitWeekly').value) || 0)),
     customInstructions: $('#setCustomInstr').value.trim(),
     toolWebSearch: $('#setToolWeb').checked,
     toolWebFetchPages: $('#setWebFetchPages').checked,
