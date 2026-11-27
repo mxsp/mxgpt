@@ -20,9 +20,8 @@ contextBridge.exposeInMainWorld('cowork', {
   activateProvider: (id) => ipcRenderer.invoke('providers:activate', id),
   refreshProvider: (id) => ipcRenderer.invoke('providers:refresh', id),
 
-  // Token Usage Statistics
+  // Token Usage Statistics & 2-Tier Limits (no reset allowed)
   getUsage: () => ipcRenderer.invoke('usage:get'),
-  resetUsage: () => ipcRenderer.invoke('usage:reset'),
 
   // Artifact Canvas Actions
   saveArtifact: (art) => ipcRenderer.invoke('artifact:save', art),
@@ -132,4 +131,61 @@ contextBridge.exposeInMainWorld('cowork', {
   gitInspect: (focus) => ipcRenderer.invoke('tools:gitInspect', focus),
   systemInfo: () => ipcRenderer.invoke('tools:systemInfo'),
   calcJs: (code) => ipcRenderer.invoke('tools:calcJs', code),
+
+  // Visual Diff & Document Compare (v1.6.0)
+  compareFiles: (opts) => ipcRenderer.invoke('diff:compareFiles', opts),
+  previewActionDiff: (action) => ipcRenderer.invoke('diff:previewAction', action),
+  parseTableFile: (relPath) => ipcRenderer.invoke('files:parseTable', relPath),
+
+  // Real Office & PDF Exports (.docx, .xlsx, .pdf, .ics)
+  exportDocx: (opts) => ipcRenderer.invoke('export:docx', opts),
+  exportXlsx: (opts) => ipcRenderer.invoke('export:xlsx', opts),
+  exportPdf: (opts) => ipcRenderer.invoke('export:pdf', opts),
+  exportIcs: (evt) => ipcRenderer.invoke('export:ics', evt),
+
+  // Reusable Slash Workflows Library
+  listWorkflows: () => ipcRenderer.invoke('workflows:list'),
+  saveWorkflow: (wf) => ipcRenderer.invoke('workflows:save', wf),
+  deleteWorkflow: (id) => ipcRenderer.invoke('workflows:delete', id),
+
+  // Project Action Items / Tasks
+  listTasks: () => ipcRenderer.invoke('tasks:list'),
+  saveTask: (task) => ipcRenderer.invoke('tasks:save', task),
+  toggleTask: (id) => ipcRenderer.invoke('tasks:toggle', id),
+  deleteTask: (id) => ipcRenderer.invoke('tasks:delete', id),
+
+  // OS Clipboard (Text & Screenshot)
+  readClipboard: () => ipcRenderer.invoke('clipboard:read'),
+
+  // Drag & Drop Project / Chat Organization
+  moveChatToProject: (opts) => ipcRenderer.invoke('chats:moveToProject', opts),
+  reorderProjects: (orderedIds) => ipcRenderer.invoke('projects:reorder', orderedIds),
+  createProjectFromDropped: (fileObj) => {
+    let p = '';
+    try { p = webUtils.getPathForFile(fileObj); } catch {}
+    if (!p) throw new Error('Could not resolve dropped folder path');
+    return ipcRenderer.invoke('projects:createFromPath', p);
+  },
+
+  // Private Document Knowledge Base (Local Semantic BM25 Search)
+  kbStats: () => ipcRenderer.invoke('kb:stats'),
+  indexKb: () => ipcRenderer.invoke('kb:index'),
+  queryKb: (opts) => ipcRenderer.invoke('kb:query', opts || {}),
+  onKbProgress: (cb) => {
+    const listener = (_, msg) => cb(msg);
+    ipcRenderer.on('kb:progress', listener);
+    return () => ipcRenderer.removeListener('kb:progress', listener);
+  },
+
+  // Local Scheduled Automations & Folder Watchers
+  listAutomations: () => ipcRenderer.invoke('automations:list'),
+  saveAutomation: (rule) => ipcRenderer.invoke('automations:save', rule),
+  toggleAutomation: (id) => ipcRenderer.invoke('automations:toggle', id),
+  deleteAutomation: (id) => ipcRenderer.invoke('automations:delete', id),
+  runAutomationNow: (id) => ipcRenderer.invoke('automations:runNow', id),
+  onAutomationEvent: (cb) => {
+    const listener = (_, msg) => cb(msg);
+    ipcRenderer.on('automations:event', listener);
+    return () => ipcRenderer.removeListener('automations:event', listener);
+  },
 });

@@ -14,10 +14,13 @@
 - **First-Class Projects & Workspace Rules**: Manage projects with local paths, custom colors, custom instructions, **Auto-Accept Edits** toggle (with 1-click Undo), container overrides, and automatic background **Fast-model Knowledge Graph** mapping.
 - **Interactive Project Knowledge Graph**: 3 layouts (**Force** with cluster zones, **Radial** hubs, **Hierarchy** tree), curved Bezier edges, Fast-model semantic roles & links, clickable inspector (`Edit`, `Pin`, `Ask Cowork`), and fullscreen mode.
 - **OS Navigation, Find & Built-in File Editor**: Navigate any local OS folder, search filenames & contents (`.pdf`, `.docx`, `.xlsx`, `.md`, code), create/rename/delete files, and edit directly in-app (`Ctrl+S`) with automatic **1-click Undo** snapshots.
-- **Container Code Execution (`Docker` / `Podman`)**: Run Python, Node.js, or Shell scripts inside hardened ephemeral containers mounted at `/workspace` (`--cap-drop=ALL`, `--network=none` default, memory/CPU caps, live streaming output).
-- **Automatic Software Updater**: Checks `mxsp/mxgpt` GitHub Releases, verifies `SHA256SUMS.txt`, and supports automatic in-app install & restart on Linux AppImage, Linux `.deb`, and Windows `.zip`.
+- **Nested Drag-and-Drop Projects (`Projects (chat 1, chat 2...)`) & Concurrent Multi-Model Streaming**: Organize chats inside collapsible projects via drag-and-drop (or drag OS folders into the sidebar to create projects), and run multiple models simultaneously across different chats without losing stream state when switching chats or tabs.
+- **On-Machine (Host) & Container Code Execution**: Execute Python, Node.js, or Shell/PowerShell either inside hardened ephemeral Docker/Podman containers (`--cap-drop=ALL`, `--network=none`) OR directly **On-Machine** in your workspace.
+- **2-Tier Token Usage Limits (Non-Resettable Telemetry)**: **Fast** tier is **Unlimited** (no cap across Fast, Subagent Workers, and Graph Mapper); **Smart** tier enforces configurable rolling **4-hour** and **Daily** token limits with live progress bars and reset countdowns.
+- **Visual Diff, Document Compare & Office/PDF Exports**: Red/green diff previews inside AI file-action cards, side-by-side **Compare 2 Files** (PDF/DOCX/CSV/code), built-in CSV/Excel **Data Desk** table viewer, and 1-click **Word (`.docx`)**, **Excel (`.xlsx`)**, **PDF**, and **Calendar Invite (`.ics`)** exports.
+- **Company Worker Productivity Suite**: Reusable `/workflows` autocomplete (`/meeting-notes`, `/weekly-update`, `/rewrite`, `/translate`, `/audit-data`, `/report`, `/action-items`, `/compare` + custom templates), **Project Tasks** board, **Privacy / PII Redaction Shield** (masks emails, IBANs, phones, secrets & custom client names locally before cloud calls and restores locally), **Private Offline Document Knowledge Base** (BM25 search over PDFs/DOCX/XLSX/MD), **Local Scheduled Automations & Folder Watchers**, **System Tray + `Alt+Space` Clipboard Quick-Ask**, and **`Ctrl+V` Screenshot Paste**.
 
 ## Running
-- **Linux**: Download `mx-Cowork-1.5.0.AppImage` (`chmod +x` and run) or install `mx-cowork_1.5.0_amd64.deb` (`sudo apt install ./mx-cowork_1.5.0_amd64.deb`).
-- **Windows**: Extract `mx-Cowork-1.5.0-win-x64.zip` and double-click `mx-Cowork.exe`.
+- **Linux**: Download `mx-Cowork-1.6.0.AppImage` (`chmod +x` and run) or install `mx-cowork_1.6.0_amd64.deb` (`sudo apt install ./mx-cowork_1.6.0_amd64.deb`).
+- **Windows**: Extract `mx-Cowork-1.6.0-win-x64.zip` and double-click `mx-Cowork.exe`.
 - **From source**: `cd cowork && npm install && npm start`

@@ -18,12 +18,16 @@ const storage = require('./storage');
 const knowledgeGraph = require('./knowledge-graph');
 const containerRunner = require('./container-runner');
 const localTools = require('./local-tools');
+const diffEngine = require('./diff-engine');
+const piiShield = require('./pii-shield');
+const docIndex = require('./doc-index');
 
 const ROLE_META = {
   web_research: { role: 'researcher', label: 'Web Search' },
   web_fetch: { role: 'researcher', label: 'Page Reader' },
   file_search: { role: 'files', label: 'OS File Search' },
   file_read: { role: 'reader', label: 'Doc Reader' },
+  doc_kb: { role: 'reader', label: 'Private Doc KB' },
   folder_audit: { role: 'organizer', label: 'Folder Audit' },
   project_graph: { role: 'analyst', label: 'Knowledge Graph' },
   git_inspect: { role: 'coder', label: 'Git Inspector' },
@@ -49,6 +53,7 @@ function extractSpecialBlocks(markdown, toolsCfg) {
   let fileActions = [];
   let codeRuns = [];
   let savedNotes = [];
+  let savedTasks = [];
   const text = String(markdown || '');
   const cfg = storage.getSettings();
 
@@ -61,16 +66,23 @@ function extractSpecialBlocks(markdown, toolsCfg) {
           fileActions = arr
             .filter((a) => a && a.type && ['mkdir', 'write', 'create', 'move', 'rename', 'copy', 'delete'].includes(String(a.type).toLowerCase()))
             .slice(0, 30)
-            .map((a, i) => ({
-              id: `act_${Date.now().toString(36)}_${i}`,
-              type: String(a.type).toLowerCase(),
-              path: a.path ? String(a.path) : '',
-              from: a.from ? String(a.from) : '',
-              to: a.to ? String(a.to) : '',
-              content: typeof a.content === 'string' ? a.content : undefined,
-              reason: String(a.reason || '').slice(0, 180),
-              status: 'pending',
-            }));
+            .map((a, i) => {
+              const act = {
+                id: `act_${Date.now().toString(36)}_${i}`,
+                type: String(a.type).toLowerCase(),
+                path: a.path ? String(a.path) : '',
+                from: a.from ? String(a.from) : '',
+                to: a.to ? String(a.to) : '',
+                content: typeof a.content === 'string' ? a.content : undefined,
+                reason: String(a.reason || '').slice(0, 180),
+                status: 'pending',
+              };
+              try {
+                const d = diffEngine.previewFileActionDiff(act);
+                if (d) act.diff = d;
+              } catch {}
+              return act;
+            });
         }
       } catch {}
     }
@@ -93,6 +105,7 @@ function extractSpecialBlocks(markdown, toolsCfg) {
             command: typeof item.command === 'string' ? item.command : '',
             network: item.network === 'bridge' ? 'bridge' : (cfg.containerNetwork || 'none'),
             mountMode: item.mountMode === 'ro' ? 'ro' : (cfg.containerMountMode || 'rw'),
+            execTarget: item.execTarget === 'host' ? 'host' : (cfg.codeExecutionTarget || 'container'),
             reason: String(item.reason || '').slice(0, 180),
             status: 'pending',
             output: '',
@@ -120,7 +133,29 @@ function extractSpecialBlocks(markdown, toolsCfg) {
     }
   }
 
-  return { fileActions, codeRuns: codeRuns.slice(0, 8), savedNotes: savedNotes.slice(0, 5) };
+  for (const m of text.matchAll(/```action-items\s*\n([\s\S]*?)```/gi)) {
+    try {
+      const parsed = JSON.parse(m[1].trim());
+      const items = Array.isArray(parsed) ? parsed : [parsed];
+      for (const item of items) {
+        if (item && (item.title || item.task)) {
+          savedTasks.push({
+            title: String(item.title || item.task).trim().slice(0, 200),
+            owner: String(item.owner || '').trim().slice(0, 60),
+            due: String(item.due || item.dueDate || '').trim().slice(0, 32),
+            priority: ['high', 'med', 'low'].includes(item.priority) ? item.priority : 'med',
+          });
+        }
+      }
+    } catch {}
+  }
+
+  return {
+    fileActions,
+    codeRuns: codeRuns.slice(0, 8),
+    savedNotes: savedNotes.slice(0, 5),
+    savedTasks: savedTasks.slice(0, 20),
+  };
 }
 
 function resolveEnabledTools(cfg, overrides = {}) {
@@ -144,7 +179,7 @@ function resolveEnabledTools(cfg, overrides = {}) {
 function allowedTaskTypes(t) {
   const types = [];
   if (t.webSearch) types.push('web_research', 'web_fetch');
-  if (t.osFiles) types.push('file_search', 'file_read', 'folder_audit');
+  if (t.osFiles) types.push('file_search', 'file_read', 'doc_kb', 'folder_audit');
   if (t.knowledgeGraph) types.push('project_graph');
   if (t.git) types.push('git_inspect');
   if (t.system) types.push('system_info');
@@ -211,7 +246,7 @@ function heuristicPlan(userPrompt, pinnedFiles = [], toolsCfg) {
   };
 }
 
-async function runDelegatedWorker(task, { workspace, fastModel, toolsCfg, signal, onEvent }) {
+async function runDelegatedWorker(task, { workspace, fastModel, toolsCfg, mask = (s) => s, signal, onEvent }) {
   const id = storage.newId('wrk');
   const meta = ROLE_META[task.type] || ROLE_META.fast_extract;
   const startedAt = Date.now();
@@ -297,6 +332,14 @@ async function runDelegatedWorker(task, { workspace, fastModel, toolsCfg, signal
         citations.push({ type: 'file', title: h.path, path: h.path });
       }
       onEvent('graph_ready', { stats: graph.stats, projectName: graph.projectName });
+    } else if (task.type === 'doc_kb') {
+      const q = String(task.query || task.focus || '').trim();
+      const res = await docIndex.queryWorkspaceDocs(q, workspace, { topK: 6, autoBuild: true });
+      rawEvidence = (res.hits || []).map((h, i) =>
+        `[${i + 1}] ${h.path} (section ${h.section}, score ${h.score})\n${h.snippet}`
+      ).join('\n\n');
+      for (const h of res.hits || []) citations.push({ type: 'file', path: h.path });
+      localSummary = `${(res.hits || []).length} KB passages (${res.fileCount || 0} indexed docs)`;
     } else if (task.type === 'folder_audit') {
       const ov = await localFiles.folderOverview(task.path || '', workspace);
       const dirList = await localFiles.listDir(task.path || '', workspace);
@@ -340,7 +383,7 @@ async function runDelegatedWorker(task, { workspace, fastModel, toolsCfg, signal
     }
 
     // Compact structured tool results pass directly to Orchestrator without extra latency
-    const directPassTypes = new Set(['file_read', 'file_search', 'project_graph', 'git_inspect', 'system_info', 'calc_js', 'memory_recall']);
+    const directPassTypes = new Set(['file_read', 'file_search', 'doc_kb', 'project_graph', 'git_inspect', 'system_info', 'calc_js', 'memory_recall']);
     if (rawEvidence.length <= 2600 && directPassTypes.has(task.type)) {
       const elapsedMs = Date.now() - startedAt;
       onEvent('worker_done', {
@@ -360,7 +403,7 @@ Distill the raw source data into a tight, factual, high-signal bullet brief (max
       model: fastModel,
       systemPrompt: distillSys,
       messages: [
-        { role: 'user', content: `Focus: ${task.focus || task.query || task.path}\n\nRaw Retrieved Data:\n${rawEvidence}` },
+        { role: 'user', content: mask(`Focus: ${task.focus || task.query || task.path}\n\nRaw Retrieved Data:\n${rawEvidence}`) },
       ],
       think: 'off',
       priority: 'subagent',
@@ -376,6 +419,7 @@ Distill the raw source data into a tight, factual, high-signal bullet brief (max
       chatTitle: task._chatTitle || '',
       model: fastRes.model || fastModel,
       role: 'worker',
+      tier: 'fast',
       promptTokens: fastRes.usage?.promptTokens || Math.round(rawEvidence.length / 4),
       evalTokens: fastRes.usage?.evalTokens || Math.round((fastRes.content || '').length / 4),
       elapsedMs: fastRes.elapsedMs || 0,
@@ -422,6 +466,8 @@ async function runCoworkTurn({
   prompt = '',
   history = [],
   pinnedFiles = [],
+  images = [],
+  piiShieldOverride = undefined,
   toolOverrides = {},
   think = 'low',
   signal,
@@ -429,9 +475,30 @@ async function runCoworkTurn({
 }) {
   const cfg = storage.getSettings();
   const toolsCfg = resolveEnabledTools(cfg, toolOverrides);
+
+  // Enforce 2-Tier Usage Limits: Fast tier is UNLIMITED; Smart tier has 4-hour & Daily limits
+  if (mode !== 'fast') {
+    const lim = storage.getUsageLimitsStatus().smart;
+    if (!lim.allowed) {
+      const fmtReset = (ms) => {
+        const mins = Math.max(1, Math.ceil(ms / 60000));
+        const h = Math.floor(mins / 60);
+        const m = mins % 60;
+        return h > 0 ? `${h}h ${m}m` : `${m}m`;
+      };
+      if (lim.exceededDaily) {
+        throw new Error(`Smart tier daily limit reached (${lim.usedDaily.toLocaleString()} / ${lim.limitDaily.toLocaleString()} tokens). Resets in ~${fmtReset(lim.resetDailyInMs)}. Switch to Fast mode (unlimited) or adjust limits in Settings.`);
+      }
+      throw new Error(`Smart tier 4-hour limit reached (${lim.used4h.toLocaleString()} / ${lim.limit4h.toLocaleString()} tokens). Resets in ~${fmtReset(lim.reset4hInMs)}. Switch to Fast mode (unlimited) or adjust limits in Settings.`);
+    }
+  }
   const activeProject = storage.getActiveProject();
   const workspace = activeProject?.path || localFiles.getWorkspace();
   const today = new Date().toISOString().slice(0, 10);
+  const shieldOn = piiShieldOverride !== undefined ? Boolean(piiShieldOverride) : Boolean(cfg.piiShieldEnabled);
+  const shield = shieldOn ? piiShield.createShieldContext(cfg.piiCustomTerms || '') : null;
+  const mask = (txt) => (shield ? shield.redact(txt) : String(txt ?? ''));
+  const unmask = (txt) => (shield ? shield.restore(txt) : String(txt ?? ''));
 
   // Pull compact cached project Knowledge Graph & custom project instructions
   let projectContextBlock = '';
@@ -496,15 +563,20 @@ async function runCoworkTurn({
 
     const userContent = ctxParts.length ? `${ctxParts.join('\n\n')}\n\nUser request:\n${prompt}` : prompt;
     const msgs = [
-      ...history.slice(-8).map((m) => ({ role: m.role, content: m.content })),
-      { role: 'user', content: userContent },
+      ...history.slice(-8).map((m) => ({ role: m.role, content: mask(m.content) })),
+      { role: 'user', content: mask(userContent) },
     ];
+    const maskedSys = mask(sys);
+    if (shield && shield.summary().total > 0) {
+      onEvent('shield', shield.summary());
+    }
 
     const res = await endpoint.chatCompletion({
       tier: mode,
       model: chosenModel,
-      systemPrompt: sys,
+      systemPrompt: maskedSys,
       messages: msgs,
+      images,
       think: mode === 'fast' ? 'off' : think,
       priority: mode,
       signal,
@@ -515,33 +587,39 @@ async function runCoworkTurn({
       },
     });
 
+    const finalContent = unmask(res.content);
+    const finalThinking = unmask(res.thinking);
+
     storage.recordUsage({
       chatId,
       chatTitle,
       model: res.model || chosenModel,
       role: 'main',
+      tier: mode === 'fast' ? 'fast' : 'smart',
       promptTokens: res.usage?.promptTokens || Math.round((sys.length + userContent.length) / 4),
-      evalTokens: res.usage?.evalTokens || Math.round(((res.content || '').length + (res.thinking || '').length) / 4),
+      evalTokens: res.usage?.evalTokens || Math.round(((finalContent || '').length + (finalThinking || '').length) / 4),
       elapsedMs: res.elapsedMs || 0,
       tokensPerSec: res.usage?.tokensPerSec || 0,
     });
 
-    const { fileActions, codeRuns, savedNotes } = extractSpecialBlocks(res.content, toolsCfg);
+    const { fileActions, codeRuns, savedNotes, savedTasks } = extractSpecialBlocks(finalContent, toolsCfg);
     if (fileActions.length) onEvent('file_actions', fileActions);
     if (codeRuns.length) onEvent('code_runs', codeRuns);
 
     return {
-      content: res.content,
-      thinking: res.thinking,
+      content: finalContent,
+      thinking: finalThinking,
       model: res.model,
       mode,
       usage: res.usage,
+      shieldSummary: shield ? shield.summary() : null,
       plan: null,
       workers: [],
       sources: [],
       fileActions,
       codeRuns,
       savedNotes,
+      savedTasks,
     };
   }
 
@@ -600,7 +678,7 @@ Rules:
         tier: 'smart',
         model: orchestratorModel,
         systemPrompt: plannerSys,
-        messages: [{ role: 'user', content: plannerPrompt }],
+        messages: [{ role: 'user', content: mask(plannerPrompt) }],
         think: 'off',
         priority: 'smart',
         signal,
@@ -657,6 +735,7 @@ Rules:
         workspace,
         fastModel: workerModel,
         toolsCfg,
+        mask,
         signal,
         onEvent,
       });
@@ -699,15 +778,20 @@ Rules:
   synthPromptParts.push(`[User Request]\n${prompt}`);
 
   const synthMessages = [
-    ...history.slice(-6).map((m) => ({ role: m.role, content: m.content })),
-    { role: 'user', content: synthPromptParts.join('\n\n') },
+    ...history.slice(-6).map((m) => ({ role: m.role, content: mask(m.content) })),
+    { role: 'user', content: mask(synthPromptParts.join('\n\n')) },
   ];
+  const maskedSynthSys = mask(synthSys);
+  if (shield && shield.summary().total > 0) {
+    onEvent('shield', shield.summary());
+  }
 
   const finalRes = await endpoint.chatCompletion({
     tier: 'smart',
     model: orchestratorModel,
-    systemPrompt: synthSys,
+    systemPrompt: maskedSynthSys,
     messages: synthMessages,
+    images,
     think,
     priority: 'smart',
     signal,
@@ -718,34 +802,40 @@ Rules:
     },
   });
 
+  const finalContent = unmask(finalRes.content);
+  const finalThinking = unmask(finalRes.thinking);
+
   storage.recordUsage({
     chatId,
     chatTitle,
     model: finalRes.model || orchestratorModel,
     role: 'main',
+    tier: 'smart',
     promptTokens: finalRes.usage?.promptTokens || Math.round((synthSys.length + synthPromptParts.join('\n').length) / 4),
-    evalTokens: finalRes.usage?.evalTokens || Math.round(((finalRes.content || '').length + (finalRes.thinking || '').length) / 4),
+    evalTokens: finalRes.usage?.evalTokens || Math.round(((finalContent || '').length + (finalThinking || '').length) / 4),
     elapsedMs: finalRes.elapsedMs || 0,
     tokensPerSec: finalRes.usage?.tokensPerSec || 0,
   });
 
-  const { fileActions, codeRuns, savedNotes } = extractSpecialBlocks(finalRes.content, toolsCfg);
+  const { fileActions, codeRuns, savedNotes, savedTasks } = extractSpecialBlocks(finalContent, toolsCfg);
   if (fileActions.length) onEvent('file_actions', fileActions);
   if (codeRuns.length) onEvent('code_runs', codeRuns);
   if (allSources.length) onEvent('sources', allSources);
 
   return {
-    content: finalRes.content,
-    thinking: finalRes.thinking,
+    content: finalContent,
+    thinking: finalThinking,
     model: finalRes.model,
     mode,
     usage: finalRes.usage,
+    shieldSummary: shield ? shield.summary() : null,
     plan,
     workers: workerResults,
     sources: allSources,
     fileActions,
     codeRuns,
     savedNotes,
+    savedTasks,
   };
 }
 

@@ -27,6 +27,8 @@ const CONTAINER_RUNS_FILE = path.join(DATA_DIR, 'container-runs.json');
 const NOTES_FILE = path.join(DATA_DIR, 'memory-notes.json');
 const USAGE_FILE = path.join(DATA_DIR, 'usage-log.json');
 const PROVIDERS_FILE = path.join(DATA_DIR, 'providers.json');
+const WORKFLOWS_FILE = path.join(DATA_DIR, 'workflows.json');
+const TASKS_FILE = path.join(DATA_DIR, 'tasks.json');
 
 fs.mkdirSync(CHATS_DIR, { recursive: true });
 fs.mkdirSync(GRAPHS_DIR, { recursive: true });
@@ -73,7 +75,8 @@ const DEFAULT_SETTINGS = {
   toolSystem: true,
   toolCalculator: true,
   toolNotes: true,
-  // Container code execution defaults (safe by default)
+  // Container & On-Machine code execution defaults
+  codeExecutionTarget: 'container', // 'container' | 'host'
   containerEnabled: true,
   containerRuntime: 'auto', // 'auto' | 'docker' | 'podman'
   containerImage: 'python:3.12-slim',
@@ -83,6 +86,13 @@ const DEFAULT_SETTINGS = {
   containerMemoryMb: 1024,
   containerCpus: '2',
   autoApproveContainerRuns: false,
+  // 2-Tier Token Usage Limits (Fast = Unlimited; Smart = 4h & Daily caps)
+  smartLimit4h: 150000,
+  smartLimitDaily: 500000,
+  // Company Worker Productivity & Privacy Defaults (v1.6.0)
+  piiShieldEnabled: false,
+  piiCustomTerms: '',
+  globalHotkey: 'Alt+Space',
 };
 
 function readJson(file, fallback) {
@@ -195,6 +205,26 @@ function deleteChat(id) {
   } catch {
     return false;
   }
+}
+
+function moveChatToProject(chatId, projectId = '') {
+  const c = getChat(chatId);
+  if (!c) return null;
+  c.projectId = String(projectId || '');
+  return saveChat(c);
+}
+
+function reorderProjects(orderedIds = []) {
+  const all = listProjects();
+  const byId = new Map(all.map((p) => [p.id, p]));
+  const next = [];
+  for (const id of orderedIds) {
+    const p = byId.get(id);
+    if (p) { next.push(p); byId.delete(id); }
+  }
+  for (const p of byId.values()) next.push(p);
+  writeJson(PROJECTS_FILE, next);
+  return next;
 }
 
 // ---- Email Drafts
@@ -522,12 +552,13 @@ function activateProviderProfile(id) {
   return saveSettings(patch);
 }
 
-// ---- Token Usage Statistics (exact WebUI analytics model)
+// ---- Token Usage Statistics & 2-Tier Limits (Fast = Unlimited; Smart = 4h + Daily limits)
 function recordUsage({
   chatId = '',
   chatTitle = '',
   model = '',
   role = 'main', // 'main' | 'worker' | 'planner' | 'graph'
+  tier = '', // 'fast' | 'smart'
   promptTokens = 0,
   evalTokens = 0,
   elapsedMs = 0,
@@ -538,6 +569,10 @@ function recordUsage({
   const ms = Math.max(0, Math.round(Number(elapsedMs) || 0));
   const tps = Number(tokensPerSec) || (eTok > 0 && ms > 0 ? Number((eTok / (ms / 1000)).toFixed(1)) : 0);
   if (!pTok && !eTok && !ms) return null;
+
+  const inferredTier = tier === 'fast' || tier === 'smart'
+    ? tier
+    : (role === 'worker' || role === 'graph' ? 'fast' : 'smart');
 
   const log = readJson(USAGE_FILE, []);
   const arr = Array.isArray(log) ? log : [];
@@ -551,6 +586,7 @@ function recordUsage({
     chatTitle: String(chatTitle || '').slice(0, 80),
     model: String(model || 'unknown'),
     role: String(role || 'main'),
+    tier: inferredTier,
     promptTokens: pTok,
     evalTokens: eTok,
     totalTokens: pTok + eTok,
@@ -558,8 +594,72 @@ function recordUsage({
     tokensPerSec: tps,
   };
   arr.push(entry);
-  writeJson(USAGE_FILE, arr.slice(-2500));
+  writeJson(USAGE_FILE, arr.slice(-4000));
   return entry;
+}
+
+function getUsageLimitsStatus() {
+  const cfg = getSettings();
+  const log = readJson(USAGE_FILE, []);
+  const arr = Array.isArray(log) ? log : [];
+  const now = Date.now();
+  const FOUR_HOURS = 4 * 60 * 60 * 1000;
+  const ONE_DAY = 24 * 60 * 60 * 1000;
+
+  const limit4h = Math.max(0, Math.round(Number(cfg.smartLimit4h ?? 150000)));
+  const limitDaily = Math.max(0, Math.round(Number(cfg.smartLimitDaily ?? 500000)));
+
+  let fastTotalTokens = 0;
+  let fastRequests = 0;
+  let smart4h = 0;
+  let smartDaily = 0;
+  let oldest4hTs = 0;
+  let oldestDailyTs = 0;
+
+  for (const e of arr) {
+    const tot = Number(e.totalTokens) || ((Number(e.promptTokens) || 0) + (Number(e.evalTokens) || 0));
+    const ts = Number(e.ts) || 0;
+    const isFast = e.tier === 'fast' || e.role === 'worker' || e.role === 'graph';
+    if (isFast) {
+      fastTotalTokens += tot;
+      fastRequests++;
+      continue;
+    }
+    if (now - ts <= FOUR_HOURS) {
+      smart4h += tot;
+      if (!oldest4hTs || ts < oldest4hTs) oldest4hTs = ts;
+    }
+    if (now - ts <= ONE_DAY) {
+      smartDaily += tot;
+      if (!oldestDailyTs || ts < oldestDailyTs) oldestDailyTs = ts;
+    }
+  }
+
+  const exceeded4h = limit4h > 0 && smart4h >= limit4h;
+  const exceededDaily = limitDaily > 0 && smartDaily >= limitDaily;
+
+  return {
+    fast: {
+      unlimited: true,
+      totalTokens: fastTotalTokens,
+      requests: fastRequests,
+    },
+    smart: {
+      limit4h,
+      used4h: smart4h,
+      remaining4h: limit4h > 0 ? Math.max(0, limit4h - smart4h) : null,
+      pct4h: limit4h > 0 ? Math.min(100, Math.round((smart4h / limit4h) * 100)) : 0,
+      reset4hInMs: oldest4hTs ? Math.max(0, (oldest4hTs + FOUR_HOURS) - now) : 0,
+      limitDaily,
+      usedDaily: smartDaily,
+      remainingDaily: limitDaily > 0 ? Math.max(0, limitDaily - smartDaily) : null,
+      pctDaily: limitDaily > 0 ? Math.min(100, Math.round((smartDaily / limitDaily) * 100)) : 0,
+      resetDailyInMs: oldestDailyTs ? Math.max(0, (oldestDailyTs + ONE_DAY) - now) : 0,
+      exceeded4h,
+      exceededDaily,
+      allowed: !exceeded4h && !exceededDaily,
+    },
+  };
 }
 
 function getUsageStats() {
@@ -639,6 +739,7 @@ function getUsageStats() {
 
   return {
     totals,
+    limits: getUsageLimitsStatus(),
     byDay: [...byDayMap.values()].sort((a, b) => a.day.localeCompare(b.day)),
     byModel: [...byModelMap.values()]
       .map((m) => ({
@@ -669,6 +770,165 @@ function resetUsageStats() {
   return { ok: true };
 }
 
+// ---- Reusable Slash Workflows (/meeting-notes, /weekly-update, custom team playbooks)
+const BUILTIN_WORKFLOWS = [
+  {
+    id: 'wf_meeting_notes',
+    slug: 'meeting-notes',
+    title: 'Meeting Notes → Decisions & Action Items',
+    description: 'Turn raw meeting notes or transcript into Decisions, Risks, and structured Action Items saved to Project Tasks.',
+    builtin: true,
+    prompt: 'Analyze the meeting notes / transcript below. Produce:\n1. **Executive Summary** (3 bullets)\n2. **Key Decisions Made**\n3. **Open Questions & Risks**\n4. **Action Items Table** (Task | Owner | Due Date | Priority)\nAlso output an ```action-items JSON array block so mx-Cowork saves every action item to the Project Tasks board:\n```action-items\n[{"title":"...","owner":"...","due":"YYYY-MM-DD","priority":"high|med|low"}]\n```\n\nNotes:\n',
+  },
+  {
+    id: 'wf_weekly_update',
+    slug: 'weekly-update',
+    title: 'Weekly Status Update',
+    description: 'Inspect project Git commits, workspace files & notes to draft a crisp Friday executive status update.',
+    builtin: true,
+    prompt: 'Inspect my project Git commits, recent workspace activity, and saved notes, then write a concise executive Weekly Status Update with sections: **Highlights Shipped**, **In Progress**, **Blockers / Risks**, and **Next Week Priorities**. Keep it clear and ready to send to management or export as Word/PDF.',
+  },
+  {
+    id: 'wf_rewrite',
+    slug: 'rewrite',
+    title: 'Polish Business Writing',
+    description: 'Rewrite pasted text into clear, confident, polite corporate communication.',
+    builtin: true,
+    prompt: 'Rewrite the text below so it is clear, concise, polite, and professional (preserve the original language and facts; output only the polished version plus 1 short note on key improvements):\n\n',
+  },
+  {
+    id: 'wf_translate',
+    slug: 'translate',
+    title: 'Business Translate (DE ↔ EN)',
+    description: 'Natural professional German ↔ English translation preserving tone, tables & formatting.',
+    builtin: true,
+    prompt: 'Translate the text below naturally between German and English (if German → English, if English → German; preserve Markdown formatting, numbers, and business tone):\n\n',
+  },
+  {
+    id: 'wf_audit_data',
+    slug: 'audit-data',
+    title: 'Audit Spreadsheet / CSV Data',
+    description: 'Inspect pinned CSV/XLSX data for duplicates, missing values, anomalies & KPI table.',
+    builtin: true,
+    prompt: 'Audit the pinned CSV / Excel dataset (or find the latest spreadsheet in my workspace). Check for duplicate rows, missing/malformed values, outliers, and totals. Provide a Markdown KPI summary table ready for Excel export and propose any cleanup steps.',
+  },
+  {
+    id: 'wf_report',
+    slug: 'report',
+    title: 'Executive Report (Word / PDF Ready)',
+    description: 'Draft a structured business report with headings & tables ready for 1-click .docx or .pdf export.',
+    builtin: true,
+    prompt: 'Draft a polished, executive-ready report with clear Markdown headings, concise bullet points, and summary tables (formatted cleanly for 1-click Word .docx and PDF export) on the following topic:\n\n',
+  },
+  {
+    id: 'wf_action_items',
+    slug: 'action-items',
+    title: 'Extract Action Items to Task Board',
+    description: 'Pull every commitment, owner & deadline from pasted text or pinned docs into Project Tasks.',
+    builtin: true,
+    prompt: 'Extract every concrete task, owner, and deadline from the text or pinned documents below. Present a concise checklist AND output an ```action-items JSON array block (`[{"title":"...","owner":"...","due":"YYYY-MM-DD","priority":"high|med|low"}]`) so mx-Cowork adds them straight to the Tasks board:\n\n',
+  },
+  {
+    id: 'wf_compare',
+    slug: 'compare',
+    title: 'Compare Two Documents',
+    description: 'Explain substantive differences, risks & changed numbers/clauses between two versions.',
+    builtin: true,
+    prompt: 'Compare the two pinned or named documents thoroughly. Summarize: 1) **Substantive Changes**, 2) **Added Clauses / Items**, 3) **Removed Clauses / Items**, and 4) **Risks or Numbers Changed** in a clean comparison table:\n\n',
+  },
+];
+
+function listWorkflows() {
+  const custom = readJson(WORKFLOWS_FILE, []);
+  const customArr = Array.isArray(custom) ? custom : [];
+  return [...customArr, ...BUILTIN_WORKFLOWS];
+}
+
+function saveWorkflow(wf) {
+  const custom = readJson(WORKFLOWS_FILE, []);
+  const arr = Array.isArray(custom) ? custom : [];
+  const slug = String(wf.slug || wf.title || 'custom')
+    .toLowerCase()
+    .replace(/^\/+/, '')
+    .replace(/[^a-z0-9_-]+/g, '-')
+    .replace(/^-|-$/g, '')
+    .slice(0, 32) || 'custom';
+  const item = {
+    id: wf.id && !String(wf.id).startsWith('wf_') ? wf.id : newId('cwf'),
+    slug,
+    title: String(wf.title || `/${slug}`).trim().slice(0, 80),
+    description: String(wf.description || '').trim().slice(0, 180),
+    prompt: String(wf.prompt || '').trim(),
+    builtin: false,
+    updatedAt: Date.now(),
+  };
+  const idx = arr.findIndex((x) => x.id === item.id || x.slug === item.slug);
+  if (idx >= 0) arr[idx] = item;
+  else arr.unshift(item);
+  writeJson(WORKFLOWS_FILE, arr.slice(0, 60));
+  return item;
+}
+
+function deleteWorkflow(id) {
+  const custom = readJson(WORKFLOWS_FILE, []);
+  const arr = Array.isArray(custom) ? custom : [];
+  const next = arr.filter((x) => x.id !== id);
+  writeJson(WORKFLOWS_FILE, next);
+  return next.length !== arr.length;
+}
+
+// ---- Lightweight Project Action Items / Tasks
+function listTasks(projectId = '') {
+  const arr = readJson(TASKS_FILE, []);
+  const all = Array.isArray(arr) ? arr : [];
+  const filtered = projectId ? all.filter((t) => !t.projectId || t.projectId === projectId) : all;
+  return filtered.sort((a, b) => Number(Boolean(a.done)) - Number(Boolean(b.done)) || (b.updatedAt || 0) - (a.updatedAt || 0));
+}
+
+function saveTask(task) {
+  const all = readJson(TASKS_FILE, []);
+  const arr = Array.isArray(all) ? all : [];
+  const now = Date.now();
+  const id = task.id || newId('tsk');
+  const item = {
+    id,
+    title: String(task.title || '').trim().slice(0, 200),
+    owner: String(task.owner || '').trim().slice(0, 60),
+    due: String(task.due || '').trim().slice(0, 32),
+    priority: ['high', 'med', 'low'].includes(task.priority) ? task.priority : 'med',
+    done: Boolean(task.done),
+    projectId: String(task.projectId ?? getSettings().activeProjectId ?? ''),
+    source: String(task.source || '').slice(0, 120),
+    createdAt: task.createdAt || now,
+    updatedAt: now,
+  };
+  if (!item.title) return null;
+  const idx = arr.findIndex((x) => x.id === id);
+  if (idx >= 0) arr[idx] = { ...arr[idx], ...item, createdAt: arr[idx].createdAt || now };
+  else arr.unshift(item);
+  writeJson(TASKS_FILE, arr.slice(0, 300));
+  return item;
+}
+
+function toggleTask(id) {
+  const all = readJson(TASKS_FILE, []);
+  const arr = Array.isArray(all) ? all : [];
+  const item = arr.find((x) => x.id === id);
+  if (!item) return null;
+  item.done = !item.done;
+  item.updatedAt = Date.now();
+  writeJson(TASKS_FILE, arr);
+  return item;
+}
+
+function deleteTask(id) {
+  const all = readJson(TASKS_FILE, []);
+  const arr = Array.isArray(all) ? all : [];
+  const next = arr.filter((x) => x.id !== id);
+  writeJson(TASKS_FILE, next);
+  return next.length !== arr.length;
+}
+
 module.exports = {
   DATA_DIR,
   getSettings,
@@ -680,6 +940,8 @@ module.exports = {
   saveChat,
   createChat,
   deleteChat,
+  moveChatToProject,
+  reorderProjects,
   listDrafts,
   saveDraft,
   deleteDraft,
@@ -709,6 +971,14 @@ module.exports = {
   deleteProviderProfile,
   activateProviderProfile,
   recordUsage,
+  getUsageLimitsStatus,
   getUsageStats,
   resetUsageStats,
+  listWorkflows,
+  saveWorkflow,
+  deleteWorkflow,
+  listTasks,
+  saveTask,
+  toggleTask,
+  deleteTask,
 };

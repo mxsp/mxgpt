@@ -118,6 +118,7 @@ async function runInContainer({
   image = '',
   network = '',
   mountMode = '',
+  execTarget = '',
   timeoutSec = 0,
   memoryMb = 0,
   cpus = '',
@@ -125,6 +126,19 @@ async function runInContainer({
   onOutput,
 } = {}) {
   const cfg = storage.getSettings();
+  const target = execTarget || cfg.codeExecutionTarget || 'container';
+  if (target === 'host') {
+    return runOnHost({
+      runId,
+      title,
+      language,
+      code,
+      command,
+      timeoutSec,
+      workspace,
+      onOutput,
+    });
+  }
   const status = await detectRuntimes(false);
   const runtime = status.activeRuntime;
 
@@ -266,13 +280,153 @@ async function runInContainer({
   });
 }
 
+async function runOnHost({
+  runId = storage.newId('hrun'),
+  title = '',
+  language = 'python',
+  code = '',
+  command = '',
+  timeoutSec = 0,
+  workspace = '',
+  onOutput,
+} = {}) {
+  const cfg = storage.getSettings();
+  const ws = path.resolve(workspace || localFiles.getWorkspace());
+  const maxTime = Math.max(5, Math.min(180, Number(timeoutSec || cfg.containerTimeoutSec || 30)));
+  const l = String(language || 'bash').toLowerCase();
+  const isWin = process.platform === 'win32';
+  const script = String(code || command || '').trim();
+  if (!script) throw new Error('No code or command provided');
+
+  let bin;
+  let args;
+  let stdinPayload = script + '\n';
+  if (l === 'python' || l === 'py' || l === 'python3') {
+    bin = isWin ? 'python' : 'python3';
+    args = ['-u', '-'];
+  } else if (l === 'javascript' || l === 'js' || l === 'node') {
+    bin = 'node';
+    args = ['-'];
+  } else {
+    if (isWin) {
+      bin = 'powershell.exe';
+      args = ['-NoProfile', '-NonInteractive', '-Command', script];
+      stdinPayload = '';
+    } else {
+      bin = 'bash';
+      args = ['-s'];
+    }
+  }
+
+  const startedAt = Date.now();
+  let stdout = '';
+  let stderr = '';
+  let timedOut = false;
+  let stopped = false;
+  const MAX_OUT = 120000;
+
+  onOutput?.({
+    runId,
+    stream: 'meta',
+    chunk: `▶ HOST (${bin} · cwd=${ws})\n`,
+  });
+
+  return new Promise((resolve) => {
+    const child = spawn(bin, args, {
+      cwd: ws,
+      stdio: ['pipe', 'pipe', 'pipe'],
+      windowsHide: true,
+    });
+
+    ACTIVE_CONTAINERS.set(runId, { child, runtime: 'host', cname: '', markStopped: () => { stopped = true; } });
+
+    const timer = setTimeout(() => {
+      timedOut = true;
+      stopContainerRun(runId).catch(() => {});
+    }, maxTime * 1000);
+
+    child.stdout.on('data', (buf) => {
+      const chunk = buf.toString('utf8');
+      if (stdout.length < MAX_OUT) stdout += chunk.slice(0, MAX_OUT - stdout.length);
+      onOutput?.({ runId, stream: 'stdout', chunk });
+    });
+
+    child.stderr.on('data', (buf) => {
+      const chunk = buf.toString('utf8');
+      if (stderr.length < MAX_OUT) stderr += chunk.slice(0, MAX_OUT - stderr.length);
+      onOutput?.({ runId, stream: 'stderr', chunk });
+    });
+
+    child.on('error', (err) => {
+      clearTimeout(timer);
+      ACTIVE_CONTAINERS.delete(runId);
+      const result = {
+        runId,
+        ok: false,
+        exitCode: -1,
+        runtime: 'host',
+        execTarget: 'host',
+        image: `host:${bin}`,
+        network: 'host',
+        mountMode: 'rw',
+        language: l,
+        title: title || `${l} host run`,
+        code: script,
+        stdout,
+        stderr: (stderr ? stderr + '\n' : '') + err.message,
+        timedOut,
+        stopped,
+        elapsedMs: Date.now() - startedAt,
+        workspace: ws,
+      };
+      storage.pushContainerRun(result);
+      resolve(result);
+    });
+
+    child.on('close', (exitCode) => {
+      clearTimeout(timer);
+      ACTIVE_CONTAINERS.delete(runId);
+      if (timedOut) stderr += `\n[Timed out after ${maxTime}s — process terminated]`;
+      else if (stopped) stderr += '\n[Stopped by user]';
+      const result = {
+        runId,
+        ok: exitCode === 0 && !timedOut && !stopped,
+        exitCode: typeof exitCode === 'number' ? exitCode : -1,
+        runtime: 'host',
+        execTarget: 'host',
+        image: `host:${bin}`,
+        network: 'host',
+        mountMode: 'rw',
+        language: l,
+        title: title || `${l} host run`,
+        code: script,
+        stdout,
+        stderr,
+        timedOut,
+        stopped,
+        elapsedMs: Date.now() - startedAt,
+        workspace: ws,
+      };
+      storage.pushContainerRun(result);
+      resolve(result);
+    });
+
+    try {
+      if (stdinPayload) child.stdin.write(stdinPayload);
+      child.stdin.end();
+    } catch {}
+  });
+}
+
 async function stopContainerRun(runId) {
   const entry = ACTIVE_CONTAINERS.get(runId);
   if (!entry) return { ok: false };
   entry.markStopped?.();
-  try {
-    await execFileAsync(entry.runtime, ['rm', '-f', entry.cname], 4000);
-  } catch {}
+  if (entry.runtime && entry.runtime !== 'host' && entry.cname) {
+    try {
+      await execFileAsync(entry.runtime, ['rm', '-f', entry.cname], 4000);
+    } catch {}
+  }
   try { entry.child.kill('SIGKILL'); } catch {}
   ACTIVE_CONTAINERS.delete(runId);
   return { ok: true };
@@ -283,5 +437,6 @@ module.exports = {
   detectRuntimes,
   defaultImageForLanguage,
   runInContainer,
+  runOnHost,
   stopContainerRun,
 };

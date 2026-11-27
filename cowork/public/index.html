@@ -47,6 +47,10 @@
   <symbol id="i-play" viewBox="0 0 24 24"><polygon points="6 4 20 12 6 20 6 4" fill="currentColor" stroke="none"/></symbol>
   <symbol id="i-expand" viewBox="0 0 24 24"><path d="M15 3h6v6M9 21H3v-6M21 3l-7 7M3 21l7-7"/></symbol>
   <symbol id="i-code" viewBox="0 0 24 24"><path d="M16 18l6-6-6-6M8 6l-6 6 6 6"/></symbol>
+  <symbol id="i-shield" viewBox="0 0 24 24"><path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z"/></symbol>
+  <symbol id="i-diff" viewBox="0 0 24 24"><path d="M12 3v18M4 8h5M6.5 5.5v5M15 16h5"/></symbol>
+  <symbol id="i-table" viewBox="0 0 24 24"><rect x="3" y="4" width="18" height="16" rx="2"/><path d="M3 10h18M9 4v16M15 10v10"/></symbol>
+  <symbol id="i-calendar" viewBox="0 0 24 24"><rect x="3" y="4" width="18" height="18" rx="2"/><path d="M16 2v4M8 2v4M3 10h18"/></symbol>
 </svg>
 
 <!-- Native Login Screen (identical visual style to mx-GPT login.html) -->
@@ -132,27 +136,29 @@
       <span class="kbd">Ctrl+N</span>
     </button>
 
-    <div class="sb-projects">
-      <div class="sb-proj-head">
-        <span class="sb-label" style="padding:0">Projects</span>
-        <button class="sb-proj-add" id="addProjectBtn" title="Add a local project folder with auto Knowledge Graph &amp; workspace settings">+ Add</button>
-      </div>
-      <div class="projects-list" id="projectsList"></div>
-    </div>
-
     <div class="sb-search">
       <svg><use href="#i-search"/></svg>
-      <input id="chatSearch" type="search" placeholder="Search chats" autocomplete="off" />
+      <input id="chatSearch" type="search" placeholder="Search projects &amp; chats" autocomplete="off" />
     </div>
 
-    <nav class="chat-list" id="chatList" aria-label="Chats"></nav>
+    <div class="sb-tree-scroll" id="sbTreeScroll">
+      <div class="sb-projects" id="sbProjectsZone">
+        <div class="sb-proj-head">
+          <span class="sb-label" style="padding:0">Projects (drag chats here)</span>
+          <button class="sb-proj-add" id="addProjectBtn" title="Add a local project folder (or drag a folder here)">+ Add</button>
+        </div>
+        <div class="projects-list" id="projectsList"></div>
+      </div>
+
+      <nav class="chat-list" id="chatList" aria-label="General Chats"></nav>
+    </div>
 
     <div class="sb-foot">
       <button class="sb-upd-btn" id="openUpdatesBtn" title="Check for updates from GitHub Releases">
         <span class="upd-dot" id="updDot" hidden></span>
         <svg><use href="#i-download"/></svg>
         <span id="updBtnLabel">Updates</span>
-        <span class="upd-ver" id="appVersionBadge">v1.5.0</span>
+        <span class="upd-ver" id="appVersionBadge">v1.6.0</span>
       </button>
       <div class="user-row">
         <button class="user-chip" id="openSettingsBtn" title="Endpoint, providers &amp; account settings">
@@ -186,7 +192,7 @@
         <button class="ghost-btn" data-panel="files" title="Navigate OS folders, find &amp; edit local files"><svg><use href="#i-folder"/></svg><span>Files</span></button>
         <button class="ghost-btn" data-panel="graph" title="Interactive Project Knowledge Graph"><svg><use href="#i-graph"/></svg><span>Graph</span></button>
         <button class="ghost-btn" data-panel="container" title="Isolated Docker/Podman Container Code Execution"><svg><use href="#i-box"/></svg><span>Container</span></button>
-        <button class="ghost-btn" data-panel="notes" title="Persistent Copilot Memory Notes &amp; Quick Local Tools"><svg><use href="#i-book"/></svg><span>Notes</span></button>
+        <button class="ghost-btn" data-panel="notes" title="Project Tasks, Action Items, Memory Notes &amp; Quick Local Tools"><svg><use href="#i-book"/></svg><span>Tasks</span></button>
         <button class="ghost-btn" data-panel="research" title="Web &amp; Wikipedia research desk"><svg><use href="#i-globe"/></svg><span>Research</span></button>
         <button class="ghost-btn" data-panel="undo" title="Undo local file edits &amp; actions"><svg><use href="#i-undo"/></svg><span>Undo</span><span class="badge-cnt" id="undoCount" hidden>0</span></button>
         <button class="icon-btn" id="themeBtn" title="Toggle theme"><svg id="themeIcon"><use href="#i-moon"/></svg></button>
@@ -218,15 +224,31 @@
       </div>
 
       <div class="composer-wrap">
+        <div class="quick-clip-bar" id="quickClipBar" hidden>
+          <div class="qcb-head">
+            <span><b>Clipboard Quick-Ask</b> · <small id="qcbSnippet"></small></span>
+            <button type="button" class="icon-btn sm" id="qcbCloseBtn" title="Dismiss"><svg><use href="#i-x"/></svg></button>
+          </div>
+          <div class="qcb-acts">
+            <button type="button" class="btn tiny primary" data-qcb="rewrite">Rewrite Professionally</button>
+            <button type="button" class="btn tiny" data-qcb="translate">Translate DE ↔ EN</button>
+            <button type="button" class="btn tiny" data-qcb="summarize">Summarize</button>
+            <button type="button" class="btn tiny" data-qcb="actions">Extract Action Items</button>
+            <button type="button" class="btn tiny" data-qcb="paste">Paste into Box</button>
+          </div>
+        </div>
+        <div class="slash-menu" id="slashMenu" hidden></div>
         <div class="composer" id="composer">
           <div class="attach-row" id="pinnedBar" hidden></div>
-          <textarea id="promptInput" rows="1" placeholder="How can I help you today?" spellcheck="false"></textarea>
+          <textarea id="promptInput" rows="1" placeholder="How can I help? Type / for workflows or Ctrl+V to paste a screenshot…" spellcheck="false"></textarea>
           <div class="composer-bar">
             <div class="c-left">
               <button class="icon-btn" id="attachFileBtn" title="Attach / pin local OS files to chat"><svg><use href="#i-plus"/></svg></button>
+              <button class="tool-toggle" id="workflowsBtn" title="Open reusable /workflows &amp; prompt templates"><span>/</span></button>
               <button class="tool-toggle on" id="webToggleBtn" title="Toggle Web Search &amp; URL Page Reader"><svg><use href="#i-globe"/></svg><span>Web</span></button>
               <button class="tool-toggle on" id="filesToggleBtn" title="Toggle Local OS File Access"><svg><use href="#i-folder"/></svg><span>Files</span></button>
               <button class="tool-toggle on" id="containerToggleBtn" title="Toggle Container Code Execution"><svg><use href="#i-box"/></svg><span>Container</span></button>
+              <button class="tool-toggle shield-btn" id="shieldToggleBtn" title="Privacy / PII Shield — mask emails, IBANs, phones, secrets &amp; custom client names locally before sending"><svg><use href="#i-shield"/></svg><span>Shield</span></button>
               <div class="think-control" id="thinkControl" title="Smart / Copilot reasoning depth">
                 <span class="think-label">Think</span>
                 <div class="think-seg" id="thinkSeg" role="radiogroup" aria-label="Thinking effort">
@@ -283,6 +305,7 @@
           </div>
           <span class="art-meta-right" id="artMetaRight"></span>
           <div class="row-gap">
+            <button class="btn tiny" id="artPdfBtn" title="Export rendered Artifact as PDF">PDF</button>
             <button class="icon-btn sm" id="artCopyBtn" title="Copy artifact code"><svg><use href="#i-copy"/></svg></button>
             <button class="icon-btn sm" id="artSaveBtn" title="Save artifact to disk…"><svg><use href="#i-download"/></svg></button>
             <button class="icon-btn sm" id="artOpenExtBtn" title="Open in OS browser"><svg><use href="#i-external"/></svg></button>
@@ -315,6 +338,7 @@
           <div class="files-subbar">
             <div class="crumbs" id="fileCrumbs"></div>
             <div class="fs-acts">
+              <button class="btn tiny" id="compareFilesBtn" title="Compare two files side-by-side (diff PDF, DOCX, CSV, code)"><svg><use href="#i-diff"/></svg>Compare</button>
               <button class="btn tiny" id="newFileBtn" title="Create a new file"><svg><use href="#i-file-plus"/></svg>File</button>
               <button class="btn tiny" id="newFolderBtn" title="Create a new folder"><svg><use href="#i-folder-plus"/></svg>Folder</button>
               <button class="btn tiny primary" id="auditWsBtn" title="Ask Copilot to audit and organize this folder">Audit</button>
@@ -335,6 +359,8 @@
           </div>
           <div class="ed-tools">
             <button class="btn tiny primary" id="edSaveBtn" title="Save file (Ctrl+S)"><svg><use href="#i-save"/></svg>Save</button>
+            <button class="btn tiny" id="edTableToggleBtn" hidden title="Switch between Data Table and Raw Text"><svg><use href="#i-table"/></svg>Table</button>
+            <button class="btn tiny" id="edExportXlsxBtn" hidden title="Export this table to Excel (.xlsx)">Export .xlsx</button>
             <button class="btn tiny" id="edAskAiBtn" title="Pin file &amp; ask Copilot to edit or analyze"><svg><use href="#i-spark"/></svg>Ask Cowork</button>
             <button class="btn tiny" id="edPinBtn"><svg><use href="#i-pin"/></svg>Pin</button>
             <button class="btn tiny" id="edRenameBtn"><svg><use href="#i-edit"/></svg>Rename</button>
@@ -342,6 +368,13 @@
             <button class="btn tiny" id="edRevealBtn" title="Reveal in OS File Manager">Reveal</button>
           </div>
           <div class="ed-readonly-note" id="edReadonlyNote" hidden>Read-only extracted text preview (PDF / Office / binary). Use "OS App" to edit externally.</div>
+          <div class="ed-table-wrap" id="edTableWrap" hidden>
+            <div class="ed-table-bar">
+              <input type="text" id="edTableFilter" placeholder="Filter table rows…" />
+              <span id="edTableStats">0 rows</span>
+            </div>
+            <div class="ed-table-scroll"><table class="data-grid" id="edTableGrid"></table></div>
+          </div>
           <textarea class="ed-textarea" id="edTextarea" spellcheck="false"></textarea>
           <div class="ed-foot">
             <span id="edStats">0 lines · 0 chars</span>
@@ -419,6 +452,10 @@
             <button class="btn tiny" id="ctRefreshBtn">Re-check</button>
           </div>
           <div class="ct-controls">
+            <select id="ctExecTarget" title="Choose where code executes">
+              <option value="container">Target: Container (Docker/Podman)</option>
+              <option value="host">Target: On-Machine (Local Host)</option>
+            </select>
             <select id="ctLang">
               <option value="python">Python 3</option>
               <option value="javascript">Node.js</option>
@@ -435,10 +472,10 @@
             </select>
           </div>
           <div class="ct-presets" id="ctImagePresets"></div>
-          <textarea class="ct-editor" id="ctCodeInput" rows="7" spellcheck="false" placeholder="# Code or command to execute inside isolated container mounted at /workspace&#10;import os&#10;print('Files in /workspace:', os.listdir('/workspace')[:15])"></textarea>
+          <textarea class="ct-editor" id="ctCodeInput" rows="7" spellcheck="false" placeholder="# Code or command to execute in container or directly on-machine&#10;import os&#10;print('Files:', os.listdir('.')[:15])"></textarea>
           <div class="row-gap">
-            <button class="btn tiny primary" id="ctRunBtn"><svg><use href="#i-play"/></svg>Run in Container</button>
-            <button class="btn tiny danger" id="ctStopBtn" hidden>Stop Container</button>
+            <button class="btn tiny primary" id="ctRunBtn"><svg><use href="#i-play"/></svg><span id="ctRunBtnLabel">Run in Container</span></button>
+            <button class="btn tiny danger" id="ctStopBtn" hidden>Stop Run</button>
             <button class="btn tiny" id="ctSendOutBtn">Send Output to Cowork</button>
             <span class="ct-meta" id="ctRunMeta"></span>
           </div>
@@ -448,26 +485,47 @@
         </div>
       </section>
 
-      <!-- Persistent Memory Notes & Quick Local Tools Pane -->
+      <!-- Project Action Items / Tasks, Quick Local Tools & Persistent Memory Notes -->
       <section class="pane" data-pane="notes">
         <div class="pane-pad">
           <div class="pane-head-row">
+            <span class="sb-label" style="padding:0">Project Action Items &amp; Tasks</span>
+            <button class="btn tiny" id="manageWorkflowsBtn" title="Create or manage reusable /workflows">/Workflows</button>
+          </div>
+          <div class="task-add-row">
+            <input type="text" id="taskTitleInput" placeholder="New action item (or run /meeting-notes)…" />
+            <div class="row-gap">
+              <input type="text" id="taskOwnerInput" placeholder="Owner" style="flex:1" />
+              <input type="date" id="taskDueInput" style="flex:1" />
+              <button class="btn tiny primary" id="addTaskBtn">Add</button>
+            </div>
+          </div>
+          <div class="saved-list" id="tasksList" style="max-height:210px;flex:none"></div>
+
+          <div class="pane-head-row" style="margin-top:6px">
             <span class="sb-label" style="padding:0">Quick Local Tools</span>
           </div>
           <div class="row-gap">
-            <button class="btn tiny" id="quickGitBtn">Git Status &amp; Log</button>
-            <button class="btn tiny" id="quickSysBtn">System &amp; Runtimes</button>
+            <button class="btn tiny" id="quickCompareBtn">Compare 2 Files</button>
+            <button class="btn tiny" id="quickGitBtn">Git Status</button>
+            <button class="btn tiny" id="quickSysBtn">System</button>
             <button class="btn tiny" id="quickCalcBtn">JS Eval</button>
           </div>
-          <pre class="ct-term" id="quickToolOut" style="max-height:140px;flex:none" hidden></pre>
+          <pre class="ct-term" id="quickToolOut" style="max-height:130px;flex:none" hidden></pre>
 
-          <div class="pane-head-row" style="margin-top:4px">
+          <div class="pane-head-row" style="margin-top:6px">
+            <span class="sb-label" style="padding:0">Local Automations &amp; Folder Watchers</span>
+            <button class="btn tiny" id="openAutoModalBtn">+ Rule</button>
+          </div>
+          <div class="saved-list" id="automationsList" style="max-height:145px;flex:none"></div>
+
+          <div class="pane-head-row" style="margin-top:6px">
             <span class="sb-label" style="padding:0">Persistent Copilot Memory Notes</span>
           </div>
           <div class="email-form">
             <input type="text" id="noteTitleInput" placeholder="Note title (e.g. Project deploy rules, Preferences)" />
             <input type="text" id="noteTagsInput" placeholder="Tags (comma separated, optional)" />
-            <textarea id="noteContentInput" rows="3" style="min-height:70px" placeholder="Facts or instructions Copilot should remember across chats…"></textarea>
+            <textarea id="noteContentInput" rows="2" style="min-height:54px" placeholder="Facts or instructions Copilot should remember across chats…"></textarea>
             <div class="row-gap">
               <button class="btn tiny primary" id="saveNoteBtn">Save Note</button>
             </div>
@@ -476,15 +534,30 @@
         </div>
       </section>
 
-      <!-- Research Desk Pane -->
+      <!-- Research Desk & Private Document Knowledge Base Pane -->
       <section class="pane" data-pane="research">
-        <div class="files-search">
-          <input type="text" id="resSearchInput" placeholder="Quick web + Wikipedia lookup…" />
-          <button class="btn tiny primary" id="resSearchBtn">Search</button>
-        </div>
-        <div class="pane-pad">
-          <div class="saved-list" id="resLive" style="max-height:42%;flex:none"></div>
-          <div class="sb-label" style="padding:10px 0 6px">Saved Research Briefs</div>
+        <div class="pane-pad" style="gap:8px">
+          <div class="pane-head-row">
+            <span class="sb-label" style="padding:0">Private Local Document KB (Offline Search)</span>
+            <button class="btn tiny" id="kbIndexBtn" title="Index PDFs, DOCX, XLSX, CSV &amp; Markdown in this project">Index Docs</button>
+          </div>
+          <div class="muted-note" id="kbStatus" style="margin:0">Index project documents to search policies, contracts &amp; SOPs offline.</div>
+          <div class="row-gap">
+            <input type="text" id="kbSearchInput" style="flex:1;height:30px;padding:0 9px;border-radius:8px;border:1px solid var(--border);background:var(--bg-elev);font-size:12px" placeholder="Ask your local docs (e.g. reimbursement limit, SLA)…" />
+            <button class="btn tiny primary" id="kbSearchBtn">Search KB</button>
+          </div>
+          <div class="saved-list" id="kbResults" style="max-height:175px;flex:none"></div>
+
+          <div class="settings-sep"></div>
+          <div class="pane-head-row">
+            <span class="sb-label" style="padding:0">Web &amp; Wikipedia Lookup</span>
+          </div>
+          <div class="row-gap">
+            <input type="text" id="resSearchInput" style="flex:1;height:30px;padding:0 9px;border-radius:8px;border:1px solid var(--border);background:var(--bg-elev);font-size:12px" placeholder="Quick web + Wikipedia lookup…" />
+            <button class="btn tiny primary" id="resSearchBtn">Web</button>
+          </div>
+          <div class="saved-list" id="resLive" style="max-height:170px;flex:none"></div>
+          <div class="sb-label" style="padding:4px 0 2px">Saved Research &amp; Automation Briefs</div>
           <div class="saved-list" id="briefsList"></div>
         </div>
       </section>
@@ -581,6 +654,22 @@
             </div>
           </div>
           <div class="fm-list" id="fetchedModelsList"></div>
+        </div>
+
+        <div class="settings-sep"></div>
+        <div class="field-row">
+          <label class="field">
+            <span>Fast Tier Limit</span>
+            <input type="text" value="Unlimited (no cap)" disabled />
+          </label>
+          <label class="field">
+            <span>Smart Tier · 4-Hour Token Limit</span>
+            <input type="number" id="setSmartLimit4h" min="0" step="10000" value="150000" />
+          </label>
+          <label class="field">
+            <span>Smart Tier · Daily Token Limit</span>
+            <input type="number" id="setSmartLimitDaily" min="0" step="25000" value="500000" />
+          </label>
         </div>
 
         <label class="field">
@@ -716,11 +805,33 @@
           <input type="checkbox" id="setAutoApprove" />
           <span>Auto-apply Copilot file actions without confirmation</span>
         </label>
+        <div class="settings-sep"></div>
+        <label class="check-field">
+          <input type="checkbox" id="setPiiShield" />
+          <span><b>Privacy / PII Redaction Shield</b> — mask emails, IBANs, phone numbers, secrets &amp; confidential names before sending to external providers (restored locally)</span>
+        </label>
+        <div class="field-row">
+          <label class="field" style="flex:1.4">
+            <span>Custom Confidential Terms (comma-separated: client names, internal project codenames)</span>
+            <input type="text" id="setPiiCustomTerms" placeholder="e.g. Acme Corp, Project Phoenix, Max Mustermann" />
+          </label>
+          <label class="field" style="flex:0.6">
+            <span>Global Quick-Ask Hotkey</span>
+            <input type="text" id="setGlobalHotkey" placeholder="Alt+Space" />
+          </label>
+        </div>
       </div>
 
-      <!-- Tab 5: Container Sandbox -->
+      <!-- Tab 5: Code Execution (Container & On-Machine Host) -->
       <div class="stab-pane" data-spane="container">
-        <p class="muted-note">Containers run with <code>--cap-drop=ALL</code>, <code>--security-opt=no-new-privileges</code>, PID/RAM/CPU limits, and auto-cleanup (<code>--rm</code>).</p>
+        <label class="field">
+          <span>Default Code Execution Target</span>
+          <select id="setCodeExecTarget">
+            <option value="container">Isolated Container (Docker / Podman — safest)</option>
+            <option value="host">On-Machine (Run directly on local host in project workspace)</option>
+          </select>
+        </label>
+        <p class="muted-note">Container runs use <code>--cap-drop=ALL</code>, <code>--security-opt=no-new-privileges</code>, PID/RAM/CPU limits, and <code>--rm</code>. On-Machine runs execute directly with local <code>python3</code> / <code>node</code> / <code>bash</code> / <code>powershell</code> in your workspace.</p>
         <div class="field-row">
           <label class="field">
             <span>Container Runtime</span>
@@ -906,6 +1017,133 @@
       <button class="btn danger" id="deleteProjectBtn" style="margin-right:auto" hidden>Remove Project</button>
       <button class="btn" id="cancelProjectBtn">Cancel</button>
       <button class="btn primary" id="saveProjectBtn">Save &amp; Open Project</button>
+    </div>
+  </div>
+</div>
+
+<!-- Side-by-Side Document Compare / Visual Diff Modal -->
+<div class="modal-backdrop" id="compareModal" hidden>
+  <div class="modal modal-xl">
+    <div class="modal-head">
+      <div>
+        <h2>Compare Two Documents</h2>
+        <p class="sub">Visual red/green diff for contracts, reports, CSVs, PDFs, Word docs, or source code.</p>
+      </div>
+      <button class="icon-btn" id="closeCompareModalBtn"><svg><use href="#i-x"/></svg></button>
+    </div>
+    <div class="modal-body">
+      <div class="field-row">
+        <label class="field">
+          <span>Original / Version A (relative workspace path)</span>
+          <input type="text" id="cmpLeftInput" list="cmpFileOptions" placeholder="e.g. Contract_v1.docx" />
+        </label>
+        <label class="field">
+          <span>Updated / Version B (relative workspace path)</span>
+          <input type="text" id="cmpRightInput" list="cmpFileOptions" placeholder="e.g. Contract_v2.docx" />
+        </label>
+      </div>
+      <datalist id="cmpFileOptions"></datalist>
+      <div class="row-gap">
+        <button class="btn tiny primary" id="runCompareBtn">Compare Files</button>
+        <button class="btn tiny" id="askCopilotDiffBtn" hidden>Ask Copilot to Explain Differences</button>
+        <span id="cmpSummaryStats" class="ct-meta"></span>
+      </div>
+      <div class="diff-viewer" id="cmpDiffViewer">
+        <div class="muted-note" style="padding:14px">Choose two files above and click <b>Compare Files</b>.</div>
+      </div>
+    </div>
+  </div>
+</div>
+
+<!-- Custom Slash Workflows Manager Modal -->
+<div class="modal-backdrop" id="workflowModal" hidden>
+  <div class="modal">
+    <div class="modal-head">
+      <div>
+        <h2>Reusable /Workflows</h2>
+        <p class="sub">Type <code>/</code> in the chat box to trigger built-in or custom team templates.</p>
+      </div>
+      <button class="icon-btn" id="closeWorkflowModalBtn"><svg><use href="#i-x"/></svg></button>
+    </div>
+    <div class="modal-body">
+      <div class="field-row">
+        <label class="field" style="flex:0.6">
+          <span>Slash Command</span>
+          <input type="text" id="wfSlugInput" placeholder="e.g. invoice-check" />
+        </label>
+        <label class="field" style="flex:1.4">
+          <span>Workflow Title</span>
+          <input type="text" id="wfTitleInput" placeholder="e.g. Check Invoice Against PO" />
+        </label>
+      </div>
+      <label class="field">
+        <span>Prompt Template</span>
+        <textarea id="wfPromptInput" rows="3" placeholder="Write the reusable instructions Copilot will run when you type /invoice-check…"></textarea>
+      </label>
+      <div class="row-gap">
+        <button class="btn tiny primary" id="saveWorkflowBtn">Save Custom Workflow</button>
+      </div>
+      <div class="settings-sep"></div>
+      <div class="saved-list" id="workflowsManageList" style="max-height:220px"></div>
+    </div>
+  </div>
+</div>
+
+<!-- Local Automation / Folder Watcher Modal -->
+<div class="modal-backdrop" id="automationModal" hidden>
+  <div class="modal">
+    <div class="modal-head">
+      <div>
+        <h2>New Local Automation</h2>
+        <p class="sub">Schedule recurring local tasks or watch a workspace folder for new files (runs on unlimited Fast tier by default).</p>
+      </div>
+      <button class="icon-btn" id="closeAutoModalBtn"><svg><use href="#i-x"/></svg></button>
+    </div>
+    <div class="modal-body">
+      <div class="field-row">
+        <label class="field">
+          <span>Rule Name</span>
+          <input type="text" id="autoNameInput" placeholder="e.g. Summarize New Invoices" />
+        </label>
+        <label class="field" style="flex:0.7">
+          <span>Trigger</span>
+          <select id="autoTriggerSelect">
+            <option value="folder_watch">Folder Watcher</option>
+            <option value="interval">Recurring Interval</option>
+          </select>
+        </label>
+      </div>
+      <div class="field-row" id="autoFolderRow">
+        <label class="field">
+          <span>Folder to Watch (relative or absolute path)</span>
+          <input type="text" id="autoFolderInput" placeholder="e.g. Invoices (leave blank for workspace root)" />
+        </label>
+        <label class="field" style="flex:0.65">
+          <span>Filename Filter</span>
+          <input type="text" id="autoPatternInput" placeholder=".pdf" />
+        </label>
+      </div>
+      <div class="field-row" id="autoIntervalRow" hidden>
+        <label class="field">
+          <span>Run Every (minutes)</span>
+          <input type="number" id="autoIntervalInput" min="5" max="10080" value="60" />
+        </label>
+        <label class="field">
+          <span>Model Tier</span>
+          <select id="autoModeSelect">
+            <option value="fast">Fast (Unlimited — Recommended)</option>
+            <option value="copilot">Copilot (Uses Smart Quota)</option>
+          </select>
+        </label>
+      </div>
+      <label class="field">
+        <span>Prompt / Task to Execute Automatically</span>
+        <textarea id="autoPromptInput" rows="3" placeholder="e.g. Read the newly dropped file, extract vendor, invoice date, total amount, and summarize key line items."></textarea>
+      </label>
+    </div>
+    <div class="modal-foot">
+      <button class="btn" id="cancelAutoBtn">Cancel</button>
+      <button class="btn primary" id="saveAutoBtn">Save Automation</button>
     </div>
   </div>
 </div>

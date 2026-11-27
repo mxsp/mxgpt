@@ -11,7 +11,7 @@
  *  - Full Fast / Smart / Copilot hybrid orchestration engine
  */
 
-const { app, BrowserWindow, ipcMain, dialog, shell, Menu } = require('electron');
+const { app, BrowserWindow, ipcMain, dialog, shell, Menu, Tray, globalShortcut, clipboard, nativeImage } = require('electron');
 const path = require('path');
 const fs = require('fs');
 const os = require('os');
@@ -25,9 +25,15 @@ const updater = require('./updater');
 const containerRunner = require('./container-runner');
 const knowledgeGraph = require('./knowledge-graph');
 const localTools = require('./local-tools');
+const diffEngine = require('./diff-engine');
+const officeExport = require('./office-export');
+const docIndex = require('./doc-index');
+const automations = require('./automations');
 
 const ACTIVE_RUNS = new Map(); // chatId -> AbortController
 let mainWindow = null;
+let appTray = null;
+let registeredHotkey = '';
 
 // Single-instance lock so double-clicking the app focuses the existing window
 const gotLock = app.requestSingleInstanceLock();
@@ -229,9 +235,8 @@ function registerIpc() {
     return { ok: true, found: r.models.length, latencyMs: r.latencyMs, models: r.models, providers: storage.publicProviders() };
   });
 
-  // ---- Token Usage Statistics
+  // ---- Token Usage Statistics & 2-Tier Limits (no reset allowed to protect limits)
   ipcMain.handle('usage:get', () => storage.getUsageStats());
-  ipcMain.handle('usage:reset', () => storage.resetUsageStats());
 
   // ---- Artifact Save & External Preview
   ipcMain.handle('artifact:save', async (_, art) => {
@@ -426,6 +431,7 @@ function registerIpc() {
       chat = storage.createChat({
         title: prompt.slice(0, 56) + (prompt.length > 56 ? '…' : ''),
         mode,
+        projectId: payload?.projectId !== undefined ? String(payload.projectId || '') : (storage.getSettings().activeProjectId || ''),
       });
     }
     if (chat.messages.length === 0) {
@@ -446,7 +452,7 @@ function registerIpc() {
 
     const controller = new AbortController();
     ACTIVE_RUNS.set(chat.id, controller);
-    emit('chat', { chat: { id: chat.id, title: chat.title, mode: chat.mode }, userMessage: userMsg });
+    emit('chat', { chat: { id: chat.id, title: chat.title, mode: chat.mode, projectId: chat.projectId || '' }, userMessage: userMsg });
 
     try {
       const result = await copilot.runCoworkTurn({
@@ -456,6 +462,8 @@ function registerIpc() {
         prompt,
         history: priorHistory,
         pinnedFiles: Array.isArray(payload?.pinnedFiles) ? payload.pinnedFiles : [],
+        images: Array.isArray(payload?.images) ? payload.images : [],
+        piiShieldOverride: payload?.piiShield,
         toolOverrides: payload?.toolOverrides || {},
         think,
         signal: controller.signal,
@@ -467,6 +475,15 @@ function registerIpc() {
           storage.saveNote(n);
         }
         emit('notes_saved', result.savedNotes);
+      }
+
+      if (result.savedTasks?.length) {
+        const added = [];
+        for (const t of result.savedTasks) {
+          const sv = storage.saveTask({ ...t, source: chat.title || 'Chat' });
+          if (sv) added.push(sv);
+        }
+        if (added.length) emit('tasks_saved', added);
       }
 
       const activeProj = storage.getActiveProject();
@@ -502,6 +519,7 @@ function registerIpc() {
               image: cr.image,
               network: cr.network,
               mountMode: cr.mountMode,
+              execTarget: cr.execTarget || storage.getSettings().codeExecutionTarget || 'container',
               onOutput: (o) => {
                 if (!event.sender.isDestroyed()) event.sender.send('container:output', o);
               },
@@ -531,6 +549,7 @@ function registerIpc() {
         sources: result.sources,
         fileActions: result.fileActions || [],
         codeRuns: result.codeRuns || [],
+        shieldSummary: result.shieldSummary || null,
         ts: Date.now(),
       };
       chat.messages.push(assistantMsg);
@@ -701,12 +720,246 @@ function registerIpc() {
   ipcMain.handle('tools:gitInspect', (_, focus) => localTools.gitInspect(localFiles.getWorkspace(), focus || ''));
   ipcMain.handle('tools:systemInfo', () => localTools.systemInfo(localFiles.getWorkspace()));
   ipcMain.handle('tools:calcJs', (_, code) => localTools.evalSandboxedJs(code));
+
+  // ---- Visual Diff & Side-by-Side Document Compare (v1.6.0)
+  ipcMain.handle('diff:compareFiles', (_, { leftPath, rightPath }) => {
+    if (!leftPath || !rightPath) throw new Error('Select two files to compare');
+    return diffEngine.compareWorkspaceFiles(leftPath, rightPath);
+  });
+  ipcMain.handle('diff:previewAction', (_, action) => diffEngine.previewFileActionDiff(action));
+
+  // ---- CSV / Excel Table Parser for Data Desk Viewer
+  ipcMain.handle('files:parseTable', (_, relPath) => {
+    const f = localFiles.readFileContent(relPath, 240000);
+    const ext = path.extname(f.name || '').toLowerCase();
+    if (ext === '.xlsx') {
+      // localFiles.readFileContent extracts tab-separated rows per sheet
+      const rows = String(f.content || '')
+        .split(/\r?\n/)
+        .filter((l) => l.trim() && !l.startsWith('--- Sheet'))
+        .map((l) => l.split(/\t/));
+      return { path: f.path, name: f.name, delimiter: '\t', rows: rows.slice(0, 500), totalRows: rows.length };
+    }
+    const parsed = officeExport.parseCsvText(f.content || '');
+    return { path: f.path, name: f.name, delimiter: parsed.delimiter, rows: parsed.rows.slice(0, 500), totalRows: parsed.rows.length };
+  });
+
+  // ---- Real Office & PDF Exports (.docx, .xlsx, .pdf, .ics)
+  const slugify = (s, fallback = 'mx-cowork-export') =>
+    String(s || fallback).toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-|-$/g, '').slice(0, 50) || fallback;
+
+  ipcMain.handle('export:docx', async (_, { title, markdown }) => {
+    const res = await dialog.showSaveDialog(mainWindow, {
+      title: 'Export Word Document (.docx)',
+      defaultPath: path.join(localFiles.getWorkspace(), `${slugify(title, 'report')}.docx`),
+      filters: [{ name: 'Word Document', extensions: ['docx'] }],
+    });
+    if (res.canceled || !res.filePath) return { canceled: true };
+    const buf = officeExport.buildDocxBuffer(markdown || '', title || 'mx-Cowork Document');
+    fs.writeFileSync(res.filePath, buf);
+    return { canceled: false, filePath: res.filePath };
+  });
+
+  ipcMain.handle('export:xlsx', async (_, { title, markdown, sheets }) => {
+    const res = await dialog.showSaveDialog(mainWindow, {
+      title: 'Export Excel Workbook (.xlsx)',
+      defaultPath: path.join(localFiles.getWorkspace(), `${slugify(title, 'spreadsheet')}.xlsx`),
+      filters: [{ name: 'Excel Workbook', extensions: ['xlsx'] }],
+    });
+    if (res.canceled || !res.filePath) return { canceled: true };
+    const finalSheets = Array.isArray(sheets) && sheets.length
+      ? sheets
+      : officeExport.extractTablesFromMarkdown(markdown || '');
+    const buf = officeExport.buildXlsxBuffer(finalSheets);
+    fs.writeFileSync(res.filePath, buf);
+    return { canceled: false, filePath: res.filePath };
+  });
+
+  ipcMain.handle('export:pdf', async (_, { title, markdown, html }) => {
+    const res = await dialog.showSaveDialog(mainWindow, {
+      title: 'Export PDF Document',
+      defaultPath: path.join(localFiles.getWorkspace(), `${slugify(title, 'document')}.pdf`),
+      filters: [{ name: 'PDF Document', extensions: ['pdf'] }],
+    });
+    if (res.canceled || !res.filePath) return { canceled: true };
+    const docHtml = html || officeExport.buildPrintableHtml(markdown || '', title || 'mx-Cowork Report');
+    const tmpHtml = path.join(os.tmpdir(), `mx-cowork-pdf-${Date.now()}.html`);
+    fs.writeFileSync(tmpHtml, docHtml, 'utf8');
+    const printWin = new BrowserWindow({
+      show: false,
+      width: 960,
+      height: 1200,
+      webPreferences: { sandbox: true, contextIsolation: true },
+    });
+    try {
+      await printWin.loadFile(tmpHtml);
+      await new Promise((r) => setTimeout(r, 250));
+      const pdfBuf = await printWin.webContents.printToPDF({
+        printBackground: true,
+        pageSize: 'A4',
+        margins: { top: 0.4, bottom: 0.4, left: 0.4, right: 0.4 },
+      });
+      fs.writeFileSync(res.filePath, pdfBuf);
+      return { canceled: false, filePath: res.filePath };
+    } finally {
+      if (!printWin.isDestroyed()) printWin.destroy();
+      try { fs.unlinkSync(tmpHtml); } catch {}
+    }
+  });
+
+  ipcMain.handle('export:ics', async (_, evt) => {
+    const res = await dialog.showSaveDialog(mainWindow, {
+      title: 'Save Calendar Invite (.ics)',
+      defaultPath: path.join(localFiles.getWorkspace(), `${slugify(evt?.title, 'follow-up')}.ics`),
+      filters: [{ name: 'Calendar Invite', extensions: ['ics'] }],
+    });
+    if (res.canceled || !res.filePath) return { canceled: true };
+    const ics = officeExport.buildIcsText(evt || {});
+    fs.writeFileSync(res.filePath, ics, 'utf8');
+    return { canceled: false, filePath: res.filePath };
+  });
+
+  // ---- Reusable Slash Workflows Library
+  ipcMain.handle('workflows:list', () => ({ workflows: storage.listWorkflows() }));
+  ipcMain.handle('workflows:save', (_, wf) => ({ workflow: storage.saveWorkflow(wf || {}), workflows: storage.listWorkflows() }));
+  ipcMain.handle('workflows:delete', (_, id) => ({ ok: storage.deleteWorkflow(id), workflows: storage.listWorkflows() }));
+
+  // ---- Project Action Items / Tasks
+  ipcMain.handle('tasks:list', () => ({ tasks: storage.listTasks(storage.getSettings().activeProjectId || '') }));
+  ipcMain.handle('tasks:save', (_, task) => ({ task: storage.saveTask(task || {}), tasks: storage.listTasks(storage.getSettings().activeProjectId || '') }));
+  ipcMain.handle('tasks:toggle', (_, id) => ({ task: storage.toggleTask(id), tasks: storage.listTasks(storage.getSettings().activeProjectId || '') }));
+  ipcMain.handle('tasks:delete', (_, id) => ({ ok: storage.deleteTask(id), tasks: storage.listTasks(storage.getSettings().activeProjectId || '') }));
+
+  // ---- Drag & Drop Project / Chat Organization (v1.6.0)
+  ipcMain.handle('chats:moveToProject', (_, { chatId, projectId }) => {
+    const c = storage.moveChatToProject(chatId, projectId || '');
+    return { ok: Boolean(c), chat: c, chats: storage.listChats() };
+  });
+  ipcMain.handle('projects:reorder', (_, orderedIds) => {
+    const projects = storage.reorderProjects(Array.isArray(orderedIds) ? orderedIds : []);
+    return { ok: true, projects };
+  });
+  ipcMain.handle('projects:createFromPath', (_, folderPath) => {
+    const abs = path.resolve(String(folderPath || ''));
+    if (!fs.existsSync(abs) || !fs.statSync(abs).isDirectory()) {
+      throw new Error('Dropped item is not a local folder');
+    }
+    const saved = storage.saveProject({ name: path.basename(abs) || 'Project', path: abs, autoMapGraph: true });
+    storage.setActiveProject(saved.id);
+    return {
+      ok: true,
+      project: saved,
+      projects: storage.listProjects(),
+      activeProject: storage.getActiveProject(),
+      settings: storage.publicSettings(),
+    };
+  });
+
+  // ---- Private Document Knowledge Base (Local Semantic BM25 Search)
+  ipcMain.handle('kb:stats', () => docIndex.getIndexStats(localFiles.getWorkspace()));
+  ipcMain.handle('kb:index', async (event) => {
+    return docIndex.indexWorkspaceDocs(localFiles.getWorkspace(), {
+      onProgress: (p) => {
+        if (!event.sender.isDestroyed()) event.sender.send('kb:progress', p);
+      },
+    });
+  });
+  ipcMain.handle('kb:query', (_, { query, topK }) => docIndex.queryWorkspaceDocs(query || '', localFiles.getWorkspace(), { topK: topK || 6, autoBuild: true }));
+
+  // ---- Local Scheduled Automations & Folder Watchers
+  ipcMain.handle('automations:list', () => ({ automations: automations.listAutomations() }));
+  ipcMain.handle('automations:save', (_, rule) => ({ automation: automations.saveAutomation(rule || {}), automations: automations.listAutomations() }));
+  ipcMain.handle('automations:toggle', (_, id) => ({ automation: automations.toggleAutomation(id), automations: automations.listAutomations() }));
+  ipcMain.handle('automations:delete', (_, id) => ({ ok: automations.deleteAutomation(id), automations: automations.listAutomations() }));
+  ipcMain.handle('automations:runNow', (_, id) => automations.executeAutomation(id, 'Manual run'));
+
+  // ---- OS Clipboard Read (Text + Screenshot Image)
+  ipcMain.handle('clipboard:read', () => {
+    const text = clipboard.readText() || '';
+    const img = clipboard.readImage();
+    let image = null;
+    if (img && !img.isEmpty()) {
+      const png = img.toPNG();
+      if (png.length && png.length <= 8 * 1024 * 1024) {
+        image = { mimeType: 'image/png', data: png.toString('base64'), name: `clipboard-${Date.now()}.png` };
+      }
+    }
+    return { text, image };
+  });
+}
+
+function showAndFocusWindow(quickAsk = false) {
+  if (!mainWindow || mainWindow.isDestroyed()) {
+    createWindow();
+  }
+  if (mainWindow.isMinimized()) mainWindow.restore();
+  mainWindow.show();
+  mainWindow.focus();
+  if (quickAsk) {
+    const text = (clipboard.readText() || '').trim();
+    sendMenuAction('quick-ask-clipboard', { text: text.slice(0, 8000) });
+  }
+}
+
+function setupTrayAndHotkey() {
+  if (process.argv.includes('--self-test')) return;
+  // System Tray
+  try {
+    const iconPath = path.join(__dirname, '..', 'build', 'icon.png');
+    if (fs.existsSync(iconPath) && !appTray) {
+      const trayImg = nativeImage.createFromPath(iconPath).resize({ width: 18, height: 18 });
+      appTray = new Tray(trayImg);
+      appTray.setToolTip('mx-Cowork — Local AI Copilot (Alt+Space Quick Ask)');
+      appTray.setContextMenu(Menu.buildFromTemplate([
+        { label: 'Show mx-Cowork', click: () => showAndFocusWindow(false) },
+        { label: 'Quick Ask Clipboard (Alt+Space)', click: () => showAndFocusWindow(true) },
+        { type: 'separator' },
+        { label: 'New Task', click: () => { showAndFocusWindow(false); sendMenuAction('new-task'); } },
+        { label: 'Compare 2 Files…', click: () => { showAndFocusWindow(false); sendMenuAction('open-compare'); } },
+        { label: 'Settings…', click: () => { showAndFocusWindow(false); sendMenuAction('open-settings'); } },
+        { type: 'separator' },
+        { label: 'Quit mx-Cowork', click: () => app.quit() },
+      ]));
+      appTray.on('click', () => showAndFocusWindow(false));
+    }
+  } catch {}
+
+  // Global Quick-Ask Shortcut (Alt+Space default)
+  try {
+    if (registeredHotkey) {
+      globalShortcut.unregister(registeredHotkey);
+      registeredHotkey = '';
+    }
+    const hotkey = String(storage.getSettings().globalHotkey || 'Alt+Space').trim();
+    if (hotkey) {
+      const ok = globalShortcut.register(hotkey, () => showAndFocusWindow(true));
+      if (ok) registeredHotkey = hotkey;
+    }
+  } catch {}
 }
 
 app.whenReady().then(() => {
   buildAppMenu();
   registerIpc();
   createWindow();
+  setupTrayAndHotkey();
+
+  if (!process.argv.includes('--self-test')) {
+    automations.initScheduler(
+      (rule, fullPrompt) => copilot.runCoworkTurn({
+        mode: rule.mode || 'fast',
+        chatTitle: `[Auto] ${rule.name}`,
+        prompt: fullPrompt,
+        think: 'off',
+        onEvent: () => {},
+      }),
+      (info) => {
+        if (mainWindow && !mainWindow.isDestroyed()) {
+          mainWindow.webContents.send('automations:event', info);
+        }
+      }
+    );
+  }
 
   if (process.argv.includes('--self-test')) {
     mainWindow.webContents.once('did-finish-load', async () => {
@@ -717,6 +970,7 @@ app.whenReady().then(() => {
             const set = await window.cowork.getSettings();
             const presets = await window.cowork.getProviderPresets();
             const upd = await window.cowork.checkUpdate({ force: false });
+            const wfs = await window.cowork.listWorkflows();
             return {
               hasApi: typeof window.cowork === 'object',
               app: info.app,
@@ -735,6 +989,15 @@ app.whenReady().then(() => {
               hasAutoEditPill: Boolean(document.querySelector('#autoAcceptTopPill')),
               hasArtifactCanvas: Boolean(document.querySelector('[data-pane="artifact"]')),
               hasUsageApi: typeof window.cowork.getUsage === 'function',
+              hasDiffApi: typeof window.cowork.compareFiles === 'function' && Boolean(document.querySelector('#compareModal')),
+              hasExportApi: typeof window.cowork.exportDocx === 'function' && typeof window.cowork.exportXlsx === 'function' && typeof window.cowork.exportPdf === 'function' && typeof window.cowork.exportIcs === 'function',
+              hasWorkflowsApi: (wfs.workflows || []).length >= 8,
+              hasTasksApi: typeof window.cowork.listTasks === 'function' && Boolean(document.querySelector('#tasksList')),
+              hasPiiShield: Boolean(document.querySelector('#shieldToggleBtn')),
+              hasKbApi: typeof window.cowork.queryKb === 'function',
+              hasAutomationsApi: typeof window.cowork.listAutomations === 'function',
+              hasMoveChatApi: typeof window.cowork.moveChatToProject === 'function',
+              hasUsageResetDisabled: typeof window.cowork.resetUsage === 'undefined',
               hasUpdateBtn: Boolean(document.querySelector('#openUpdatesBtn')),
               hasUpdateModal: Boolean(document.querySelector('#updatesModal')),
               updaterOk: upd.ok,
@@ -755,6 +1018,11 @@ app.whenReady().then(() => {
   app.on('activate', () => {
     if (BrowserWindow.getAllWindows().length === 0) createWindow();
   });
+});
+
+app.on('will-quit', () => {
+  try { globalShortcut.unregisterAll(); } catch {}
+  try { automations.stopAllSchedulers(); } catch {}
 });
 
 app.on('window-all-closed', () => {

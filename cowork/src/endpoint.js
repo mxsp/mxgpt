@@ -364,6 +364,7 @@ async function chatCompletion({
   model = '',
   systemPrompt = '',
   messages = [],
+  images = [],
   think = 'off',
   priority = '',
   signal,
@@ -372,12 +373,16 @@ async function chatCompletion({
   const cfg = storage.getSettings();
   const chosenModel = model || (tier === 'smart' ? cfg.smartModel : cfg.fastModel);
   const effectivePriority = priority || (tier === 'fast' ? 'fast' : 'smart');
+  const cleanImages = Array.isArray(images)
+    ? images.filter((i) => i && i.data).slice(0, 4)
+    : [];
 
   if (cfg.endpointType === 'ollama') {
     return chatViaOllama(cfg, {
       model: chosenModel,
       systemPrompt,
       messages,
+      images: cleanImages,
       think,
       priority: effectivePriority,
       signal,
@@ -389,6 +394,7 @@ async function chatCompletion({
       model: chosenModel,
       systemPrompt,
       messages,
+      images: cleanImages,
       think,
       signal,
       onEvent,
@@ -399,6 +405,7 @@ async function chatCompletion({
       model: chosenModel,
       systemPrompt,
       messages,
+      images: cleanImages,
       think,
       signal,
       onEvent,
@@ -408,22 +415,35 @@ async function chatCompletion({
     model: chosenModel,
     systemPrompt,
     messages,
+    images: cleanImages,
     think,
     signal,
     onEvent,
   });
 }
 
-async function chatViaOpenAI(cfg, { model, systemPrompt, messages, signal, onEvent }) {
+async function chatViaOpenAI(cfg, { model, systemPrompt, messages, images = [], signal, onEvent }) {
   const base = normalizeOpenAIBase(cfg.endpointUrl);
   const fullMsgs = [];
   if (systemPrompt) fullMsgs.push({ role: 'system', content: systemPrompt });
-  for (const m of messages) {
-    fullMsgs.push({
-      role: m.role === 'assistant' ? 'assistant' : 'user',
-      content: String(m.content || ''),
-    });
-  }
+  messages.forEach((m, idx) => {
+    const role = m.role === 'assistant' ? 'assistant' : 'user';
+    const isLastUser = idx === messages.length - 1 && role === 'user' && images.length > 0;
+    if (isLastUser) {
+      fullMsgs.push({
+        role,
+        content: [
+          { type: 'text', text: String(m.content || '') },
+          ...images.map((im) => ({
+            type: 'image_url',
+            image_url: { url: `data:${im.mimeType || 'image/png'};base64,${im.data}` },
+          })),
+        ],
+      });
+    } else {
+      fullMsgs.push({ role, content: String(m.content || '') });
+    }
+  });
 
   const body = {
     model,
@@ -510,7 +530,7 @@ async function chatViaOpenAI(cfg, { model, systemPrompt, messages, signal, onEve
   };
 }
 
-async function chatViaAnthropic(cfg, { model, systemPrompt, messages, signal, onEvent }) {
+async function chatViaAnthropic(cfg, { model, systemPrompt, messages, images = [], signal, onEvent }) {
   if (!cfg.apiKey) throw new Error('Anthropic API key is required (open Settings).');
   const base = normalizeAnthropicBase(cfg.endpointUrl || 'https://api.anthropic.com');
 
@@ -528,6 +548,16 @@ async function chatViaAnthropic(cfg, { model, systemPrompt, messages, signal, on
   }
   if (!cleanMsgs.length || cleanMsgs[0].role !== 'user') {
     cleanMsgs.unshift({ role: 'user', content: 'Hello.' });
+  }
+  if (images.length && cleanMsgs[cleanMsgs.length - 1].role === 'user') {
+    const last = cleanMsgs[cleanMsgs.length - 1];
+    last.content = [
+      ...images.map((im) => ({
+        type: 'image',
+        source: { type: 'base64', media_type: im.mimeType || 'image/png', data: im.data },
+      })),
+      { type: 'text', text: String(last.content || '') },
+    ];
   }
 
   const body = {
@@ -617,12 +647,16 @@ async function chatViaAnthropic(cfg, { model, systemPrompt, messages, signal, on
   };
 }
 
-async function chatViaOllama(cfg, { model, systemPrompt, messages, think, priority, signal, onEvent }) {
+async function chatViaOllama(cfg, { model, systemPrompt, messages, images = [], think, priority, signal, onEvent }) {
   const fullMsgs = [];
   if (systemPrompt) fullMsgs.push({ role: 'system', content: systemPrompt });
-  for (const m of messages) {
-    fullMsgs.push({ role: m.role, content: String(m.content || '') });
-  }
+  messages.forEach((m, idx) => {
+    const item = { role: m.role, content: String(m.content || '') };
+    if (idx === messages.length - 1 && m.role === 'user' && images.length > 0) {
+      item.images = images.map((im) => im.data);
+    }
+    fullMsgs.push(item);
+  });
 
   const body = {
     model,
@@ -711,7 +745,7 @@ async function chatViaOllama(cfg, { model, systemPrompt, messages, think, priori
   };
 }
 
-async function chatViaMxgpt(cfg, { model, systemPrompt, messages, think, signal, onEvent }) {
+async function chatViaMxgpt(cfg, { model, systemPrompt, messages, images = [], think, signal, onEvent }) {
   const t0 = Date.now();
   // Create a temporary remote chat with custom systemPrompt so we get clean,
   // isolated coworker turns with zero cross-contamination, then delete it in finally.
@@ -770,6 +804,7 @@ async function chatViaMxgpt(cfg, { model, systemPrompt, messages, think, signal,
         chatId: remoteChatId,
         model,
         content: promptText,
+        ...(images.length ? { images: images.map((im) => im.data) } : {}),
         useWeb: false,
         useTools: false,
         useSubagents: false,

@@ -50,6 +50,19 @@ const S = {
   artifactTab: 'preview',
   artifactUserPickedTab: false,
   savedProviders: [],
+  attachedImages: [], // { id, name, mimeType, data }
+  piiShield: false,
+  workflows: [],
+  slashIndex: 0,
+  tasks: [],
+  quickClipText: '',
+  lastCompare: null,
+  editorTable: null,
+  editorTableMode: false,
+  activeStreams: new Map(), // streamId -> per-chat live stream state (supports concurrent multi-model runs!)
+  viewingTempStreamId: null,
+  expandedProjects: new Set(),
+  automations: [],
 };
 
 function esc(s) {
@@ -394,6 +407,7 @@ function renderMd(raw, opts = {}) {
     .replace(/```file-actions[\s\S]*?```/gi, '')
     .replace(/```code-run[\s\S]*?```/gi, '')
     .replace(/```memory-save[\s\S]*?```/gi, '')
+    .replace(/```action-items[\s\S]*?```/gi, '')
     .trim();
   if (!src) return '';
 
@@ -521,7 +535,7 @@ const PANEL_META = {
   files: { title: 'OS Files & Editor', icon: '#i-folder' },
   graph: { title: 'Project Knowledge Graph', icon: '#i-graph' },
   container: { title: 'Container Sandbox', icon: '#i-box' },
-  notes: { title: 'Notes & Local Tools', icon: '#i-book' },
+  notes: { title: 'Tasks, Notes & Tools', icon: '#i-book' },
   research: { title: 'Research Desk', icon: '#i-globe' },
   undo: { title: 'Undo History', icon: '#i-undo' },
 };
@@ -552,8 +566,8 @@ function openPanel(tab, toggleIfSame = false) {
   if (tab === 'files' && !S.editor) loadFiles(S.cwd);
   if (tab === 'graph') ensureGraphLoaded();
   if (tab === 'container') { loadContainerStatus(false); loadContainerHistory(); }
-  if (tab === 'notes') loadNotes();
-  if (tab === 'research') loadBriefs();
+  if (tab === 'notes') { loadTasks(); loadAutomations(); loadNotes(); }
+  if (tab === 'research') { loadKbStats(); loadBriefs(); }
   if (tab === 'undo') loadUndo();
 }
 
@@ -664,16 +678,18 @@ async function boot() {
   S.projects = projData?.projects || [];
   S.activeProject = projData?.activeProject || null;
 
-  $('#appVersionBadge').textContent = `v${info.version || '1.5.0'}`;
+  $('#appVersionBadge').textContent = `v${info.version || '1.6.0'}`;
   applyThemeUI(S.settings.theme || 'light');
   setMode(S.settings.defaultMode || 'copilot');
   setThink(S.settings.think || 'low');
   S.toolWebSearch = S.settings.toolWebSearch !== false;
   S.toolOsFiles = S.settings.toolOsFiles !== false;
   S.containerEnabled = S.settings.toolContainer !== false && S.settings.containerEnabled !== false;
+  S.piiShield = Boolean(S.settings.piiShieldEnabled);
   $('#webToggleBtn').classList.toggle('on', S.toolWebSearch);
   $('#filesToggleBtn').classList.toggle('on', S.toolOsFiles);
   $('#containerToggleBtn').classList.toggle('on', S.containerEnabled);
+  $('#shieldToggleBtn').classList.toggle('on', S.piiShield);
   $('#ctImage').value = S.settings.containerImage || 'python:3.12-slim';
   $('#ctNet').value = S.settings.containerNetwork || 'none';
   $('#ctMount').value = S.settings.containerMountMode || 'rw';
@@ -686,10 +702,25 @@ async function boot() {
     showLoginScreen();
   }
 
-  await Promise.all([loadChats(), loadFiles(''), loadNotes(), loadBriefs(), loadUndo()]);
+  await Promise.all([loadChats(), loadFiles(''), loadNotes(), loadTasks(), loadWorkflows(), loadAutomations(), loadKbStats(), loadBriefs(), loadUndo()]);
   checkConnectionQuiet();
   checkUpdatesQuiet();
   loadContainerStatus(false);
+
+  // Single persistent global Cowork stream router (allows multiple chats & models to run simultaneously!)
+  CW.onCoworkEvent((pkt) => handleGlobalCoworkEvent(pkt));
+  CW.onAutomationEvent((info) => {
+    loadAutomations();
+    loadBriefs();
+    if (info?.type === 'ran') toast(`Automation finished: ${info.automation?.name}`);
+    else if (info?.type === 'error') toast(`Automation failed: ${info.error}`, 4500);
+  });
+  CW.onKbProgress((p) => {
+    const el = $('#kbStatus');
+    if (el) el.textContent = `Indexing ${p.current}/${p.total}: ${p.file}`;
+  });
+  $('#ctExecTarget').value = S.settings.codeExecutionTarget || 'container';
+  syncCodeExecTargetUI();
 
   CW.onUpdateProgress((p) => renderUpdateProgress(p));
   CW.onContainerOutput((ev) => handleContainerOutputChunk(ev));
@@ -718,6 +749,8 @@ async function boot() {
     else if (action === 'pick-folder') pickWorkspaceFolder();
     else if (action === 'open-settings') openSettings();
     else if (action === 'open-updates') openUpdatesModal();
+    else if (action === 'open-compare') openCompareModal();
+    else if (action === 'quick-ask-clipboard') showQuickClipBar(payload?.text || '');
     else if (action === 'set-mode') setMode(payload);
     else if (action === 'toggle-drawer') S.panelOpen ? closePanel() : openPanel(S.panelTab || 'files');
     else if (action === 'toggle-theme') toggleTheme();
@@ -763,41 +796,192 @@ function renderAutoAcceptPill() {
   pill.textContent = on ? 'Auto-Edit: ON' : 'Auto-Edit: Off';
 }
 
+function isChatStreaming(chatId) {
+  if (!chatId) return false;
+  for (const st of S.activeStreams.values()) {
+    if (st.chatId === chatId) return true;
+  }
+  return false;
+}
+
+function getStreamForCurrentView() {
+  if (S.chat?.id) {
+    for (const st of S.activeStreams.values()) {
+      if (st.chatId === S.chat.id) return st;
+    }
+  }
+  if (S.viewingTempStreamId) {
+    return S.activeStreams.get(S.viewingTempStreamId) || null;
+  }
+  return null;
+}
+
+function updateSendButtonState() {
+  const curStream = getStreamForCurrentView();
+  const busy = Boolean(curStream);
+  $('#sendBtn').classList.toggle('stop', busy);
+  $('#sendIcon use').setAttribute('href', busy ? '#i-stop' : '#i-send');
+  $('#sendBtn').title = busy ? 'Stop generating in this chat' : 'Send (Enter)';
+}
+
+function createChatRowEl(c) {
+  const row = document.createElement('div');
+  const active = S.chat?.id === c.id;
+  const live = isChatStreaming(c.id);
+  row.className = 'chat-item' + (active ? ' active' : '');
+  row.draggable = true;
+  row.dataset.chatId = c.id;
+  row.innerHTML = `${live ? '<span class="chat-live-dot" title="Generating…"></span>' : ''}<span class="ci-title">${esc(c.title)}</span><button class="ci-del" title="Delete chat"><svg><use href="#i-trash"/></svg></button>`;
+
+  row.addEventListener('dragstart', (e) => {
+    e.stopPropagation();
+    row.classList.add('dragging');
+    e.dataTransfer.effectAllowed = 'move';
+    e.dataTransfer.setData('application/x-mxcw-chat', c.id);
+    e.dataTransfer.setData('text/plain', c.id);
+  });
+  row.addEventListener('dragend', () => {
+    row.classList.remove('dragging');
+    $$('.drag-over').forEach((x) => x.classList.remove('drag-over'));
+  });
+  row.onclick = (e) => {
+    if (e.target.closest('.ci-del')) return;
+    openChat(c.id);
+  };
+  row.querySelector('.ci-del').onclick = async (e) => {
+    e.stopPropagation();
+    if (isChatStreaming(c.id)) CW.stopCowork(c.id).catch(() => {});
+    await CW.deleteChat(c.id);
+    if (S.chat?.id === c.id) { S.chat = null; S.messages = []; renderMessages(); updateSendButtonState(); }
+    loadChats();
+  };
+  return row;
+}
+
 function renderProjectsList() {
   const list = $('#projectsList');
   list.innerHTML = '';
+  const q = S.chatSearch.trim().toLowerCase();
+  if (S.activeProject?.id) S.expandedProjects.add(S.activeProject.id);
+
   if (!S.projects.length) {
-    list.innerHTML = '<div class="proj-empty">Click <b>+ Add</b> to create a project with auto Knowledge Graph &amp; workspace rules.</div>';
+    list.innerHTML = '<div class="proj-empty">Click <b>+ Add</b> or drop a folder here to organize project chats &amp; Knowledge Graphs.</div>';
     return;
   }
+
   for (const p of S.projects) {
     const active = S.activeProject?.id === p.id;
+    const projChats = S.chats.filter((c) => c.projectId === p.id && (!q || (c.title || '').toLowerCase().includes(q) || (p.name || '').toLowerCase().includes(q)));
+    const isOpen = S.expandedProjects.has(p.id) || Boolean(q && projChats.length);
+
+    const group = document.createElement('div');
+    group.className = 'proj-group' + (isOpen ? ' open' : '');
+    group.draggable = true;
+    group.dataset.projId = p.id;
+
     const row = document.createElement('div');
     row.className = 'proj-item' + (active ? ' active' : '');
     const badges = [
-      p.graphStats?.fileCount ? `${p.graphStats.fileCount} files` : p.path.split(/[\\/]/).slice(-2).join('/'),
+      p.graphStats?.fileCount ? `${p.graphStats.fileCount} files` : p.path.split(/[\\/]/).slice(-1)[0],
       p.autoAcceptEdits ? 'auto-edit' : '',
     ].filter(Boolean).join(' · ');
+
     row.innerHTML = `
+      <span class="proj-chev"><svg><use href="#i-chevron-right"/></svg></span>
       <span class="proj-dot" style="background:${esc(p.color || '#c96442')}"></span>
       <span class="proj-meta">
         <span class="proj-name" title="${esc(p.path)}">${esc(p.name)}</span>
         <span class="proj-sub">${esc(badges)}</span>
       </span>
-      <button type="button" class="proj-edit-btn" title="Project workspace settings"><svg><use href="#i-settings"/></svg></button>`;
+      <span class="proj-cnt" title="${projChats.length} chat(s)">${projChats.length}</span>
+      <button type="button" class="proj-act-btn" data-pact="newchat" title="New chat inside ${esc(p.name)}"><svg><use href="#i-plus"/></svg></button>
+      <button type="button" class="proj-act-btn" data-pact="settings" title="Project workspace settings"><svg><use href="#i-settings"/></svg></button>`;
+
     row.onclick = (e) => {
-      if (e.target.closest('.proj-edit-btn')) return;
-      selectProjectById(p.id);
+      if (e.target.closest('.proj-act-btn')) return;
+      if (active) {
+        if (S.expandedProjects.has(p.id)) S.expandedProjects.delete(p.id);
+        else S.expandedProjects.add(p.id);
+        renderProjectsList();
+      } else {
+        S.expandedProjects.add(p.id);
+        selectProjectById(p.id);
+      }
     };
-    row.querySelector('.proj-edit-btn').onclick = (e) => {
+    row.querySelector('[data-pact="newchat"]').onclick = async (e) => {
+      e.stopPropagation();
+      S.expandedProjects.add(p.id);
+      if (S.activeProject?.id !== p.id) await selectProjectById(p.id, true);
+      newChat(p.id);
+    };
+    row.querySelector('[data-pact="settings"]').onclick = (e) => {
       e.stopPropagation();
       openProjectModal(p);
     };
-    list.appendChild(row);
+
+    // Drag project to reorder OR drop a chat onto this project to move it inside!
+    group.addEventListener('dragstart', (e) => {
+      if (e.target.closest('.chat-item')) return;
+      group.classList.add('dragging');
+      e.dataTransfer.effectAllowed = 'move';
+      e.dataTransfer.setData('application/x-mxcw-project', p.id);
+    });
+    group.addEventListener('dragend', () => {
+      group.classList.remove('dragging');
+      $$('.drag-over').forEach((x) => x.classList.remove('drag-over'));
+    });
+    group.addEventListener('dragover', (e) => {
+      e.preventDefault();
+      e.stopPropagation();
+      group.classList.add('drag-over');
+    });
+    group.addEventListener('dragleave', (e) => {
+      if (!group.contains(e.relatedTarget)) group.classList.remove('drag-over');
+    });
+    group.addEventListener('drop', async (e) => {
+      e.preventDefault();
+      e.stopPropagation();
+      group.classList.remove('drag-over');
+      const chatId = e.dataTransfer.getData('application/x-mxcw-chat');
+      const dragProjId = e.dataTransfer.getData('application/x-mxcw-project');
+      if (chatId) {
+        const res = await CW.moveChatToProject({ chatId, projectId: p.id });
+        S.chats = res.chats || S.chats;
+        if (S.chat?.id === chatId) S.chat.projectId = p.id;
+        S.expandedProjects.add(p.id);
+        renderSidebarTree();
+        toast(`Moved chat → ${p.name}`);
+      } else if (dragProjId && dragProjId !== p.id) {
+        const ids = S.projects.map((x) => x.id).filter((id) => id !== dragProjId);
+        const targetIdx = ids.indexOf(p.id);
+        ids.splice(targetIdx >= 0 ? targetIdx : ids.length, 0, dragProjId);
+        const r = await CW.reorderProjects(ids);
+        S.projects = r.projects || S.projects;
+        renderSidebarTree();
+      }
+    });
+
+    const chatsWrap = document.createElement('div');
+    chatsWrap.className = 'proj-chats';
+    if (!projChats.length) {
+      chatsWrap.innerHTML = '<div class="proj-chat-empty">Drop a chat here or click +</div>';
+    } else {
+      for (const c of projChats) {
+        chatsWrap.appendChild(createChatRowEl(c));
+      }
+    }
+
+    group.append(row, chatsWrap);
+    list.appendChild(group);
   }
 }
 
-async function selectProjectById(id) {
+function renderSidebarTree() {
+  renderProjectsList();
+  renderChatList();
+}
+
+async function selectProjectById(id, quiet = false) {
   try {
     const r = await CW.selectProject(id);
     S.activeProject = r.activeProject;
@@ -809,11 +993,14 @@ async function selectProjectById(id) {
     $('#ctImage').value = S.settings.containerImage || 'python:3.12-slim';
     $('#ctNet').value = S.settings.containerNetwork || 'none';
     $('#ctMount').value = S.settings.containerMountMode || 'rw';
-    renderProjectsList();
+    S.expandedProjects.add(id);
+    renderSidebarTree();
     renderWorkspaceUI();
     renderAutoAcceptPill();
     renderPinned();
     loadFiles('');
+    loadTasks();
+    loadKbStats();
 
     if (r.cachedGraph) {
       S.graphData = r.cachedGraph;
@@ -822,7 +1009,7 @@ async function selectProjectById(id) {
       S.graphData = null;
     }
 
-    toast(`Project → ${S.activeProject.name}`);
+    if (!quiet) toast(`Project → ${S.activeProject.name}`);
     if (S.activeProject.autoMapGraph) {
       const stale = !r.cachedGraph || (Date.now() - (r.cachedGraph.mappedAt || r.cachedGraph.builtAt || 0) > 5 * 60 * 1000);
       if (stale) triggerBackgroundGraphMap(S.activeProject);
@@ -930,16 +1117,28 @@ function chatGroupLabel(ts) {
 async function loadChats() {
   const d = await CW.listChats();
   S.chats = d.chats || [];
-  renderChatList();
+  renderSidebarTree();
 }
 
 function renderChatList() {
   const list = $('#chatList');
   const q = S.chatSearch.trim().toLowerCase();
-  const filtered = q ? S.chats.filter((c) => (c.title || '').toLowerCase().includes(q)) : S.chats;
+  const projectIds = new Set(S.projects.map((p) => p.id));
+  // Show chats not assigned to any existing project in the General Chats section
+  const unassigned = S.chats.filter((c) => !c.projectId || !projectIds.has(c.projectId));
+  const filtered = q ? unassigned.filter((c) => (c.title || '').toLowerCase().includes(q)) : unassigned;
   list.innerHTML = '';
+
+  const hdr = document.createElement('div');
+  hdr.className = 'sb-label';
+  hdr.textContent = 'General Chats';
+  list.appendChild(hdr);
+
   if (!filtered.length) {
-    list.innerHTML = `<div class="sb-empty">${q ? 'No matching chats' : 'No conversations yet'}</div>`;
+    const empty = document.createElement('div');
+    empty.className = 'sb-empty';
+    empty.textContent = q ? 'No matching general chats' : 'Drop a chat here to unassign from a project';
+    list.appendChild(empty);
     return;
   }
 
@@ -953,50 +1152,82 @@ function renderChatList() {
       lbl.textContent = grp;
       list.appendChild(lbl);
     }
-    const row = document.createElement('div');
-    row.className = 'chat-item' + (S.chat?.id === c.id ? ' active' : '');
-    row.innerHTML = `<span class="ci-title">${esc(c.title)}</span><button class="ci-del" title="Delete chat"><svg><use href="#i-trash"/></svg></button>`;
-    row.onclick = (e) => {
-      if (e.target.closest('.ci-del')) return;
-      openChat(c.id);
-    };
-    row.querySelector('.ci-del').onclick = async (e) => {
-      e.stopPropagation();
-      await CW.deleteChat(c.id);
-      if (S.chat?.id === c.id) { S.chat = null; S.messages = []; renderMessages(); }
-      loadChats();
-    };
-    list.appendChild(row);
+    list.appendChild(createChatRowEl(c));
   }
 }
 
-async function openChat(id) {
-  const d = await CW.getChat(id);
-  S.chat = d.chat;
-  S.messages = d.chat.messages || [];
-  $('#chatTitle').textContent = d.chat.title || 'New chat';
-  if (d.chat.mode) setMode(d.chat.mode);
-  renderMessages();
-  renderChatList();
+function reattachActiveStreamDom(st) {
+  if (!st) return;
+  const live = mountLiveAssistantDom(st.assistant.livePhase || 'Working…');
+  st.live = live;
+  if (!st.assistant.livePhase) live.phaseEl.hidden = true;
+  if (st.assistant.queuePos) live.phaseEl.className = 'loading-state queued';
+  if (st.assistant.plan || st.assistant.workers?.length) {
+    const cp = renderCopilotPanel(st.assistant);
+    if (cp) { live.planSlot.hidden = false; live.planSlot.appendChild(cp); }
+  }
+  if (st.assistant.thinking) {
+    live.thinkEl.hidden = false;
+    live.thinkSummary.textContent = `Thinking (${st.assistant.thinking.length} chars)`;
+    live.thinkPre.textContent = st.assistant.thinking;
+    live.thinkPre.scrollTop = live.thinkPre.scrollHeight;
+  }
+  if (st.assistant.content) {
+    live.proseEl.hidden = false;
+    live.proseEl.innerHTML = renderMd(st.assistant.content, { msgKey: st.streamId, isStreaming: true });
+  }
+  scrollFeedIfNearBottom(true);
 }
 
-function newChat() {
-  S.chat = null;
+async function openChat(id) {
+  // Detach live DOM pointers on any background streams without stopping them!
+  for (const st of S.activeStreams.values()) st.live = null;
+  S.viewingTempStreamId = null;
+
+  const d = await CW.getChat(id);
+  S.chat = d.chat;
+  // If this chat belongs to a project, quietly activate that project so workspace & graph stay in sync
+  if (d.chat.projectId && S.activeProject?.id !== d.chat.projectId && S.projects.some((p) => p.id === d.chat.projectId)) {
+    await selectProjectById(d.chat.projectId, true);
+  }
+  S.messages = [...(d.chat.messages || [])];
+  $('#chatTitle').textContent = d.chat.title || 'New chat';
+  if (d.chat.mode) setMode(d.chat.mode);
+
+  const activeSt = [...S.activeStreams.values()].find((x) => x.chatId === id);
+  renderMessages(true);
+  if (activeSt) {
+    reattachActiveStreamDom(activeSt);
+  }
+  renderSidebarTree();
+  updateSendButtonState();
+}
+
+function newChat(projectIdOverride = undefined) {
+  for (const st of S.activeStreams.values()) st.live = null;
+  S.viewingTempStreamId = null;
+  const pid = typeof projectIdOverride === 'string' ? projectIdOverride : undefined;
+  S.chat = pid !== undefined ? { id: null, projectId: pid } : null;
   S.messages = [];
   $('#chatTitle').textContent = 'New chat';
-  renderMessages();
-  renderChatList();
+  renderMessages(true);
+  renderSidebarTree();
+  updateSendButtonState();
   $('#promptInput').focus();
 }
 
 // ---- Messages Rendering (exact mx-GPT webapp layout)
 function renderPinned() {
   const bar = $('#pinnedBar');
-  if (!S.pinnedFiles.length) { bar.hidden = true; bar.innerHTML = ''; return; }
+  if (!S.pinnedFiles.length && !S.attachedImages.length) { bar.hidden = true; bar.innerHTML = ''; return; }
   bar.hidden = false;
-  bar.innerHTML = S.pinnedFiles.map((p) =>
+  const filePills = S.pinnedFiles.map((p) =>
     `<span class="attach-pill"><svg style="width:14px;height:14px;color:var(--accent)"><use href="#i-file"/></svg><span title="${esc(p)}">${esc(p)}</span><button data-unpin="${esc(p)}" title="Remove"><svg style="width:12px;height:12px"><use href="#i-x"/></svg></button></span>`
   ).join('');
+  const imgPills = S.attachedImages.map((im) =>
+    `<span class="img-attach-pill"><img src="data:${esc(im.mimeType)};base64,${im.data}" alt="screenshot" /><span>${esc(im.name)}</span><button data-unimg="${esc(im.id)}" title="Remove screenshot"><svg style="width:12px;height:12px"><use href="#i-x"/></svg></button></span>`
+  ).join('');
+  bar.innerHTML = filePills + imgPills;
   $$('[data-unpin]', bar).forEach((b) => {
     b.onclick = () => {
       S.pinnedFiles = S.pinnedFiles.filter((x) => x !== b.dataset.unpin);
@@ -1004,6 +1235,23 @@ function renderPinned() {
       if (S.panelOpen && S.panelTab === 'files' && !S.editor) loadFiles(S.cwd);
     };
   });
+  $$('[data-unimg]', bar).forEach((b) => {
+    b.onclick = () => {
+      S.attachedImages = S.attachedImages.filter((x) => x.id !== b.dataset.unimg);
+      renderPinned();
+    };
+  });
+}
+
+function renderDiffLinesHtml(diff) {
+  if (!diff) return '';
+  if (diff.identical) return '<div class="muted-note" style="padding:10px">Files are identical (0 changes).</div>';
+  const rows = (diff.lines || []).map((l) => {
+    if (l.type === 'sep') return `<div class="diff-line sep">${esc(l.text)}</div>`;
+    const sign = l.type === 'add' ? '+' : l.type === 'del' ? '−' : ' ';
+    return `<div class="diff-line ${esc(l.type)}"><span class="ln">${l.oldLine ?? ''}</span><span class="ln">${l.newLine ?? ''}</span><span class="sg">${sign}</span><span>${esc(l.text)}</span></div>`;
+  }).join('');
+  return rows || '<div class="muted-note" style="padding:10px">No visible diff lines.</div>';
 }
 
 function renderCopilotPanel(msg) {
@@ -1111,6 +1359,7 @@ function renderFileActionsCard(actions) {
         <div>${desc}</div>
         ${act.reason ? `<div class="ac-reason">${esc(act.reason)}</div>` : ''}
         ${act.result ? `<div class="ac-reason">${esc(act.result)}</div>` : ''}
+        ${act.diff ? `<details class="diff-box"><summary><span>${act.diff.exists ? 'Diff Preview' : 'New File Preview'}</span><span class="diff-stat-add">+${act.diff.added || 0}</span><span class="diff-stat-del">−${act.diff.removed || 0}</span></summary><div class="diff-viewer">${renderDiffLinesHtml(act.diff)}</div></details>` : ''}
       </div>
       <div class="row-gap"></div>`;
     const btns = row.querySelector('.row-gap');
@@ -1195,19 +1444,20 @@ function renderCodeRunsCard(runs) {
     const liveOut = S.containerRunOutputs[run.id] ?? run.output ?? '';
     const isRunning = run.status === 'running';
 
+    const isHost = (run.execTarget || S.settings?.codeExecutionTarget) === 'host';
     box.innerHTML = `
       <div class="ac-head">
         <div class="cr-badges">
-          <b style="font-size:12.5px">${esc(run.title || 'Container Run')}</b>
+          <b style="font-size:12.5px">${esc(run.title || 'Code Run')}</b>
+          <span class="cr-badge${isHost ? ' host' : ''}">${isHost ? 'HOST (On-Machine)' : 'CONTAINER'}</span>
           <span class="cr-badge">${esc(run.language || 'bash')}</span>
-          <span class="cr-badge">${esc(run.image || 'python:3.12-slim')}</span>
-          <span class="cr-badge">net:${esc(run.network || 'none')}</span>
-          <span class="cr-badge">${esc(run.mountMode || 'rw')}</span>
+          ${isHost ? '' : `<span class="cr-badge">${esc(run.image || 'python:3.12-slim')}</span><span class="cr-badge">net:${esc(run.network || 'none')}</span>`}
         </div>
         <div class="row-gap">
           ${isRunning
             ? `<button class="btn tiny danger" data-cr-stop>Stop</button>`
-            : `<button class="btn tiny primary" data-cr-run>${run.status === 'done' || run.status === 'error' ? 'Re-run' : 'Run in Container'}</button>`}
+            : `<button class="btn tiny primary" data-cr-run>${run.status === 'done' || run.status === 'error' ? 'Re-run' : (isHost ? 'Run on Host' : 'Run in Container')}</button>
+               <button class="btn tiny" data-cr-toggle-target title="Switch between Container and On-Machine Host execution">${isHost ? 'Use Container' : 'Run on Host'}</button>`}
           ${liveOut ? `<button class="btn tiny" data-cr-send>Send Output</button>` : ''}
         </div>
       </div>
@@ -1217,12 +1467,20 @@ function renderCodeRunsCard(runs) {
       ${run.status === 'error' ? `<span class="ac-stat err">✗ Exit ${run.exitCode ?? 1}</span>` : ''}
       ${liveOut ? `<pre class="cr-term" data-term-id="${esc(run.id)}">${esc(liveOut)}</pre>` : ''}`;
 
+    const togTargetBtn = box.querySelector('[data-cr-toggle-target]');
+    if (togTargetBtn) {
+      togTargetBtn.onclick = () => {
+        run.execTarget = isHost ? 'container' : 'host';
+        renderMessages(false);
+      };
+    }
+
     const runBtn = box.querySelector('[data-cr-run]');
     if (runBtn) {
       runBtn.onclick = async () => {
         run.status = 'running';
         S.containerRunOutputs[run.id] = '';
-        renderMessages();
+        renderMessages(false);
         try {
           const r = await CW.runInContainer({
             runId: run.id,
@@ -1233,6 +1491,7 @@ function renderCodeRunsCard(runs) {
             image: run.image,
             network: run.network,
             mountMode: run.mountMode,
+            execTarget: run.execTarget || S.settings?.codeExecutionTarget || 'container',
           });
           run.status = r.ok ? 'done' : 'error';
           run.exitCode = r.exitCode;
@@ -1365,6 +1624,13 @@ function renderMessages(forceScroll = true) {
       body.appendChild(sr);
     }
 
+    if (m.shieldSummary?.total > 0) {
+      const sh = document.createElement('div');
+      sh.className = 'shield-pill';
+      sh.innerHTML = `<svg><use href="#i-shield"/></svg><span>Privacy Shield masked ${m.shieldSummary.total} sensitive item${m.shieldSummary.total === 1 ? '' : 's'} &amp; restored locally</span>`;
+      body.appendChild(sh);
+    }
+
     if (!m.streaming && m.content) {
       const foot = document.createElement('div');
       foot.className = 'msg-foot-bar';
@@ -1373,21 +1639,54 @@ function renderMessages(forceScroll = true) {
       const info = [modeLbl, m.model ? m.model.replace(/:latest$/, '') : '', spd].filter(Boolean).join(' · ');
       const span = document.createElement('span');
       span.textContent = info;
+      const docTitle = (m.plan?.goal || S.chat?.title || 'mx-Cowork Report').slice(0, 80);
+
       const cpBtn = document.createElement('button');
       cpBtn.textContent = 'Copy';
       cpBtn.onclick = () => { navigator.clipboard?.writeText(m.content); toast('Copied'); };
+
+      const docxBtn = document.createElement('button');
+      docxBtn.textContent = 'Word';
+      docxBtn.title = 'Export as formatted Microsoft Word (.docx)';
+      docxBtn.onclick = async () => {
+        try {
+          const r = await CW.exportDocx({ title: docTitle, markdown: m.content });
+          if (!r.canceled) toast(`Exported Word → ${r.filePath}`);
+        } catch (e) { toast(e.message, 4000); }
+      };
+
+      const xlsxBtn = document.createElement('button');
+      xlsxBtn.textContent = 'Excel';
+      xlsxBtn.title = 'Export tables as Excel workbook (.xlsx)';
+      xlsxBtn.onclick = async () => {
+        try {
+          const r = await CW.exportXlsx({ title: docTitle, markdown: m.content });
+          if (!r.canceled) toast(`Exported Excel → ${r.filePath}`);
+        } catch (e) { toast(e.message, 4000); }
+      };
+
+      const pdfBtn = document.createElement('button');
+      pdfBtn.textContent = 'PDF';
+      pdfBtn.title = 'Export as print-ready PDF';
+      pdfBtn.onclick = async () => {
+        try {
+          const r = await CW.exportPdf({ title: docTitle, markdown: m.content });
+          if (!r.canceled) toast(`Exported PDF → ${r.filePath}`);
+        } catch (e) { toast(e.message, 4000); }
+      };
+
       const svBtn = document.createElement('button');
       svBtn.textContent = 'Save Brief';
       svBtn.onclick = async () => {
         await CW.saveBrief({
-          title: (m.plan?.goal || S.chat?.title || 'Research Brief').slice(0, 80),
+          title: docTitle,
           markdown: m.content,
           sources: m.sources || [],
         });
         toast('Saved to Research Desk');
         loadBriefs();
       };
-      foot.append(span, cpBtn, svBtn);
+      foot.append(span, cpBtn, docxBtn, xlsxBtn, pdfBtn, svBtn);
       body.appendChild(foot);
     }
 
@@ -1458,34 +1757,258 @@ function mountLiveAssistantDom(initialPhase) {
   };
 }
 
-// ---- Send / Stream Cowork Turn (Zero-Jitter Incremental DOM)
+// ---- Concurrent Multi-Model Stream Router (switching chats/tabs never interrupts or mixes streams!)
+function isViewingStream(st) {
+  if (!st) return false;
+  if (st.chatId) return S.chat?.id === st.chatId;
+  return S.viewingTempStreamId === st.streamId;
+}
+
+function syncStreamArtifacts(st, isStillStreaming) {
+  if (!isViewingStream(st)) return;
+  const msgKey = isStillStreaming ? st.streamId : (st.assistant.id || st.streamId);
+  const arts = extractArtifactsFromText(st.assistant.content, msgKey, isStillStreaming);
+  if (!arts.length) return;
+  for (const a of arts) S.artifacts.set(a.id, a);
+  const latest = arts[arts.length - 1];
+
+  if (latest.streaming) {
+    if (st.autoOpenedArtId !== latest.id) {
+      st.autoOpenedArtId = latest.id;
+      S.artifactUserPickedTab = false;
+      openArtifact(latest, 'code', { isAuto: true });
+    } else if (S.panelOpen && S.panelTab === 'artifact' && S.activeArtifactId === latest.id) {
+      renderArtifactPane();
+    }
+  } else if (!st.completedArtIds.has(latest.id)) {
+    st.completedArtIds.add(latest.id);
+    const wasStreamingThis = Boolean(st.autoOpenedArtId);
+    st.autoOpenedArtId = latest.id;
+    if (wasStreamingThis) {
+      S.activeArtifactId = latest.id;
+      if (!S.artifactUserPickedTab) S.artifactTab = 'preview';
+      openPanel('artifact', false);
+      renderArtifactPane();
+    } else {
+      openArtifact(latest, 'preview', { isAuto: true });
+    }
+  }
+}
+
+function flushStreamProse(st) {
+  st.proseTimer = null;
+  if (!st.assistant.content || !isViewingStream(st) || !st.live?.el?.isConnected) return;
+  const sc = $('#scrollArea');
+  const stick = isNearBottom(sc, 110);
+  st.live.proseEl.hidden = false;
+  st.live.proseEl.innerHTML = renderMd(st.assistant.content, { msgKey: st.streamId, isStreaming: true });
+  syncStreamArtifacts(st, true);
+  if (stick) sc.scrollTop = sc.scrollHeight;
+}
+
+function flushStreamThink(st) {
+  st.thinkTimer = null;
+  if (!st.pendingThink) return;
+  const chunk = st.pendingThink;
+  st.pendingThink = '';
+  if (!isViewingStream(st) || !st.live?.el?.isConnected) return;
+  st.live.thinkEl.hidden = false;
+  st.live.thinkSummary.textContent = `Thinking (${st.assistant.thinking.length} chars)`;
+  const preNearBot = isNearBottom(st.live.thinkPre, 40);
+  st.live.thinkPre.append(document.createTextNode(chunk));
+  if (preNearBot) st.live.thinkPre.scrollTop = st.live.thinkPre.scrollHeight;
+}
+
+function refreshStreamPlanPanel(st) {
+  if (!isViewingStream(st) || !st.live?.el?.isConnected) return;
+  const cp = renderCopilotPanel(st.assistant);
+  st.live.planSlot.innerHTML = '';
+  if (cp) {
+    st.live.planSlot.hidden = false;
+    st.live.planSlot.appendChild(cp);
+  }
+}
+
+function handleGlobalCoworkEvent({ streamId: sid, event: ev, data: d }) {
+  const st = S.activeStreams.get(sid);
+  if (!st) return;
+  const viewing = isViewingStream(st);
+  const live = viewing && st.live?.el?.isConnected ? st.live : null;
+
+  if (ev === 'chat' && d.chat) {
+    st.chatId = d.chat.id;
+    if (viewing) {
+      S.chat = d.chat;
+      S.viewingTempStreamId = null;
+      $('#chatTitle').textContent = d.chat.title || 'New chat';
+    }
+    loadChats();
+  } else if (ev === 'phase') {
+    st.assistant.queuePos = 0;
+    st.assistant.livePhase = d.label || d.phase;
+    if (live) {
+      live.phaseEl.hidden = false;
+      live.phaseEl.className = 'loading-state';
+      live.phaseTxt.textContent = st.assistant.livePhase;
+    }
+  } else if (ev === 'queue') {
+    if (d.acquired || !d.position) {
+      st.assistant.queuePos = 0;
+      st.assistant.livePhase = 'Preparing response…';
+      if (live) live.phaseEl.className = 'loading-state';
+    } else {
+      st.assistant.queuePos = d.position;
+      st.assistant.livePhase = `Queued #${d.position}${d.runningLabel ? ` · waiting for ${d.runningLabel}` : ''}`;
+      if (live) live.phaseEl.className = 'loading-state queued';
+    }
+    if (live) {
+      live.phaseEl.hidden = false;
+      live.phaseTxt.textContent = st.assistant.livePhase;
+    }
+  } else if (ev === 'shield') {
+    st.assistant.shieldSummary = d;
+    if (viewing && d?.total > 0) {
+      toast(`Privacy Shield masked ${d.total} sensitive item${d.total === 1 ? '' : 's'} locally`);
+    }
+  } else if (ev === 'copilot_plan') {
+    st.assistant.plan = d;
+    refreshStreamPlanPanel(st);
+  } else if (ev === 'worker_start') {
+    st.assistant.workers.push({ ...d, status: 'running', stream: '' });
+    refreshStreamPlanPanel(st);
+  } else if (ev === 'worker_delta') {
+    const w = st.assistant.workers.find((x) => x.id === d.id);
+    if (w) {
+      w.stream = (w.stream || '') + (d.delta || '');
+      if (live) {
+        const bodyEl = live.planSlot.querySelector(`[data-worker-body="${CSS.escape(d.id)}"]`);
+        if (bodyEl) bodyEl.textContent = w.stream;
+      }
+    }
+  } else if (ev === 'worker_done') {
+    const w = st.assistant.workers.find((x) => x.id === d.id);
+    if (w) { Object.assign(w, d, { status: d.ok ? 'done' : 'error' }); refreshStreamPlanPanel(st); }
+  } else if (ev === 'thinking') {
+    st.assistant.queuePos = 0;
+    st.assistant.livePhase = 'Thinking…';
+    if (live) {
+      live.phaseEl.hidden = false;
+      live.phaseEl.className = 'loading-state';
+      live.phaseTxt.textContent = 'Thinking…';
+    }
+    const delta = d.delta || '';
+    if (delta) {
+      st.assistant.thinking += delta;
+      st.pendingThink += delta;
+      if (!st.thinkTimer) st.thinkTimer = setTimeout(() => flushStreamThink(st), 90);
+    }
+  } else if (ev === 'text') {
+    st.assistant.livePhase = '';
+    if (live) live.phaseEl.hidden = true;
+    st.assistant.content += d.delta || '';
+    if (!st.proseTimer) st.proseTimer = setTimeout(() => flushStreamProse(st), 75);
+  } else if (ev === 'file_actions') {
+    st.assistant.fileActions = d;
+  } else if (ev === 'code_runs') {
+    st.assistant.codeRuns = d;
+  } else if (ev === 'graph_ready') {
+    st.assistant.graphReady = d;
+  } else if (ev === 'notes_saved') {
+    loadNotes();
+    toast(`Saved ${d.length} memory note${d.length > 1 ? 's' : ''}`);
+  } else if (ev === 'tasks_saved') {
+    loadTasks();
+    toast(`Added ${d.length} action item${d.length > 1 ? 's' : ''} to Tasks`);
+  } else if (ev === 'sources') {
+    st.assistant.sources = d;
+  } else if (ev === 'done') {
+    if (st.proseTimer) { clearTimeout(st.proseTimer); st.proseTimer = null; }
+    if (st.thinkTimer) { clearTimeout(st.thinkTimer); st.thinkTimer = null; }
+    Object.assign(st.assistant, d.message || {}, { streaming: false, livePhase: '' });
+    S.activeStreams.delete(sid);
+    if (isViewingStream(st)) {
+      if (!S.messages.includes(st.assistant)) {
+        // Reload from persisted chat so message history is 100% authoritative
+        openChat(st.chatId).then(() => syncStreamArtifacts(st, false));
+      } else {
+        renderMessages(false);
+        syncStreamArtifacts(st, false);
+      }
+      updateSendButtonState();
+    } else {
+      toast(`Finished: ${d.chat?.title || 'Background chat'}`);
+    }
+    loadChats();
+  } else if (ev === 'stopped') {
+    if (st.proseTimer) clearTimeout(st.proseTimer);
+    if (st.thinkTimer) clearTimeout(st.thinkTimer);
+    st.assistant.streaming = false;
+    st.assistant.livePhase = '';
+    S.activeStreams.delete(sid);
+    if (isViewingStream(st)) {
+      renderMessages(false);
+      updateSendButtonState();
+    }
+    loadChats();
+  } else if (ev === 'error') {
+    if (st.proseTimer) clearTimeout(st.proseTimer);
+    if (st.thinkTimer) clearTimeout(st.thinkTimer);
+    st.assistant.livePhase = '';
+    st.assistant.streaming = false;
+    st.assistant.content += `\n\n> **Error:** ${d.message}`;
+    S.activeStreams.delete(sid);
+    toast(d.message, 5000);
+    if (isViewingStream(st)) {
+      renderMessages(false);
+      updateSendButtonState();
+    }
+    loadChats();
+  }
+}
+
+// ---- Send / Stream Cowork Turn (Concurrent Multi-Model Safe!)
 async function sendPrompt(overrideText = null) {
-  if (S.streaming) {
-    if (S.chat?.id) CW.stopCowork(S.chat.id).catch(() => {});
+  const curStream = getStreamForCurrentView();
+  if (curStream) {
+    if (curStream.chatId) CW.stopCowork(curStream.chatId).catch(() => {});
     return;
   }
   const input = $('#promptInput');
   const prompt = (overrideText !== null ? overrideText : input.value).trim();
   if (!prompt) return;
+  hideSlashMenu();
+  $('#quickClipBar').hidden = true;
   if (overrideText === null) { input.value = ''; input.style.height = 'auto'; }
 
   const streamId = 's_' + Date.now().toString(36) + '_' + Math.random().toString(36).slice(2, 6);
-  S.activeStreamId = streamId;
-  S.messages.push({ id: 'tmp-u', role: 'user', content: prompt });
+  const imagesToSend = S.attachedImages.map(({ mimeType, data, name }) => ({ mimeType, data, name }));
+  const pinnedToSend = [...S.pinnedFiles];
+  const targetChatId = S.chat?.id || null;
+  const targetProjectId = S.chat?.projectId !== undefined ? S.chat.projectId : (S.activeProject?.id || '');
+  const chosenMode = S.mode;
+  const chosenThink = S.think;
+  const shieldOn = S.piiShield;
 
-  // Render existing messages + new user bubble once, then mount a stable live assistant DOM
+  // Clear attached screenshots after capturing them for this turn
+  if (S.attachedImages.length) {
+    S.attachedImages = [];
+    renderPinned();
+  }
+
+  const userMsg = { id: 'tmp-u-' + streamId, role: 'user', content: prompt };
+  S.messages.push(userMsg);
   renderMessages(true);
 
-  const initialPhase = S.mode === 'copilot_b'
+  const initialPhase = chosenMode === 'copilot_b'
     ? 'Copilot (B) planning…'
-    : S.mode === 'copilot'
+    : chosenMode === 'copilot'
       ? 'Copilot planning…'
       : 'Connecting…';
 
   const assistant = {
-    id: 'tmp-a',
+    id: 'tmp-a-' + streamId,
     role: 'assistant',
-    mode: S.mode,
+    mode: chosenMode,
     content: '',
     thinking: '',
     plan: null,
@@ -1493,6 +2016,7 @@ async function sendPrompt(overrideText = null) {
     sources: [],
     fileActions: [],
     codeRuns: [],
+    shieldSummary: null,
     livePhase: initialPhase,
     queuePos: 0,
     streaming: true,
@@ -1500,194 +2024,45 @@ async function sendPrompt(overrideText = null) {
   S.messages.push(assistant);
   const live = mountLiveAssistantDom(initialPhase);
 
-  S.streaming = true;
-  $('#sendBtn').classList.add('stop');
-  $('#sendIcon use').setAttribute('href', '#i-stop');
-
-  let proseTimer = null;
-  let autoOpenedArtId = null;
-  const completedArtIds = new Set();
-
-  const syncLiveArtifacts = (isStillStreaming) => {
-    const msgKey = isStillStreaming ? streamId : (assistant.id || streamId);
-    const arts = extractArtifactsFromText(assistant.content, msgKey, isStillStreaming);
-    if (!arts.length) return;
-    for (const a of arts) S.artifacts.set(a.id, a);
-    const latest = arts[arts.length - 1];
-
-    if (latest.streaming) {
-      if (autoOpenedArtId !== latest.id) {
-        autoOpenedArtId = latest.id;
-        S.artifactUserPickedTab = false;
-        openArtifact(latest, 'code', { isAuto: true });
-      } else if (S.panelOpen && S.panelTab === 'artifact' && S.activeArtifactId === latest.id) {
-        renderArtifactPane();
-      }
-    } else if (!completedArtIds.has(latest.id)) {
-      completedArtIds.add(latest.id);
-      const wasStreamingThis = Boolean(autoOpenedArtId);
-      autoOpenedArtId = latest.id;
-      if (wasStreamingThis) {
-        S.activeArtifactId = latest.id;
-        if (!S.artifactUserPickedTab) S.artifactTab = 'preview';
-        openPanel('artifact', false);
-        renderArtifactPane();
-      } else {
-        openArtifact(latest, 'preview', { isAuto: true });
-      }
-    }
+  const st = {
+    streamId,
+    chatId: targetChatId,
+    projectId: targetProjectId,
+    userMsg,
+    assistant,
+    live,
+    proseTimer: null,
+    thinkTimer: null,
+    pendingThink: '',
+    autoOpenedArtId: null,
+    completedArtIds: new Set(),
   };
+  S.activeStreams.set(streamId, st);
+  if (!targetChatId) S.viewingTempStreamId = streamId;
+  updateSendButtonState();
+  renderSidebarTree();
 
-  const flushProse = () => {
-    proseTimer = null;
-    if (!assistant.content) return;
-    const sc = $('#scrollArea');
-    const stick = isNearBottom(sc, 110);
-    live.proseEl.hidden = false;
-    live.proseEl.innerHTML = renderMd(assistant.content, { msgKey: streamId, isStreaming: true });
-    syncLiveArtifacts(true);
-    if (stick) sc.scrollTop = sc.scrollHeight;
-  };
-  const scheduleProse = () => {
-    if (!proseTimer) proseTimer = setTimeout(flushProse, 75);
-  };
-
-  let thinkTimer = null;
-  let pendingThink = '';
-  const flushThink = () => {
-    thinkTimer = null;
-    if (!pendingThink) return;
-    const chunk = pendingThink;
-    pendingThink = '';
-    live.thinkEl.hidden = false;
-    live.thinkSummary.textContent = `Thinking (${assistant.thinking.length} chars)`;
-    const preNearBot = isNearBottom(live.thinkPre, 40);
-    live.thinkPre.append(document.createTextNode(chunk));
-    if (preNearBot) live.thinkPre.scrollTop = live.thinkPre.scrollHeight;
-  };
-
-  const refreshPlanPanel = () => {
-    const cp = renderCopilotPanel(assistant);
-    live.planSlot.innerHTML = '';
-    if (cp) {
-      live.planSlot.hidden = false;
-      live.planSlot.appendChild(cp);
-    }
-  };
-
-  const off = CW.onCoworkEvent(({ streamId: sid, event: ev, data: d }) => {
-    if (sid !== streamId) return;
-    if (ev === 'chat' && d.chat) {
-      S.chat = d.chat;
-      $('#chatTitle').textContent = d.chat.title || 'New chat';
-      loadChats();
-    } else if (ev === 'phase') {
-      assistant.queuePos = 0;
-      assistant.livePhase = d.label || d.phase;
-      live.phaseEl.hidden = false;
-      live.phaseEl.className = 'loading-state';
-      live.phaseTxt.textContent = assistant.livePhase;
-    } else if (ev === 'queue') {
-      if (d.acquired || !d.position) {
-        assistant.queuePos = 0;
-        assistant.livePhase = 'Preparing response…';
-        live.phaseEl.className = 'loading-state';
-      } else {
-        assistant.queuePos = d.position;
-        assistant.livePhase = `Queued #${d.position}${d.runningLabel ? ` · waiting for ${d.runningLabel}` : ''}`;
-        live.phaseEl.className = 'loading-state queued';
-      }
-      live.phaseEl.hidden = false;
-      live.phaseTxt.textContent = assistant.livePhase;
-    } else if (ev === 'copilot_plan') {
-      assistant.plan = d;
-      refreshPlanPanel();
-    } else if (ev === 'worker_start') {
-      assistant.workers.push({ ...d, status: 'running', stream: '' });
-      refreshPlanPanel();
-    } else if (ev === 'worker_delta') {
-      const w = assistant.workers.find((x) => x.id === d.id);
-      if (w) {
-        w.stream = (w.stream || '') + (d.delta || '');
-        const bodyEl = live.planSlot.querySelector(`[data-worker-body="${CSS.escape(d.id)}"]`);
-        if (bodyEl) bodyEl.textContent = w.stream;
-      }
-    } else if (ev === 'worker_done') {
-      const w = assistant.workers.find((x) => x.id === d.id);
-      if (w) { Object.assign(w, d, { status: d.ok ? 'done' : 'error' }); refreshPlanPanel(); }
-    } else if (ev === 'thinking') {
-      assistant.queuePos = 0;
-      assistant.livePhase = 'Thinking…';
-      live.phaseEl.hidden = false;
-      live.phaseEl.className = 'loading-state';
-      live.phaseTxt.textContent = 'Thinking…';
-      const delta = d.delta || '';
-      if (delta) {
-        assistant.thinking += delta;
-        pendingThink += delta;
-        if (!thinkTimer) thinkTimer = setTimeout(flushThink, 90);
-      }
-    } else if (ev === 'text') {
-      assistant.livePhase = '';
-      live.phaseEl.hidden = true;
-      assistant.content += d.delta || '';
-      scheduleProse();
-    } else if (ev === 'file_actions') {
-      assistant.fileActions = d;
-    } else if (ev === 'code_runs') {
-      assistant.codeRuns = d;
-    } else if (ev === 'graph_ready') {
-      assistant.graphReady = d;
-    } else if (ev === 'notes_saved') {
-      loadNotes();
-      toast(`Saved ${d.length} memory note${d.length > 1 ? 's' : ''}`);
-    } else if (ev === 'sources') {
-      assistant.sources = d;
-    } else if (ev === 'done') {
-      if (proseTimer) { clearTimeout(proseTimer); proseTimer = null; }
-      if (thinkTimer) { clearTimeout(thinkTimer); thinkTimer = null; }
-      Object.assign(assistant, d.message || {}, { streaming: false, livePhase: '' });
-      renderMessages(false);
-      syncLiveArtifacts(false);
-      loadChats();
-    } else if (ev === 'error') {
-      assistant.livePhase = '';
-      assistant.streaming = false;
-      assistant.content += `\n\n> **Error:** ${d.message}`;
-      toast(d.message, 4500);
-      renderMessages(false);
+  // Fire concurrently — user can immediately switch to another chat/project and launch another model!
+  CW.runCowork({
+    streamId,
+    chatId: targetChatId,
+    projectId: targetProjectId,
+    mode: chosenMode,
+    think: chosenThink,
+    prompt,
+    pinnedFiles: pinnedToSend,
+    images: imagesToSend,
+    piiShield: shieldOn,
+    toolOverrides: {
+      toolWebSearch: S.toolWebSearch,
+      toolOsFiles: S.toolOsFiles,
+      toolContainer: S.containerEnabled,
+    },
+  }).catch((e) => {
+    if (S.activeStreams.has(streamId)) {
+      handleGlobalCoworkEvent({ streamId, event: 'error', data: { message: e.message } });
     }
   });
-
-  try {
-    await CW.runCowork({
-      streamId,
-      chatId: S.chat?.id || null,
-      mode: S.mode,
-      think: S.think,
-      prompt,
-      pinnedFiles: S.pinnedFiles,
-      toolOverrides: {
-        toolWebSearch: S.toolWebSearch,
-        toolOsFiles: S.toolOsFiles,
-        toolContainer: S.containerEnabled,
-      },
-    });
-  } catch (e) {
-    assistant.content += `\n\n> **Error:** ${e.message}`;
-    toast(e.message, 4500);
-  } finally {
-    off();
-    if (proseTimer) clearTimeout(proseTimer);
-    if (thinkTimer) clearTimeout(thinkTimer);
-    assistant.streaming = false;
-    assistant.livePhase = '';
-    S.streaming = false;
-    S.activeStreamId = null;
-    $('#sendBtn').classList.remove('stop');
-    $('#sendIcon use').setAttribute('href', '#i-send');
-    renderMessages(false);
-  }
 }
 
 // ---- OS File Browser + Find + Live File Editor
@@ -1834,10 +2209,37 @@ function updateEditorPinBtn() {
   $('#edPinBtn').classList.toggle('primary', pinned);
 }
 
+function renderEditorTable(filterText = '') {
+  const tbl = S.editorTable;
+  const grid = $('#edTableGrid');
+  if (!tbl || !tbl.rows?.length) {
+    grid.innerHTML = '<tbody><tr><td style="color:var(--muted);padding:12px">No table rows found.</td></tr></tbody>';
+    $('#edTableStats').textContent = '0 rows';
+    return;
+  }
+  const q = filterText.trim().toLowerCase();
+  const [header, ...bodyRows] = tbl.rows;
+  const filtered = q ? bodyRows.filter((r) => r.some((c) => String(c || '').toLowerCase().includes(q))) : bodyRows;
+  const visible = filtered.slice(0, 250);
+  $('#edTableStats').textContent = `${filtered.length} / ${bodyRows.length} rows · ${header.length} cols`;
+  grid.innerHTML = `<thead><tr>${header.map((h) => `<th title="${esc(h)}">${esc(h)}</th>`).join('')}</tr></thead>`
+    + `<tbody>${visible.map((r) => `<tr>${header.map((_, i) => `<td title="${esc(r[i] ?? '')}">${esc(r[i] ?? '')}</td>`).join('')}</tr>`).join('')}</tbody>`;
+}
+
+function setEditorTableMode(on) {
+  S.editorTableMode = Boolean(on && S.editorTable);
+  $('#edTableWrap').hidden = !S.editorTableMode;
+  $('#edTextarea').hidden = S.editorTableMode;
+  $('#edTableToggleBtn').classList.toggle('primary', S.editorTableMode);
+  $('#edTableToggleBtn').innerHTML = `<svg><use href="#i-table"/></svg>${S.editorTableMode ? 'Raw Text' : 'Table'}`;
+}
+
 async function openFileInEditor(relPath) {
   try {
     const f = await CW.readFileForEdit(relPath);
     S.editor = { ...f, savedContent: f.content };
+    S.editorTable = null;
+    S.editorTableMode = false;
     $('#filesBrowserView').hidden = true;
     $('#fileEditorView').hidden = false;
     $('#edFileName').textContent = f.name;
@@ -1846,6 +2248,25 @@ async function openFileInEditor(relPath) {
     $('#edTextarea').readOnly = !f.editable;
     $('#edSaveBtn').disabled = !f.editable;
     $('#edReadonlyNote').hidden = f.editable;
+
+    const isTabular = /\.(csv|tsv|xlsx)$/i.test(f.name || '');
+    $('#edTableToggleBtn').hidden = !isTabular;
+    $('#edExportXlsxBtn').hidden = !isTabular;
+    $('#edTableWrap').hidden = true;
+    $('#edTextarea').hidden = false;
+    $('#edTableFilter').value = '';
+
+    if (isTabular) {
+      try {
+        const tbl = await CW.parseTableFile(relPath);
+        if (tbl?.rows?.length) {
+          S.editorTable = tbl;
+          renderEditorTable('');
+          setEditorTableMode(true);
+        }
+      } catch {}
+    }
+
     updateEditorStats();
     updateEditorPinBtn();
   } catch (e) {
@@ -1858,6 +2279,10 @@ function closeFileEditor(force = false) {
     toast('Closed without saving (use Undo or re-open)');
   }
   S.editor = null;
+  S.editorTable = null;
+  S.editorTableMode = false;
+  $('#edTableWrap').hidden = true;
+  $('#edTextarea').hidden = false;
   $('#fileEditorView').hidden = true;
   $('#filesBrowserView').hidden = false;
 }
@@ -2306,13 +2731,24 @@ function handleContainerOutputChunk(ev) {
   }
 }
 
+function syncCodeExecTargetUI() {
+  const isHost = $('#ctExecTarget')?.value === 'host';
+  $('#ctImage').hidden = isHost;
+  $('#ctNet').hidden = isHost;
+  $('#ctMount').hidden = isHost;
+  $('#ctImagePresets').hidden = isHost;
+  const lbl = $('#ctRunBtnLabel');
+  if (lbl) lbl.textContent = isHost ? 'Run on Host (On-Machine)' : 'Run in Container';
+}
+
 async function runSandboxContainer() {
   const code = $('#ctCodeInput').value.trim();
   if (!code) { toast('Enter code or a shell command first'); return; }
+  const execTarget = $('#ctExecTarget')?.value || 'container';
   const runId = 'sb_' + Date.now().toString(36);
   S.activeContainerRunId = runId;
   S.containerRunOutputs[runId] = '';
-  $('#ctTerminal').textContent = 'Starting container…\n';
+  $('#ctTerminal').textContent = execTarget === 'host' ? 'Running on local host…\n' : 'Starting container…\n';
   $('#ctRunMeta').textContent = 'Running…';
   $('#ctRunBtn').disabled = true;
   $('#ctStopBtn').hidden = false;
@@ -2320,9 +2756,10 @@ async function runSandboxContainer() {
   try {
     const r = await CW.runInContainer({
       runId,
-      title: `Sandbox (${$('#ctLang').value})`,
+      title: `${execTarget === 'host' ? 'Host' : 'Container'} (${$('#ctLang').value})`,
       language: $('#ctLang').value,
       code,
+      execTarget,
       image: $('#ctImage').value.trim() || 'python:3.12-slim',
       network: $('#ctNet').value,
       mountMode: $('#ctMount').value,
@@ -2602,12 +3039,42 @@ async function renderUsagePanel() {
         </tr>`).join('')
       : '<tr><td colspan="4" style="color:var(--muted);text-align:center;padding:10px">No per-chat usage recorded yet.</td></tr>';
 
+    const lim = u?.limits || { fast: { unlimited: true, totalTokens: 0, requests: 0 }, smart: { limit4h: 150000, used4h: 0, pct4h: 0, reset4hInMs: 0, limitDaily: 500000, usedDaily: 0, pctDaily: 0, resetDailyInMs: 0 } };
+    const fmtReset = (ms) => {
+      if (!ms || ms <= 0) return 'ready';
+      const mins = Math.ceil(ms / 60000);
+      const h = Math.floor(mins / 60);
+      const m = mins % 60;
+      return h > 0 ? `resets in ~${h}h ${m}m` : `resets in ~${m}m`;
+    };
+    const barCls = (pct) => (pct >= 100 ? 'hit' : pct >= 80 ? 'warn' : 'ok');
+
     root.innerHTML = `
       <div class="pane-head-row" style="margin-bottom:10px">
-        <span class="muted-note" style="margin:0">Local token &amp; speed telemetry across main turns, subagent workers, and Fast graph mapping.</span>
+        <span class="muted-note" style="margin:0">2-Tier Token Telemetry &amp; Limits — Fast tier is unlimited; Smart tier enforces rolling 4-hour &amp; daily caps.</span>
         <div class="row-gap">
           <button type="button" class="btn tiny" id="usageRefreshBtn">Refresh</button>
-          <button type="button" class="btn tiny danger" id="usageResetBtn">Reset Stats</button>
+        </div>
+      </div>
+
+      <div class="limit-grid">
+        <div class="limit-card unlimited">
+          <div class="limit-top"><span>Fast Tier</span><span class="badge-pill ok">Unlimited</span></div>
+          <div class="limit-val">${fmtTok(lim.fast.totalTokens)} used</div>
+          <div class="limit-bar"><div class="limit-fill ok" style="width:100%"></div></div>
+          <div class="limit-sub">${lim.fast.requests} reqs · No cap (Fast, Workers, Graph)</div>
+        </div>
+        <div class="limit-card">
+          <div class="limit-top"><span>Smart · 4-Hour Window</span><span>${lim.smart.limit4h > 0 ? lim.smart.pct4h + '%' : 'Off'}</span></div>
+          <div class="limit-val">${fmtTok(lim.smart.used4h)} / ${lim.smart.limit4h > 0 ? fmtTok(lim.smart.limit4h) : '∞'}</div>
+          <div class="limit-bar"><div class="limit-fill ${barCls(lim.smart.pct4h)}" style="width:${lim.smart.pct4h}%"></div></div>
+          <div class="limit-sub">${lim.smart.exceeded4h ? 'Limit reached · ' : ''}${fmtReset(lim.smart.reset4hInMs)}</div>
+        </div>
+        <div class="limit-card">
+          <div class="limit-top"><span>Smart · Daily Limit</span><span>${lim.smart.limitDaily > 0 ? lim.smart.pctDaily + '%' : 'Off'}</span></div>
+          <div class="limit-val">${fmtTok(lim.smart.usedDaily)} / ${lim.smart.limitDaily > 0 ? fmtTok(lim.smart.limitDaily) : '∞'}</div>
+          <div class="limit-bar"><div class="limit-fill ${barCls(lim.smart.pctDaily)}" style="width:${lim.smart.pctDaily}%"></div></div>
+          <div class="limit-sub">${lim.smart.exceededDaily ? 'Limit reached · ' : ''}${fmtReset(lim.smart.resetDailyInMs)}</div>
         </div>
       </div>
 
@@ -2664,19 +3131,6 @@ async function renderUsagePanel() {
       </div>`;
 
     $('#usageRefreshBtn', root).onclick = () => renderUsagePanel();
-    const resetBtn = $('#usageResetBtn', root);
-    let armed = false;
-    resetBtn.onclick = async () => {
-      if (!armed) {
-        armed = true;
-        resetBtn.textContent = 'Confirm Reset?';
-        setTimeout(() => { if (armed) { armed = false; resetBtn.textContent = 'Reset Stats'; } }, 4000);
-        return;
-      }
-      await CW.resetUsage();
-      toast('Token usage statistics cleared');
-      renderUsagePanel();
-    };
     $$('[data-usage-chat]', root).forEach((row) => {
       row.onclick = () => {
         const cid = row.dataset.usageChat;
@@ -2709,6 +3163,8 @@ function openSettings(initialTab = 'models') {
   $('#setGraphMapperModel').value = s.graphMapperModel || s.fastModel || 'lfm3:latest';
   $('#setDefaultMode').value = s.defaultMode || 'copilot';
   $('#setDefaultThink').value = s.think || 'low';
+  $('#setSmartLimit4h').value = String(s.smartLimit4h ?? 150000);
+  $('#setSmartLimitDaily').value = String(s.smartLimitDaily ?? 500000);
   $('#setCustomInstr').value = s.customInstructions || '';
   // Tab 2: Providers & API Keys
   $('#setEndpointType').value = s.endpointType || 'mxgpt';
@@ -2718,7 +3174,7 @@ function openSettings(initialTab = 'models') {
   $('#setPassword').placeholder = s.hasPassword ? '•••••••• (saved — leave blank to keep)' : 'Enter password';
   $('#setApiKey').value = '';
   $('#setApiKey').placeholder = s.hasApiKey ? '•••••••• (saved — leave blank to keep)' : 'sk-... (stored locally)';
-  // Tab 4: Tools
+  // Tab 4: Tools & Privacy
   $('#setToolWeb').checked = s.toolWebSearch !== false;
   $('#setToolOsFiles').checked = s.toolOsFiles !== false;
   $('#setToolContainer').checked = s.toolContainer !== false && s.containerEnabled !== false;
@@ -2732,7 +3188,11 @@ function openSettings(initialTab = 'models') {
   $('#setWebFetchPages').checked = s.toolWebFetchPages !== false;
   $('#setWorkspace').value = s.workspace || '';
   $('#setAutoApprove').checked = !!s.autoApproveFileActions;
-  // Tab 5: Container
+  $('#setPiiShield').checked = !!s.piiShieldEnabled;
+  $('#setPiiCustomTerms').value = s.piiCustomTerms || '';
+  $('#setGlobalHotkey').value = s.globalHotkey || 'Alt+Space';
+  // Tab 5: Code Execution (Container & Host)
+  $('#setCodeExecTarget').value = s.codeExecutionTarget || 'container';
   $('#setContainerRuntime').value = s.containerRuntime || 'auto';
   $('#setContainerImage').value = s.containerImage || 'python:3.12-slim';
   $('#setContainerNet').value = s.containerNetwork || 'none';
@@ -2767,6 +3227,8 @@ function collectSettingsForm() {
     graphMapperModel: $('#setGraphMapperModel').value.trim() || fastModel,
     defaultMode: $('#setDefaultMode').value || 'copilot',
     think: $('#setDefaultThink').value || 'low',
+    smartLimit4h: Math.max(0, Math.round(Number($('#setSmartLimit4h').value) || 0)),
+    smartLimitDaily: Math.max(0, Math.round(Number($('#setSmartLimitDaily').value) || 0)),
     customInstructions: $('#setCustomInstr').value.trim(),
     toolWebSearch: $('#setToolWeb').checked,
     toolWebFetchPages: $('#setWebFetchPages').checked,
@@ -2782,6 +3244,10 @@ function collectSettingsForm() {
     toolNotes: $('#setToolNotes').checked,
     workspace: $('#setWorkspace').value.trim(),
     autoApproveFileActions: $('#setAutoApprove').checked,
+    piiShieldEnabled: $('#setPiiShield').checked,
+    piiCustomTerms: $('#setPiiCustomTerms').value.trim(),
+    globalHotkey: $('#setGlobalHotkey').value.trim() || 'Alt+Space',
+    codeExecutionTarget: $('#setCodeExecTarget').value || 'container',
     containerRuntime: $('#setContainerRuntime').value || 'auto',
     containerImage: $('#setContainerImage').value.trim() || 'python:3.12-slim',
     containerNetwork: $('#setContainerNet').value,
@@ -2961,8 +3427,8 @@ async function doLogout() {
 // ---- Event Wiring
 $('#collapseBtn').onclick = () => { $('#sidebar').classList.add('collapsed'); $('#expandBtn').hidden = false; };
 $('#expandBtn').onclick = () => { $('#sidebar').classList.remove('collapsed'); $('#expandBtn').hidden = true; };
-$('#newChatBtn').onclick = newChat;
-$('#chatSearch').oninput = (e) => { S.chatSearch = e.target.value; renderChatList(); };
+$('#newChatBtn').onclick = () => newChat();
+$('#chatSearch').oninput = (e) => { S.chatSearch = e.target.value; renderSidebarTree(); };
 $('#themeBtn').onclick = toggleTheme;
 $('#openSettingsBtn').onclick = () => openSettings('models');
 $('#footProviderBtn').onclick = () => openSettings('providers');
@@ -3130,7 +3596,7 @@ $('#deleteProjectBtn').onclick = async () => {
   S.activeProject = r.activeProject;
   S.settings = r.settings;
   $('#projectModal').hidden = true;
-  renderProjectsList();
+  renderSidebarTree();
   renderWorkspaceUI();
   renderAutoAcceptPill();
   toast('Project removed from sidebar (local files untouched)');
@@ -3479,9 +3945,13 @@ $('#saveSettingsBtn').onclick = async () => {
     S.toolWebSearch = S.settings.toolWebSearch !== false;
     S.toolOsFiles = S.settings.toolOsFiles !== false;
     S.containerEnabled = S.settings.toolContainer !== false && S.settings.containerEnabled !== false;
+    S.piiShield = Boolean(S.settings.piiShieldEnabled);
     $('#webToggleBtn').classList.toggle('on', S.toolWebSearch);
     $('#filesToggleBtn').classList.toggle('on', S.toolOsFiles);
     $('#containerToggleBtn').classList.toggle('on', S.containerEnabled);
+    $('#shieldToggleBtn').classList.toggle('on', S.piiShield);
+    $('#ctExecTarget').value = S.settings.codeExecutionTarget || 'container';
+    syncCodeExecTargetUI();
     $('#ctImage').value = S.settings.containerImage || 'python:3.12-slim';
     $('#ctNet').value = S.settings.containerNetwork || 'none';
     $('#ctMount').value = S.settings.containerMountMode || 'rw';
@@ -3509,5 +3979,572 @@ $('#updAutoInstallChk').onchange = async () => {
   toast(on ? 'Auto-install & restart enabled' : 'Manual update install selected');
 };
 $('#updInstallBtn').onclick = () => triggerInstallUpdate();
+
+// ============ v1.6.0 Controllers: Slash Workflows, Compare Diff, Tasks, KB, Automations, Clipboard, Screenshot Paste, Drag-Drop & Shield ============
+
+// 1. Privacy / PII Redaction Shield toggle
+$('#shieldToggleBtn').onclick = async () => {
+  S.piiShield = !S.piiShield;
+  $('#shieldToggleBtn').classList.toggle('on', S.piiShield);
+  await CW.saveSettings({ piiShieldEnabled: S.piiShield });
+  toast(S.piiShield ? 'Privacy Shield ON — emails, IBANs, phones, secrets & custom terms masked locally' : 'Privacy Shield OFF');
+};
+
+// 2. Host vs Container Target Selector & Artifact PDF Export
+$('#ctExecTarget').onchange = () => syncCodeExecTargetUI();
+$('#artPdfBtn').onclick = async () => {
+  const art = S.activeArtifactId ? S.artifacts.get(S.activeArtifactId) : null;
+  if (!art) { toast('Open an artifact first'); return; }
+  try {
+    const r = await CW.exportPdf({ title: art.title || 'Artifact', html: buildArtifactHtml(art) });
+    if (!r.canceled) toast(`Exported PDF → ${r.filePath}`);
+  } catch (e) { toast(e.message, 4000); }
+};
+
+// 3. CSV / Excel Data Desk Table Controls
+$('#edTableToggleBtn').onclick = () => setEditorTableMode(!S.editorTableMode);
+$('#edTableFilter').oninput = (e) => renderEditorTable(e.target.value);
+$('#edExportXlsxBtn').onclick = async () => {
+  if (!S.editorTable?.rows?.length) return;
+  try {
+    const title = (S.editor?.name || 'spreadsheet').replace(/\.[^.]+$/, '');
+    const r = await CW.exportXlsx({ title, sheets: [{ name: title.slice(0, 28) || 'Data', rows: S.editorTable.rows }] });
+    if (!r.canceled) toast(`Exported Excel → ${r.filePath}`);
+  } catch (e) { toast(e.message, 4000); }
+};
+
+// 4. Side-by-Side Document Compare / Visual Diff Modal
+async function openCompareModal() {
+  S.lastCompare = null;
+  $('#askCopilotDiffBtn').hidden = true;
+  $('#cmpSummaryStats').textContent = '';
+  $('#cmpDiffViewer').innerHTML = '<div class="muted-note" style="padding:14px">Choose two files above and click <b>Compare Files</b>.</div>';
+  // Populate workspace file suggestions in datalist
+  try {
+    const ls = await CW.listFiles(S.cwd || '');
+    const dl = $('#cmpFileOptions');
+    dl.innerHTML = (ls.items || [])
+      .filter((x) => !x.isDir)
+      .map((x) => `<option value="${esc(x.relPath)}"></option>`)
+      .join('');
+    if (S.pinnedFiles.length >= 2) {
+      $('#cmpLeftInput').value = S.pinnedFiles[0];
+      $('#cmpRightInput').value = S.pinnedFiles[1];
+    }
+  } catch {}
+  $('#compareModal').hidden = false;
+  setTimeout(() => $('#cmpLeftInput').focus(), 30);
+}
+
+async function runFileCompare() {
+  const leftPath = $('#cmpLeftInput').value.trim();
+  const rightPath = $('#cmpRightInput').value.trim();
+  if (!leftPath || !rightPath) { toast('Enter two relative workspace file paths'); return; }
+  $('#cmpDiffViewer').innerHTML = '<div class="muted-note" style="padding:14px">Computing diff…</div>';
+  try {
+    const res = await CW.compareFiles({ leftPath, rightPath });
+    S.lastCompare = res;
+    $('#cmpSummaryStats').innerHTML = res.identical
+      ? 'Identical (0 changes)'
+      : `<span class="diff-stat-add">+${res.added}</span> · <span class="diff-stat-del">−${res.removed}</span> · ${res.unchanged} unchanged`;
+    $('#cmpDiffViewer').innerHTML = renderDiffLinesHtml(res);
+    $('#askCopilotDiffBtn').hidden = false;
+  } catch (e) {
+    $('#cmpDiffViewer').innerHTML = `<div class="muted-note" style="padding:14px;color:var(--danger,#c53030)">${esc(e.message)}</div>`;
+    toast(e.message, 4000);
+  }
+}
+
+$('#compareFilesBtn').onclick = openCompareModal;
+$('#quickCompareBtn').onclick = openCompareModal;
+$('#closeCompareModalBtn').onclick = () => { $('#compareModal').hidden = true; };
+$('#runCompareBtn').onclick = runFileCompare;
+$('#askCopilotDiffBtn').onclick = () => {
+  if (!S.lastCompare) return;
+  const c = S.lastCompare;
+  $('#compareModal').hidden = true;
+  sendPrompt(`Explain all substantive differences, changed numbers, and potential risks between "${c.left.path}" and "${c.right.path}" (+${c.added} / -${c.removed} lines):\n\`\`\`diff\n${(c.unifiedText || '').slice(0, 8000)}\n\`\`\``);
+};
+
+// 5. Reusable Slash /Workflows Autocomplete & Manager
+async function loadWorkflows() {
+  try {
+    const d = await CW.listWorkflows();
+    S.workflows = d.workflows || [];
+  } catch {}
+}
+
+function filteredSlashWorkflows(query) {
+  const q = String(query || '').replace(/^\/+/, '').trim().toLowerCase();
+  if (!q) return S.workflows;
+  return S.workflows.filter((w) =>
+    (w.slug || '').toLowerCase().includes(q)
+    || (w.title || '').toLowerCase().includes(q)
+    || (w.description || '').toLowerCase().includes(q)
+  );
+}
+
+function hideSlashMenu() {
+  $('#slashMenu').hidden = true;
+}
+
+function applySlashWorkflow(wf) {
+  hideSlashMenu();
+  if (!wf) return;
+  if (wf.slug === 'compare') {
+    $('#promptInput').value = '';
+    openCompareModal();
+    return;
+  }
+  const inp = $('#promptInput');
+  inp.value = wf.prompt || '';
+  inp.style.height = 'auto';
+  inp.style.height = Math.min(inp.scrollHeight, 200) + 'px';
+  inp.focus();
+  inp.setSelectionRange(inp.value.length, inp.value.length);
+}
+
+function renderSlashMenu(filterText = '') {
+  const menu = $('#slashMenu');
+  const items = filteredSlashWorkflows(filterText);
+  if (!items.length) { menu.hidden = true; return; }
+  S.slashIndex = Math.max(0, Math.min(S.slashIndex, items.length - 1));
+  menu.hidden = false;
+  menu.innerHTML = '';
+  items.forEach((wf, idx) => {
+    const btn = document.createElement('button');
+    btn.type = 'button';
+    btn.className = 'slash-item' + (idx === S.slashIndex ? ' active' : '');
+    btn.innerHTML = `
+      <span class="slash-item-l">
+        <span class="slash-cmd">/${esc(wf.slug)} · ${esc(wf.title)}</span>
+        <span class="slash-desc">${esc(wf.description || wf.prompt.slice(0, 90))}</span>
+      </span>
+      <span class="slash-badge">${wf.builtin ? 'built-in' : 'custom'}</span>`;
+    btn.onmousedown = (e) => { e.preventDefault(); applySlashWorkflow(wf); };
+    menu.appendChild(btn);
+  });
+  const mgr = document.createElement('button');
+  mgr.type = 'button';
+  mgr.className = 'slash-item';
+  mgr.innerHTML = '<span class="slash-item-l"><span class="slash-cmd">+ Manage / Create Custom Workflow…</span><span class="slash-desc">Add reusable team or personal slash templates</span></span>';
+  mgr.onmousedown = (e) => { e.preventDefault(); hideSlashMenu(); openWorkflowModal(); };
+  menu.appendChild(mgr);
+}
+
+$('#workflowsBtn').onclick = () => {
+  const menu = $('#slashMenu');
+  if (!menu.hidden) { hideSlashMenu(); return; }
+  S.slashIndex = 0;
+  renderSlashMenu('');
+};
+
+$('#promptInput').addEventListener('input', () => {
+  const v = $('#promptInput').value;
+  if (v.startsWith('/') && !v.includes('\n') && v.length <= 36) {
+    S.slashIndex = 0;
+    renderSlashMenu(v);
+  } else {
+    hideSlashMenu();
+  }
+});
+
+$('#promptInput').addEventListener('keydown', (e) => {
+  const menu = $('#slashMenu');
+  if (menu.hidden) return;
+  const items = filteredSlashWorkflows($('#promptInput').value);
+  if (!items.length) return;
+  if (e.key === 'ArrowDown') {
+    e.preventDefault();
+    S.slashIndex = (S.slashIndex + 1) % items.length;
+    renderSlashMenu($('#promptInput').value);
+  } else if (e.key === 'ArrowUp') {
+    e.preventDefault();
+    S.slashIndex = (S.slashIndex - 1 + items.length) % items.length;
+    renderSlashMenu($('#promptInput').value);
+  } else if (e.key === 'Tab' || (e.key === 'Enter' && !e.shiftKey)) {
+    e.preventDefault();
+    e.stopImmediatePropagation();
+    applySlashWorkflow(items[S.slashIndex] || items[0]);
+  } else if (e.key === 'Escape') {
+    e.preventDefault();
+    hideSlashMenu();
+  }
+}, true);
+
+// Screenshot / Image Paste (Ctrl+V) directly into Composer
+$('#promptInput').addEventListener('paste', (e) => {
+  const items = [...(e.clipboardData?.items || [])];
+  const imgItem = items.find((it) => it.type && it.type.startsWith('image/'));
+  if (!imgItem) return;
+  const file = imgItem.getAsFile();
+  if (!file) return;
+  e.preventDefault();
+  const reader = new FileReader();
+  reader.onload = () => {
+    const res = String(reader.result || '');
+    const base64 = res.includes(',') ? res.split(',')[1] : res;
+    if (!base64) return;
+    S.attachedImages.push({
+      id: 'img_' + Date.now().toString(36),
+      name: `Screenshot ${S.attachedImages.length + 1}`,
+      mimeType: file.type || 'image/png',
+      data: base64,
+    });
+    renderPinned();
+    toast('Screenshot attached — send to any vision-capable model');
+  };
+  reader.readAsDataURL(file);
+});
+
+// Manage Custom Workflows Modal
+function renderWorkflowsManageList() {
+  const list = $('#workflowsManageList');
+  list.innerHTML = '';
+  for (const wf of S.workflows) {
+    const card = document.createElement('div');
+    card.className = 'saved-card';
+    card.innerHTML = `
+      <div class="sc-row">
+        <b>/${esc(wf.slug)} · ${esc(wf.title)}</b>
+        ${wf.builtin ? '<span class="slash-badge">built-in</span>' : '<button class="btn tiny danger" data-del-wf>✕</button>'}
+      </div>
+      <small>${esc(wf.description || wf.prompt.slice(0, 120))}</small>`;
+    const delBtn = card.querySelector('[data-del-wf]');
+    if (delBtn) {
+      delBtn.onclick = async () => {
+        const r = await CW.deleteWorkflow(wf.id);
+        S.workflows = r.workflows || [];
+        renderWorkflowsManageList();
+        toast(`Removed /${wf.slug}`);
+      };
+    }
+    list.appendChild(card);
+  }
+}
+
+function openWorkflowModal() {
+  $('#wfSlugInput').value = '';
+  $('#wfTitleInput').value = '';
+  $('#wfPromptInput').value = '';
+  renderWorkflowsManageList();
+  $('#workflowModal').hidden = false;
+  setTimeout(() => $('#wfSlugInput').focus(), 30);
+}
+
+$('#manageWorkflowsBtn').onclick = openWorkflowModal;
+$('#closeWorkflowModalBtn').onclick = () => { $('#workflowModal').hidden = true; };
+$('#saveWorkflowBtn').onclick = async () => {
+  const slug = $('#wfSlugInput').value.trim();
+  const title = $('#wfTitleInput').value.trim();
+  const prompt = $('#wfPromptInput').value.trim();
+  if (!slug || !prompt) { toast('Enter both a slash command and prompt template'); return; }
+  const r = await CW.saveWorkflow({ slug, title: title || `/${slug}`, prompt });
+  S.workflows = r.workflows || [];
+  $('#wfSlugInput').value = '';
+  $('#wfTitleInput').value = '';
+  $('#wfPromptInput').value = '';
+  renderWorkflowsManageList();
+  toast(`Saved workflow /${r.workflow.slug}`);
+};
+
+// 6. Quick-Ask Clipboard Banner (triggered by Alt+Space or Tray)
+function showQuickClipBar(text) {
+  const clean = String(text || '').trim();
+  if (!clean) {
+    $('#promptInput').focus();
+    toast('Quick-Ask ready (Alt+Space)');
+    return;
+  }
+  S.quickClipText = clean;
+  $('#qcbSnippet').textContent = clean.replace(/\s+/g, ' ').slice(0, 88) + (clean.length > 88 ? '…' : '');
+  $('#quickClipBar').hidden = false;
+  $('#promptInput').focus();
+}
+$('#qcbCloseBtn').onclick = () => { $('#quickClipBar').hidden = true; };
+$$('[data-qcb]').forEach((b) => {
+  b.onclick = () => {
+    const act = b.dataset.qcb;
+    const txt = S.quickClipText || '';
+    $('#quickClipBar').hidden = true;
+    if (!txt) return;
+    if (act === 'paste') {
+      const inp = $('#promptInput');
+      inp.value = (inp.value ? inp.value + '\n\n' : '') + txt;
+      inp.focus();
+      return;
+    }
+    const prompts = {
+      rewrite: `Rewrite the text below into clear, polite, professional business prose (keep original language):\n\n${txt}`,
+      translate: `Translate the text below naturally between German and English (preserve formatting & tone):\n\n${txt}`,
+      summarize: `Summarize the key points, decisions, and risks from the text below in crisp bullets:\n\n${txt}`,
+      actions: `Extract all action items (owner, due date, priority) and output an \`\`\`action-items JSON block so mx-Cowork saves them to Project Tasks:\n\n${txt}`,
+    };
+    sendPrompt(prompts[act] || txt);
+  };
+});
+
+// 7. Project Action Items / Tasks + .ics Calendar Invite Export
+async function loadTasks() {
+  try {
+    const d = await CW.listTasks();
+    S.tasks = d.tasks || [];
+    const list = $('#tasksList');
+    if (!list) return;
+    list.innerHTML = S.tasks.length ? '' : '<div class="muted-note">No action items yet. Add one above or run <code>/meeting-notes</code>.</div>';
+    for (const t of S.tasks) {
+      const row = document.createElement('div');
+      row.className = 'task-item' + (t.done ? ' done' : '');
+      row.innerHTML = `
+        <input type="checkbox" ${t.done ? 'checked' : ''} />
+        <div class="task-main">
+          <span class="task-title">${esc(t.title)}</span>
+          <span class="task-meta">
+            <span class="task-pri ${esc(t.priority || 'med')}">${esc(t.priority || 'med')}</span>
+            ${t.owner ? `<span>@${esc(t.owner)}</span>` : ''}
+            ${t.due ? `<span>Due ${esc(t.due)}</span>` : ''}
+          </span>
+        </div>
+        <button type="button" class="icon-btn sm" data-ics title="Export Calendar Invite (.ics)"><svg><use href="#i-calendar"/></svg></button>
+        <button type="button" class="icon-btn sm" data-del title="Delete task"><svg><use href="#i-x"/></svg></button>`;
+      row.querySelector('input[type="checkbox"]').onchange = async () => {
+        const r = await CW.toggleTask(t.id);
+        S.tasks = r.tasks || [];
+        loadTasks();
+      };
+      row.querySelector('[data-ics]').onclick = async () => {
+        const r = await CW.exportIcs({
+          title: t.title,
+          description: [t.owner ? `Owner: ${t.owner}` : '', t.source ? `Source: ${t.source}` : ''].filter(Boolean).join('\n'),
+          start: t.due ? `${t.due}T09:00:00` : null,
+          durationMin: 30,
+        });
+        if (!r.canceled) toast(`Saved calendar invite → ${r.filePath}`);
+      };
+      row.querySelector('[data-del]').onclick = async () => {
+        await CW.deleteTask(t.id);
+        loadTasks();
+      };
+      list.appendChild(row);
+    }
+  } catch {}
+}
+
+$('#addTaskBtn').onclick = async () => {
+  const title = $('#taskTitleInput').value.trim();
+  if (!title) { toast('Enter a task title first'); return; }
+  await CW.saveTask({
+    title,
+    owner: $('#taskOwnerInput').value.trim(),
+    due: $('#taskDueInput').value,
+    priority: 'med',
+  });
+  $('#taskTitleInput').value = '';
+  $('#taskOwnerInput').value = '';
+  $('#taskDueInput').value = '';
+  loadTasks();
+  toast('Task added');
+};
+$('#taskTitleInput').addEventListener('keydown', (e) => {
+  if (e.key === 'Enter') { e.preventDefault(); $('#addTaskBtn').click(); }
+});
+
+// 8. Private Local Document Knowledge Base (Offline Semantic BM25 Search)
+async function loadKbStats() {
+  try {
+    const st = await CW.kbStats();
+    const el = $('#kbStatus');
+    if (!el) return;
+    el.textContent = st.indexed
+      ? `Indexed ${st.fileCount} docs (${st.chunkCount} passages) · updated ${new Date(st.builtAt).toLocaleTimeString()}`
+      : 'Not indexed yet — click "Index Docs" to search local PDFs, DOCX, XLSX & Markdown offline.';
+  } catch {}
+}
+
+$('#kbIndexBtn').onclick = async () => {
+  const btn = $('#kbIndexBtn');
+  btn.disabled = true;
+  btn.textContent = 'Indexing…';
+  try {
+    const r = await CW.indexKb();
+    toast(`Indexed ${r.fileCount} local documents (${r.chunkCount} passages)`);
+    loadKbStats();
+  } catch (e) { toast(e.message, 4000); }
+  finally { btn.disabled = false; btn.textContent = 'Index Docs'; }
+};
+
+async function runKbSearch() {
+  const q = $('#kbSearchInput').value.trim();
+  if (!q) return;
+  const out = $('#kbResults');
+  out.innerHTML = '<div class="muted-note">Searching local document knowledge base…</div>';
+  try {
+    const d = await CW.queryKb({ query: q, topK: 6 });
+    loadKbStats();
+    out.innerHTML = '';
+    if (!d.hits?.length) {
+      out.innerHTML = '<div class="muted-note">No matching passages found in indexed project docs.</div>';
+      return;
+    }
+    for (const h of d.hits) {
+      const card = document.createElement('div');
+      card.className = 'saved-card';
+      card.innerHTML = `
+        <div class="sc-row"><b>${esc(h.path)}</b><span class="slash-badge">§${h.section} · ${h.score}</span></div>
+        <small style="white-space:pre-wrap;color:var(--text-2)">${esc(h.snippet.slice(0, 220))}…</small>`;
+      card.onclick = () => { openPanel('files'); openFileInEditor(h.path); };
+      out.appendChild(card);
+    }
+    const askBtn = document.createElement('button');
+    askBtn.className = 'btn tiny primary';
+    askBtn.textContent = 'Ask Copilot Using These Passages';
+    askBtn.onclick = () => {
+      const ctx = d.hits.slice(0, 4).map((h, i) => `[${i + 1}] ${h.path} (section ${h.section}):\n${h.snippet}`).join('\n\n');
+      sendPrompt(`Answer "${q}" accurately using ONLY the cited local document passages below:\n\n${ctx}`);
+    };
+    out.appendChild(askBtn);
+  } catch (e) {
+    out.innerHTML = `<div class="muted-note">KB search failed: ${esc(e.message)}</div>`;
+  }
+}
+$('#kbSearchBtn').onclick = runKbSearch;
+$('#kbSearchInput').addEventListener('keydown', (e) => { if (e.key === 'Enter') runKbSearch(); });
+
+// 9. Local Scheduled Automations & Folder Watchers
+async function loadAutomations() {
+  try {
+    const d = await CW.listAutomations();
+    S.automations = d.automations || [];
+    const list = $('#automationsList');
+    if (!list) return;
+    list.innerHTML = S.automations.length
+      ? ''
+      : '<div class="muted-note">No automations yet. Click <b>+ Rule</b> to watch a folder or schedule recurring tasks.</div>';
+    for (const a of S.automations) {
+      const card = document.createElement('div');
+      card.className = 'saved-card';
+      const trig = a.triggerType === 'folder_watch'
+        ? `Watch: ${a.watchFolder || '/'} ${a.filePattern ? `(*${a.filePattern}*)` : ''}`
+        : `Every ${a.intervalMinutes} min`;
+      card.innerHTML = `
+        <div class="sc-row">
+          <b>${esc(a.name)}</b>
+          <div class="row-gap">
+            <button class="btn tiny" data-arun title="Run right now">Run</button>
+            <button class="btn tiny ${a.enabled ? 'primary' : ''}" data-atog>${a.enabled ? 'On' : 'Off'}</button>
+            <button class="btn tiny danger" data-adel>✕</button>
+          </div>
+        </div>
+        <small>${esc(trig)} · ${esc(a.mode || 'fast')}${a.lastRunAt ? ` · last ${new Date(a.lastRunAt).toLocaleTimeString()} (${esc(a.lastStatus)})` : ''}</small>`;
+      card.querySelector('[data-arun]').onclick = async (e) => {
+        const b = e.currentTarget; b.disabled = true; b.textContent = 'Running…';
+        try {
+          await CW.runAutomationNow(a.id);
+          loadAutomations(); loadBriefs();
+        } catch (err) { toast(err.message, 4000); }
+        finally { b.disabled = false; b.textContent = 'Run'; }
+      };
+      card.querySelector('[data-atog]').onclick = async () => { await CW.toggleAutomation(a.id); loadAutomations(); };
+      card.querySelector('[data-adel]').onclick = async () => { await CW.deleteAutomation(a.id); loadAutomations(); };
+      list.appendChild(card);
+    }
+  } catch {}
+}
+
+$('#openAutoModalBtn').onclick = () => {
+  $('#autoNameInput').value = '';
+  $('#autoFolderInput').value = '';
+  $('#autoPatternInput').value = '.pdf';
+  $('#autoIntervalInput').value = '60';
+  $('#autoPromptInput').value = '';
+  $('#autoTriggerSelect').value = 'folder_watch';
+  $('#autoFolderRow').hidden = false;
+  $('#autoIntervalRow').hidden = true;
+  $('#automationModal').hidden = false;
+};
+$('#closeAutoModalBtn').onclick = () => { $('#automationModal').hidden = true; };
+$('#cancelAutoBtn').onclick = () => { $('#automationModal').hidden = true; };
+$('#autoTriggerSelect').onchange = () => {
+  const isWatch = $('#autoTriggerSelect').value === 'folder_watch';
+  $('#autoFolderRow').hidden = !isWatch;
+  $('#autoIntervalRow').hidden = isWatch;
+};
+$('#saveAutoBtn').onclick = async () => {
+  const name = $('#autoNameInput').value.trim();
+  const prompt = $('#autoPromptInput').value.trim();
+  if (!prompt) { toast('Enter an automation prompt first'); return; }
+  try {
+    await CW.saveAutomation({
+      name: name || 'Local Automation',
+      triggerType: $('#autoTriggerSelect').value,
+      watchFolder: $('#autoFolderInput').value.trim(),
+      filePattern: $('#autoPatternInput').value.trim(),
+      intervalMinutes: Number($('#autoIntervalInput').value) || 60,
+      mode: $('#autoModeSelect').value || 'fast',
+      prompt,
+    });
+    $('#automationModal').hidden = true;
+    loadAutomations();
+    toast('Automation saved & active');
+  } catch (e) { toast(e.message, 4000); }
+};
+
+// 10. Sidebar Drag-and-Drop Drop Zones (unassign chat to General Chats, or drop OS folder to create Project!)
+const chatListDrop = $('#chatList');
+chatListDrop.addEventListener('dragover', (e) => {
+  if (e.dataTransfer?.types?.includes('application/x-mxcw-chat')) {
+    e.preventDefault();
+    chatListDrop.classList.add('drag-over');
+  }
+});
+chatListDrop.addEventListener('dragleave', (e) => {
+  if (!chatListDrop.contains(e.relatedTarget)) chatListDrop.classList.remove('drag-over');
+});
+chatListDrop.addEventListener('drop', async (e) => {
+  const chatId = e.dataTransfer?.getData('application/x-mxcw-chat');
+  if (!chatId) return;
+  e.preventDefault();
+  e.stopPropagation();
+  chatListDrop.classList.remove('drag-over');
+  const r = await CW.moveChatToProject({ chatId, projectId: '' });
+  S.chats = r.chats || S.chats;
+  if (S.chat?.id === chatId) S.chat.projectId = '';
+  renderSidebarTree();
+  toast('Moved chat to General Chats');
+});
+
+const projZoneDrop = $('#sbProjectsZone');
+projZoneDrop.addEventListener('dragover', (e) => {
+  if (e.dataTransfer?.types?.includes('Files')) {
+    e.preventDefault();
+    e.stopPropagation();
+    projZoneDrop.classList.add('drag-over');
+  }
+});
+projZoneDrop.addEventListener('dragleave', (e) => {
+  if (!projZoneDrop.contains(e.relatedTarget)) projZoneDrop.classList.remove('drag-over');
+});
+projZoneDrop.addEventListener('drop', async (e) => {
+  const files = [...(e.dataTransfer?.files || [])];
+  if (!files.length) return;
+  e.preventDefault();
+  e.stopPropagation();
+  projZoneDrop.classList.remove('drag-over');
+  try {
+    const r = await CW.createProjectFromDropped(files[0]);
+    if (r?.ok) {
+      S.projects = r.projects || S.projects;
+      S.activeProject = r.activeProject;
+      S.settings = r.settings;
+      S.expandedProjects.add(r.project.id);
+      renderSidebarTree();
+      renderWorkspaceUI();
+      renderAutoAcceptPill();
+      loadFiles('');
+      toast(`Created project "${r.project.name}" from dropped folder`);
+      if (r.project.autoMapGraph) triggerBackgroundGraphMap(r.project);
+    }
+  } catch (err) { toast(err.message, 4000); }
+});
 
 boot().catch((e) => toast(`Startup error: ${e.message}`, 5000));
