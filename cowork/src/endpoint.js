@@ -485,11 +485,27 @@ async function chatCompletion({
   });
 }
 
-async function chatViaOpenAI(cfg, { model, systemPrompt, messages, images = [], tools = [], toolChoice = 'auto', think = 'off', signal, onEvent }) {
-  const base = normalizeOpenAIBase(cfg.endpointUrl);
+function buildOpenAIMessages(systemPrompt, messages, images = []) {
   const fullMsgs = [];
   if (systemPrompt) fullMsgs.push({ role: 'system', content: systemPrompt });
   messages.forEach((m, idx) => {
+    // Preserve native assistant tool_calls and role:'tool' turns verbatim for multi-step OpenAI / OpenCode Go agents!
+    if (m.role === 'tool' && m.tool_call_id) {
+      fullMsgs.push({
+        role: 'tool',
+        tool_call_id: String(m.tool_call_id),
+        content: String(m.content || ''),
+      });
+      return;
+    }
+    if (m.role === 'assistant' && Array.isArray(m.tool_calls) && m.tool_calls.length) {
+      fullMsgs.push({
+        role: 'assistant',
+        content: m.content ? String(m.content) : null,
+        tool_calls: m.tool_calls,
+      });
+      return;
+    }
     const role = m.role === 'assistant' ? 'assistant' : 'user';
     const isLastUser = idx === messages.length - 1 && role === 'user' && images.length > 0;
     if (isLastUser) {
@@ -507,6 +523,12 @@ async function chatViaOpenAI(cfg, { model, systemPrompt, messages, images = [], 
       fullMsgs.push({ role, content: String(m.content || '') });
     }
   });
+  return fullMsgs;
+}
+
+async function chatViaOpenAI(cfg, { model, systemPrompt, messages, images = [], tools = [], toolChoice = 'auto', think = 'off', signal, onEvent }) {
+  const base = normalizeOpenAIBase(cfg.endpointUrl);
+  const fullMsgs = buildOpenAIMessages(systemPrompt, messages, images);
 
   const body = {
     model,
@@ -856,26 +878,7 @@ async function chatViaOllama(cfg, { model, systemPrompt, messages, images = [], 
 
 async function chatViaMxgptOpencodeProxy(cfg, { model, systemPrompt, messages, images = [], tools = [], toolChoice = 'auto', think, signal, onEvent }) {
   const t0 = Date.now();
-  const fullMsgs = [];
-  if (systemPrompt) fullMsgs.push({ role: 'system', content: systemPrompt });
-  messages.forEach((m, idx) => {
-    const role = m.role === 'assistant' ? 'assistant' : 'user';
-    const isLastUser = idx === messages.length - 1 && role === 'user' && images.length > 0;
-    if (isLastUser) {
-      fullMsgs.push({
-        role,
-        content: [
-          { type: 'text', text: String(m.content || '') },
-          ...images.map((im) => ({
-            type: 'image_url',
-            image_url: { url: `data:${im.mimeType || 'image/png'};base64,${im.data}` },
-          })),
-        ],
-      });
-    } else {
-      fullMsgs.push({ role, content: String(m.content || '') });
-    }
-  });
+  const fullMsgs = buildOpenAIMessages(systemPrompt, messages, images);
 
   const body = {
     model,

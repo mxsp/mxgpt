@@ -371,11 +371,86 @@ function summarizeBlocksMarkdown(blocks) {
   return parts.join('\n\n');
 }
 
+function buildHistoryMessages(history, useNativeTools, mask) {
+  const slice = (history || []).slice(-12);
+  const out = [];
+  let seq = 0;
+
+  for (let i = 0; i < slice.length; i++) {
+    const m = slice[i];
+    if (!m) continue;
+
+    if (useNativeTools && m.role === 'assistant' && ((m.codeRuns?.length || 0) + (m.fileActions?.length || 0) + (m.tableEdits?.length || 0) > 0)) {
+      const cleanTxt = String(m.content || '')
+        .replace(/^Prepared \*\*\d+\*\* (?:file action|code run|spreadsheet edit)s?[^\n]*\n*/gim, '')
+        .trim();
+      const toolCalls = [];
+      const toolResults = [];
+
+      for (const a of m.fileActions || []) {
+        const callId = `call_hist_${++seq}`;
+        const fnName = a.type === 'write' ? 'write_file' : 'file_action';
+        const args = fnName === 'write_file'
+          ? { path: a.path || '', content: a.content || '', reason: a.reason || '' }
+          : { type: a.type, path: a.path || '', from: a.from || '', to: a.to || '', content: a.content, reason: a.reason || '' };
+        toolCalls.push({ id: callId, type: 'function', function: { name: fnName, arguments: mask(JSON.stringify(args)) } });
+        toolResults.push({ role: 'tool', tool_call_id: callId, content: mask(`${a.status || 'applied'}: ${a.result || a.path || a.to || 'done'}`) });
+      }
+      for (const r of m.codeRuns || []) {
+        const callId = `call_hist_${++seq}`;
+        const args = { title: r.title || r.language, language: r.language || 'bash', code: r.code || r.command || '', reason: r.reason || '' };
+        toolCalls.push({ id: callId, type: 'function', function: { name: 'run_code', arguments: mask(JSON.stringify(args)) } });
+        toolResults.push({ role: 'tool', tool_call_id: callId, content: mask(`Exit ${r.exitCode ?? 0}:\n${String(r.output || '(no output)').slice(0, 3500)}`) });
+      }
+      for (const t of m.tableEdits || []) {
+        const callId = `call_hist_${++seq}`;
+        const args = { path: t.path, sheetIndex: t.sheetIndex || 0, summary: t.summary || '', operations: t.operations || [] };
+        toolCalls.push({ id: callId, type: 'function', function: { name: 'edit_table', arguments: mask(JSON.stringify(args)) } });
+        toolResults.push({ role: 'tool', tool_call_id: callId, content: mask(`${t.status || 'applied'}: ${t.result || t.path}`) });
+      }
+
+      out.push({ role: 'assistant', content: cleanTxt ? mask(cleanTxt) : null, tool_calls: toolCalls });
+      // If the very next message is the Harness feedback for these exact tool calls, fold its text into the tool response instead of duplicating as a user message!
+      const next = slice[i + 1];
+      if (next && next.role === 'user' && (next.isHarness || /^(Code execution (finished|failed)|Code executed on |File actions applied automatically)/i.test(String(next.content || '').trim()))) {
+        if (toolResults.length === 1 && !m.codeRuns?.[0]?.output) {
+          toolResults[0].content = mask(String(next.content || '').slice(0, 3500));
+        }
+        i++; // skip redundant harness user bubble since tool response already carries the output
+      }
+      out.push(...toolResults);
+      continue;
+    }
+
+    const fm = formatHistoryMessage(m);
+    out.push({ role: fm.role, content: mask(fm.content) });
+  }
+  return out;
+}
+
+function formatHistoryMessage(m) {
+  let txt = String(m?.content || '').trim();
+  if (m?.role === 'assistant') {
+    txt = txt.replace(/^Prepared \*\*\d+\*\* (?:file action|code run|spreadsheet edit)s?[^\n]*\n*/gim, '').trim();
+    const notes = [];
+    for (const a of m.fileActions || []) {
+      notes.push(`Completed ${a.type} ${a.path || a.to || a.from} (${a.status || 'done'}).`);
+    }
+    for (const r of m.codeRuns || []) {
+      notes.push(`Executed ${r.language || 'code'} "${r.title || ''}" (exit ${r.exitCode ?? '?'}).`);
+    }
+    if (notes.length) txt = [txt, notes.join(' ')].filter(Boolean).join('\n');
+  }
+  return { role: m?.role === 'assistant' ? 'assistant' : 'user', content: txt || '(done)' };
+}
+
 function isPrematureIntentStop(content, toolCalls = []) {
   if (Array.isArray(toolCalls) && toolCalls.length > 0) return false;
   const txt = String(content || '').trim();
   if (!txt) return true;
   if (/```(?:file-actions|code-run|table-edits)\b/i.test(txt)) return false;
+  // Catch models mimicking synthetic tool text ("Prepared 1 code run..." or "[Tool run_code ...]") without actually calling a tool!
+  if (/^(?:Prepared\s+\*{0,2}\d+\*{0,2}\s+(?:code run|file action|spreadsheet edit)|\[Tool\s+)/i.test(txt)) return true;
   if (txt.length > 360) return false;
   // Detect short narration-only stops like "Ich baue jetzt eine Flask-App und starte sie im Hintergrund." or "Let me create app.py and run it."
   const announcesAction = /\b(ich (baue|erstelle|starte|führe|fuehre|schreibe|lege|mache|prüfe|pruefe|installiere|öffne|oeffne)|erstelle jetzt|baue jetzt|starte jetzt|lass mich|let me|i['’]ll|i will|now i['’]?ll|now i will|going to (create|build|write|run|start|launch|install|inspect)|creating|building|starting|launching|running)\b/i.test(txt);
@@ -837,7 +912,7 @@ async function runCoworkTurn({
 
   const codeRunHint = toolsCfg.container
     ? (resolvedExecTarget === 'host'
-      ? `Code execution is ENABLED on the user's preselected standard environment: ON-MACHINE HOST (runs directly in ${workspace} via local python3, node, or ${process.platform === 'win32' ? 'PowerShell' : 'bash'}). When executing Python, Node.js, or Shell code on the workspace helps verify, test, compute, create .xlsx/.pdf/.docx files, or automate, include a \`\`\`code-run JSON block: {"title":"short label","language":"python"|"javascript"|"bash","code":"...","reason":"why"}. Use paths relative to the working directory (${workspace}); do NOT hardcode /workspace.`
+      ? `Code execution is ENABLED on the user's preselected standard environment: ON-MACHINE HOST (runs directly in ${workspace} via local python3, node, or ${process.platform === 'win32' ? 'PowerShell' : 'bash'}). When executing Python, Node.js, or Shell code on the workspace helps verify, test, compute, create .xlsx/.pdf/.docx files, or automate, include a \`\`\`code-run JSON block: {"title":"short label","language":"python"|"javascript"|"bash","code":"...","reason":"why"}. Use paths relative to the working directory (${workspace}); do NOT hardcode /workspace. On Linux with PEP 668 externally-managed Python, use a local venv (python3 -m venv .venv && .venv/bin/pip install ...) or pip install --break-system-packages.`
       : `Code execution is ENABLED on the user's preselected standard environment: ISOLATED CONTAINER (Docker/Podman mounted at /workspace; default image ${cfg.containerImage || 'python:3.12-slim'}). When executing Python, Node.js, or Shell code on the workspace helps verify, test, compute, create .xlsx/.pdf/.docx files, or automate, include a \`\`\`code-run JSON block: {"title":"short label","language":"python"|"javascript"|"bash","image":"python:3.12-slim","code":"...","reason":"why"}.`)
     : '';
   const noNativeToolHint = `CRITICAL: Do NOT call native function tools (none are attached) and NEVER stop after internal reasoning with an empty reply. Always output your complete final Markdown answer and any fenced \`\`\`code-run, \`\`\`file-actions, or \`\`\`table-edits blocks directly in one response.`;
@@ -903,7 +978,7 @@ async function runCoworkTurn({
 
     const userContent = ctxParts.length ? `${ctxParts.join('\n\n')}\n\nUser request:\n${prompt}` : prompt;
     const msgs = [
-      ...history.slice(-8).map((m) => ({ role: m.role, content: mask(m.content) })),
+      ...buildHistoryMessages(history, useNativeTools, mask),
       { role: 'user', content: mask(userContent) },
     ];
     const maskedSys = mask(sys);
@@ -932,7 +1007,9 @@ async function runCoworkTurn({
     if (isPrematureIntentStop(res.content, res.toolCalls) && !signal?.aborted) {
       onEvent('phase', { phase: 'synthesizing', label: 'Executing planned action…' });
       const thoughtHint = String(res.thinking || '').trim().slice(0, 1200);
-      const partialTxt = String(res.content || '').trim();
+      const rawPartial = String(res.content || '').trim();
+      const isFakePrepared = /^Prepared\s+\*{0,2}\d+\*{0,2}\s+(?:code run|file action|spreadsheet edit)/i.test(rawPartial);
+      const partialTxt = isFakePrepared ? '' : rawPartial;
       const recoverRes = await endpoint.chatCompletion({
         tier: mode,
         model: chosenModel,
@@ -943,7 +1020,7 @@ async function runCoworkTurn({
           {
             role: 'user',
             content: mask(
-              `${thoughtHint ? `Your internal plan was:\n${thoughtHint}\n\n` : ''}${partialTxt ? `You wrote "${partialTxt}" but stopped without calling any tool.` : 'You stopped after thinking without writing a visible answer or tool call.'} Execute the step RIGHT NOW using write_file / file_action / run_code (or emit fenced \`\`\`file-actions / \`\`\`code-run blocks). Do not stop with just a promise.`
+              `${thoughtHint ? `Your internal plan was:\n${thoughtHint}\n\n` : ''}${isFakePrepared ? 'You wrote plain text "Prepared 1 code run..." instead of calling a tool.' : (partialTxt ? `You wrote "${partialTxt}" but stopped without calling any tool.` : 'You stopped after thinking without writing a visible answer or tool call.')} Call write_file / file_action / run_code RIGHT NOW (do NOT write "Prepared 1 code run..." as plain text).`
             ),
           },
         ],
@@ -1177,7 +1254,7 @@ Rules:
   synthPromptParts.push(`[User Request]\n${prompt}`);
 
   const synthMessages = [
-    ...history.slice(-6).map((m) => ({ role: m.role, content: mask(m.content) })),
+    ...buildHistoryMessages(history, useNativeTools, mask),
     { role: 'user', content: mask(synthPromptParts.join('\n\n')) },
   ];
   const maskedSynthSys = mask(synthSys);
@@ -1206,7 +1283,9 @@ Rules:
   if (isPrematureIntentStop(finalRes.content, finalRes.toolCalls) && !signal?.aborted) {
     onEvent('phase', { phase: 'synthesizing', label: 'Executing planned action…' });
     const thoughtHint = String(finalRes.thinking || '').trim().slice(0, 1200);
-    const partialTxt = String(finalRes.content || '').trim();
+    const rawPartial = String(finalRes.content || '').trim();
+    const isFakePrepared = /^Prepared\s+\*{0,2}\d+\*{0,2}\s+(?:code run|file action|spreadsheet edit)/i.test(rawPartial);
+    const partialTxt = isFakePrepared ? '' : rawPartial;
     const recoverRes = await endpoint.chatCompletion({
       tier: 'smart',
       model: orchestratorModel,
@@ -1217,7 +1296,7 @@ Rules:
         {
           role: 'user',
           content: mask(
-            `${thoughtHint ? `Your internal plan was:\n${thoughtHint}\n\n` : ''}${partialTxt ? `You wrote "${partialTxt}" but stopped without calling any tool.` : 'You stopped after thinking without writing a visible answer or tool call.'} Execute the step RIGHT NOW using write_file / file_action / run_code (or emit fenced \`\`\`file-actions / \`\`\`code-run blocks). Do not stop with just a promise.`
+            `${thoughtHint ? `Your internal plan was:\n${thoughtHint}\n\n` : ''}${isFakePrepared ? 'You wrote plain text "Prepared 1 code run..." instead of calling a tool.' : (partialTxt ? `You wrote "${partialTxt}" but stopped without calling any tool.` : 'You stopped after thinking without writing a visible answer or tool call.')} Call write_file / file_action / run_code RIGHT NOW (do NOT write "Prepared 1 code run..." as plain text).`
           ),
         },
       ],
