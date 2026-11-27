@@ -11,6 +11,7 @@ const path = require('path');
 const os = require('os');
 const zlib = require('zlib');
 const storage = require('./storage');
+const officeExport = require('./office-export');
 
 const IGNORE_DIRS = new Set([
   'node_modules', '.git', '.svn', '.hg', '.mx-cowork-trash',
@@ -539,6 +540,142 @@ async function undoFileAction(undoId) {
   throw new Error(`Cannot undo action type: ${entry.type}`);
 }
 
+async function readFileContent(relPath, maxChars = 120000, baseDir = getWorkspace()) {
+  const { abs, rel } = resolveSafe(relPath, baseDir);
+  const st = await fsp.stat(abs);
+  const content = await readTextContent(abs, maxChars);
+  return {
+    path: rel,
+    absPath: abs,
+    name: path.basename(abs),
+    size: st.size,
+    sizeLabel: formatBytes(st.size),
+    content,
+  };
+}
+
+async function parseTableFile(relPath, baseDir = getWorkspace()) {
+  const { abs, rel } = resolveSafe(relPath, baseDir);
+  const name = path.basename(abs);
+  const ext = path.extname(name).toLowerCase();
+  if (ext === '.xlsx') {
+    const buf = await fsp.readFile(abs);
+    const parsed = officeExport.parseXlsxBuffer(buf);
+    const sheets = parsed.sheets || [{ name: 'Sheet1', rows: [['']] }];
+    return {
+      path: rel,
+      name,
+      ext,
+      editable: true,
+      delimiter: ',',
+      sheets: sheets.map((s) => ({ name: s.name, rows: s.rows.slice(0, 600), totalRows: s.rows.length })),
+      rows: sheets[0].rows.slice(0, 600),
+      totalRows: sheets[0].rows.length,
+    };
+  }
+  const raw = await fsp.readFile(abs, 'utf8');
+  const parsed = officeExport.parseCsvText(raw);
+  return {
+    path: rel,
+    name,
+    ext,
+    editable: true,
+    delimiter: parsed.delimiter,
+    sheets: [{ name: name.replace(/\.[^.]+$/, '') || 'Data', rows: parsed.rows.slice(0, 600), totalRows: parsed.rows.length }],
+    rows: parsed.rows.slice(0, 600),
+    totalRows: parsed.rows.length,
+  };
+}
+
+async function saveTableFile({ path: relPath, rows, sheets, sheetIndex = 0, delimiter = ',' }, baseDir = getWorkspace()) {
+  const root = path.resolve(baseDir);
+  const target = resolveSafe(relPath, root);
+  await fsp.mkdir(path.dirname(target.abs), { recursive: true });
+
+  let hadPrev = false;
+  let prevBackup = '';
+  if (fs.existsSync(target.abs)) {
+    hadPrev = true;
+    const trashDir = path.join(root, '.mx-cowork-trash');
+    await fsp.mkdir(trashDir, { recursive: true });
+    prevBackup = path.join(trashDir, `bak_${Date.now()}_${path.basename(target.abs)}`);
+    await fsp.copyFile(target.abs, prevBackup);
+  }
+
+  const ext = path.extname(target.abs).toLowerCase();
+  if (ext === '.xlsx') {
+    let allSheets = Array.isArray(sheets) && sheets.length
+      ? sheets.map((s) => ({ name: s.name || 'Sheet1', rows: s.rows || [['']] }))
+      : null;
+    if (!allSheets && hadPrev) {
+      try {
+        const prevParsed = officeExport.parseXlsxBuffer(await fsp.readFile(target.abs));
+        allSheets = prevParsed.sheets;
+      } catch {}
+    }
+    if (!allSheets || !allSheets.length) allSheets = [{ name: 'Sheet1', rows: rows || [['']] }];
+    if (Array.isArray(rows)) {
+      const idx = Math.max(0, Math.min(allSheets.length - 1, Number(sheetIndex) || 0));
+      allSheets[idx] = { name: allSheets[idx].name || `Sheet${idx + 1}`, rows };
+    }
+    const buf = officeExport.buildXlsxBuffer(allSheets);
+    await fsp.writeFile(target.abs, buf);
+  } else {
+    const csvStr = officeExport.serializeCsv(rows || [], ext === '.tsv' ? '\t' : (delimiter || ','));
+    await fsp.writeFile(target.abs, csvStr, 'utf8');
+  }
+
+  const undo = storage.pushUndo({
+    type: 'write',
+    path: target.rel,
+    hadPrev,
+    prevBackup,
+    workspace: root,
+    summary: `Updated spreadsheet ${target.rel}`,
+  });
+  return { ok: true, path: target.rel, summary: `Saved ${target.rel}`, undoId: undo.id };
+}
+
+async function listOfficeFiles(baseDir = getWorkspace(), maxFiles = 40) {
+  const root = path.resolve(baseDir);
+  const OFFICE_LIST_EXTS = new Set(['.xlsx', '.csv', '.tsv', '.docx', '.pdf', '.pptx', '.odt', '.ods']);
+  const found = [];
+  let scanned = 0;
+
+  async function walk(dir, depth) {
+    if (depth > 4 || found.length >= maxFiles || scanned >= 1200) return;
+    let entries;
+    try { entries = await fsp.readdir(dir, { withFileTypes: true }); } catch { return; }
+    for (const d of entries) {
+      if (found.length >= maxFiles || scanned >= 1200) break;
+      const full = path.join(dir, d.name);
+      if (d.isDirectory()) {
+        if (IGNORE_DIRS.has(d.name) || d.name.startsWith('.')) continue;
+        await walk(full, depth + 1);
+      } else {
+        scanned++;
+        const ext = path.extname(d.name).toLowerCase();
+        if (OFFICE_LIST_EXTS.has(ext)) {
+          try {
+            const st = await fsp.stat(full);
+            found.push({
+              name: d.name,
+              relPath: path.relative(root, full).replace(/\\/g, '/'),
+              ext,
+              size: st.size,
+              sizeLabel: formatBytes(st.size),
+              mtime: st.mtimeMs,
+            });
+          } catch {}
+        }
+      }
+    }
+  }
+  await walk(root, 0);
+  found.sort((a, b) => b.mtime - a.mtime);
+  return found;
+}
+
 module.exports = {
   quickFolders,
   getWorkspace,
@@ -546,7 +683,11 @@ module.exports = {
   resolveSafe,
   listDir,
   readTextContent,
+  readFileContent,
   readFileForEdit,
+  parseTableFile,
+  saveTableFile,
+  listOfficeFiles,
   searchFiles,
   folderOverview,
   executeFileAction,

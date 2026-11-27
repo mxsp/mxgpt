@@ -63,6 +63,12 @@ const S = {
   viewingTempStreamId: null,
   expandedProjects: new Set(),
   automations: [],
+  queuedPrompts: new Map(), // chatKey -> [{ id, text }]
+  editorSheetIndex: 0,
+  editorTableDirty: false,
+  selectedCell: null, // { row, col, colLetter, value }
+  officeFiles: [],
+  copilotScanTimer: null,
 };
 
 function esc(s) {
@@ -408,6 +414,7 @@ function renderMd(raw, opts = {}) {
     .replace(/```code-run[\s\S]*?```/gi, '')
     .replace(/```memory-save[\s\S]*?```/gi, '')
     .replace(/```action-items[\s\S]*?```/gi, '')
+    .replace(/```table-edits[\s\S]*?```/gi, '')
     .trim();
   if (!src) return '';
 
@@ -563,7 +570,7 @@ function openPanel(tab, toggleIfSame = false) {
   $$('.pane').forEach((p) => p.classList.toggle('active', p.dataset.pane === tab));
 
   if (tab === 'artifact') renderArtifactPane();
-  if (tab === 'files' && !S.editor) loadFiles(S.cwd);
+  if (tab === 'files' && !S.editor) { loadFiles(S.cwd); loadOfficeQuickStrip(); }
   if (tab === 'graph') ensureGraphLoaded();
   if (tab === 'container') { loadContainerStatus(false); loadContainerHistory(); }
   if (tab === 'notes') { loadTasks(); loadAutomations(); loadNotes(); }
@@ -678,7 +685,7 @@ async function boot() {
   S.projects = projData?.projects || [];
   S.activeProject = projData?.activeProject || null;
 
-  $('#appVersionBadge').textContent = `v${info.version || '1.6.0'}`;
+  $('#appVersionBadge').textContent = `v${info.version || '1.7.0'}`;
   applyThemeUI(S.settings.theme || 'light');
   setMode(S.settings.defaultMode || 'copilot');
   setThink(S.settings.think || 'low');
@@ -702,7 +709,7 @@ async function boot() {
     showLoginScreen();
   }
 
-  await Promise.all([loadChats(), loadFiles(''), loadNotes(), loadTasks(), loadWorkflows(), loadAutomations(), loadKbStats(), loadBriefs(), loadUndo()]);
+  await Promise.all([loadChats(), loadFiles(''), loadOfficeQuickStrip(), loadNotes(), loadTasks(), loadWorkflows(), loadAutomations(), loadKbStats(), loadBriefs(), loadUndo()]);
   checkConnectionQuiet();
   checkUpdatesQuiet();
   loadContainerStatus(false);
@@ -816,12 +823,70 @@ function getStreamForCurrentView() {
   return null;
 }
 
+function getCurrentQueueKey() {
+  return S.chat?.id || S.viewingTempStreamId || '__new__';
+}
+
+function renderQueuedBar() {
+  const bar = $('#queuedBar');
+  if (!bar) return;
+  const key = getCurrentQueueKey();
+  const q = S.queuedPrompts.get(key) || [];
+  if (!q.length) {
+    bar.hidden = true;
+    bar.innerHTML = '';
+    return;
+  }
+  bar.hidden = false;
+  bar.innerHTML = '';
+  q.forEach((item, idx) => {
+    const row = document.createElement('div');
+    row.className = 'queued-item';
+    row.innerHTML = `
+      <span class="queued-num">Queued #${idx + 1}</span>
+      <span class="queued-txt" title="${esc(item.text)}">${esc(item.text)}</span>
+      <button type="button" class="btn tiny" data-qedit>Edit</button>
+      <button type="button" class="icon-btn sm" data-qdel title="Remove from queue"><svg><use href="#i-x"/></svg></button>`;
+    row.querySelector('[data-qedit]').onclick = () => {
+      q.splice(idx, 1);
+      if (!q.length) S.queuedPrompts.delete(key);
+      const inp = $('#promptInput');
+      inp.value = item.text;
+      inp.style.height = 'auto';
+      inp.style.height = Math.min(inp.scrollHeight, 200) + 'px';
+      inp.focus();
+      renderQueuedBar();
+    };
+    row.querySelector('[data-qdel]').onclick = () => {
+      q.splice(idx, 1);
+      if (!q.length) S.queuedPrompts.delete(key);
+      renderQueuedBar();
+    };
+    bar.appendChild(row);
+  });
+}
+
+function queuePromptForCurrentChat(rawText) {
+  const text = String(rawText || '').trim();
+  if (!text) return false;
+  const key = getCurrentQueueKey();
+  const list = S.queuedPrompts.get(key) || [];
+  list.push({ id: 'q_' + Date.now().toString(36), text });
+  S.queuedPrompts.set(key, list);
+  renderQueuedBar();
+  toast(`Pre-sent & queued (#${list.length}) — will send automatically next`);
+  return true;
+}
+
 function updateSendButtonState() {
   const curStream = getStreamForCurrentView();
   const busy = Boolean(curStream);
   $('#sendBtn').classList.toggle('stop', busy);
   $('#sendIcon use').setAttribute('href', busy ? '#i-stop' : '#i-send');
   $('#sendBtn').title = busy ? 'Stop generating in this chat' : 'Send (Enter)';
+  const qBtn = $('#queueSendBtn');
+  if (qBtn) qBtn.hidden = !busy;
+  renderQueuedBar();
 }
 
 function createChatRowEl(c) {
@@ -999,6 +1064,7 @@ async function selectProjectById(id, quiet = false) {
     renderAutoAcceptPill();
     renderPinned();
     loadFiles('');
+    loadOfficeQuickStrip();
     loadTasks();
     loadKbStats();
 
@@ -1216,18 +1282,38 @@ function newChat(projectIdOverride = undefined) {
   $('#promptInput').focus();
 }
 
+function getActiveViewContext() {
+  if (!S.editor) {
+    return { activePanel: S.panelOpen ? S.panelTab : '', openFile: null };
+  }
+  return {
+    activePanel: S.panelOpen ? S.panelTab : 'files',
+    openFile: {
+      path: S.editor.path,
+      name: S.editor.name,
+      isTabular: Boolean(S.editorTable),
+      sheetIndex: S.editorSheetIndex || 0,
+      selectedCell: S.selectedCell ? { ...S.selectedCell } : null,
+    },
+  };
+}
+
 // ---- Messages Rendering (exact mx-GPT webapp layout)
 function renderPinned() {
   const bar = $('#pinnedBar');
-  if (!S.pinnedFiles.length && !S.attachedImages.length) { bar.hidden = true; bar.innerHTML = ''; return; }
+  const hasOpenCtx = Boolean(S.editor && S.editor.path);
+  if (!S.pinnedFiles.length && !S.attachedImages.length && !hasOpenCtx) { bar.hidden = true; bar.innerHTML = ''; return; }
   bar.hidden = false;
+  const ctxPill = hasOpenCtx
+    ? `<span class="ctx-view-pill" title="Copilot automatically sees this open sidebar file &amp; selected cell"><span class="chat-live-dot"></span><span>Live Context: ${esc(S.editor.name)}${S.editorTable && S.selectedCell ? ` · ${esc(S.selectedCell.colLetter)}${S.selectedCell.row + 1}` : ''}</span></span>`
+    : '';
   const filePills = S.pinnedFiles.map((p) =>
     `<span class="attach-pill"><svg style="width:14px;height:14px;color:var(--accent)"><use href="#i-file"/></svg><span title="${esc(p)}">${esc(p)}</span><button data-unpin="${esc(p)}" title="Remove"><svg style="width:12px;height:12px"><use href="#i-x"/></svg></button></span>`
   ).join('');
   const imgPills = S.attachedImages.map((im) =>
     `<span class="img-attach-pill"><img src="data:${esc(im.mimeType)};base64,${im.data}" alt="screenshot" /><span>${esc(im.name)}</span><button data-unimg="${esc(im.id)}" title="Remove screenshot"><svg style="width:12px;height:12px"><use href="#i-x"/></svg></button></span>`
   ).join('');
-  bar.innerHTML = filePills + imgPills;
+  bar.innerHTML = ctxPill + filePills + imgPills;
   $$('[data-unpin]', bar).forEach((b) => {
     b.onclick = () => {
       S.pinnedFiles = S.pinnedFiles.filter((x) => x !== b.dataset.unpin);
@@ -1589,6 +1675,7 @@ function renderMessages(forceScroll = true) {
     }
 
     if (m.fileActions?.length) body.appendChild(renderFileActionsCard(m.fileActions));
+    if (m.tableEdits?.length) body.appendChild(renderTableEditsCard(m.tableEdits));
     if (m.codeRuns?.length) body.appendChild(renderCodeRunsCard(m.codeRuns));
     if (m.graphReady) {
       const gb = document.createElement('div');
@@ -1836,13 +1923,25 @@ function handleGlobalCoworkEvent({ streamId: sid, event: ev, data: d }) {
   const live = viewing && st.live?.el?.isConnected ? st.live : null;
 
   if (ev === 'chat' && d.chat) {
+    // Migrate any pre-sent queued messages from temp streamId to real chat.id
+    const tmpQ = S.queuedPrompts.get(sid);
+    if (tmpQ?.length) {
+      const existing = S.queuedPrompts.get(d.chat.id) || [];
+      S.queuedPrompts.set(d.chat.id, [...existing, ...tmpQ]);
+      S.queuedPrompts.delete(sid);
+    }
     st.chatId = d.chat.id;
     if (viewing) {
       S.chat = d.chat;
       S.viewingTempStreamId = null;
       $('#chatTitle').textContent = d.chat.title || 'New chat';
+      renderQueuedBar();
     }
     loadChats();
+  } else if (ev === 'copilot_cursor') {
+    if (viewing && d?.path) {
+      startCopilotReadingCursor(d.path, d.label || `Reading ${d.path}…`);
+    }
   } else if (ev === 'phase') {
     st.assistant.queuePos = 0;
     st.assistant.livePhase = d.label || d.phase;
@@ -1909,6 +2008,14 @@ function handleGlobalCoworkEvent({ streamId: sid, event: ev, data: d }) {
     if (!st.proseTimer) st.proseTimer = setTimeout(() => flushStreamProse(st), 75);
   } else if (ev === 'file_actions') {
     st.assistant.fileActions = d;
+  } else if (ev === 'table_edits') {
+    st.assistant.tableEdits = d;
+    if (viewing && Array.isArray(d) && d.length) {
+      const first = d[0];
+      if (first.status === 'applied') {
+        playCopilotTableEditsLive(first, { applyToDisk: false });
+      }
+    }
   } else if (ev === 'code_runs') {
     st.assistant.codeRuns = d;
   } else if (ev === 'graph_ready') {
@@ -1924,11 +2031,11 @@ function handleGlobalCoworkEvent({ streamId: sid, event: ev, data: d }) {
   } else if (ev === 'done') {
     if (st.proseTimer) { clearTimeout(st.proseTimer); st.proseTimer = null; }
     if (st.thinkTimer) { clearTimeout(st.thinkTimer); st.thinkTimer = null; }
+    stopCopilotReadingCursor();
     Object.assign(st.assistant, d.message || {}, { streaming: false, livePhase: '' });
     S.activeStreams.delete(sid);
     if (isViewingStream(st)) {
       if (!S.messages.includes(st.assistant)) {
-        // Reload from persisted chat so message history is 100% authoritative
         openChat(st.chatId).then(() => syncStreamArtifacts(st, false));
       } else {
         renderMessages(false);
@@ -1939,9 +2046,21 @@ function handleGlobalCoworkEvent({ streamId: sid, event: ev, data: d }) {
       toast(`Finished: ${d.chat?.title || 'Background chat'}`);
     }
     loadChats();
+    // Auto-dispatch next pre-sent queued follow-up message for this chat!
+    const qKey = st.chatId || sid;
+    const qList = S.queuedPrompts.get(qKey);
+    if (qList && qList.length) {
+      const next = qList.shift();
+      if (!qList.length) S.queuedPrompts.delete(qKey);
+      renderQueuedBar();
+      setTimeout(() => {
+        if (next?.text) sendPrompt(next.text, { forceChatId: st.chatId, forceProjectId: st.projectId });
+      }, 120);
+    }
   } else if (ev === 'stopped') {
     if (st.proseTimer) clearTimeout(st.proseTimer);
     if (st.thinkTimer) clearTimeout(st.thinkTimer);
+    stopCopilotReadingCursor();
     st.assistant.streaming = false;
     st.assistant.livePhase = '';
     S.activeStreams.delete(sid);
@@ -1953,6 +2072,7 @@ function handleGlobalCoworkEvent({ streamId: sid, event: ev, data: d }) {
   } else if (ev === 'error') {
     if (st.proseTimer) clearTimeout(st.proseTimer);
     if (st.thinkTimer) clearTimeout(st.thinkTimer);
+    stopCopilotReadingCursor();
     st.assistant.livePhase = '';
     st.assistant.streaming = false;
     st.assistant.content += `\n\n> **Error:** ${d.message}`;
@@ -1966,10 +2086,12 @@ function handleGlobalCoworkEvent({ streamId: sid, event: ev, data: d }) {
   }
 }
 
-// ---- Send / Stream Cowork Turn (Concurrent Multi-Model Safe!)
-async function sendPrompt(overrideText = null) {
-  const curStream = getStreamForCurrentView();
-  if (curStream) {
+// ---- Send / Stream Cowork Turn (Concurrent Multi-Model Safe + Pre-Send Queue!)
+async function sendPrompt(overrideText = null, opts = {}) {
+  const { forceChatId = null, forceProjectId = undefined } = opts;
+  const curStream = !forceChatId ? getStreamForCurrentView() : null;
+  if (curStream && overrideText === null) {
+    // Clicking Stop button stops current chat; if user typed text & hit Queue/Enter, queue instead!
     if (curStream.chatId) CW.stopCowork(curStream.chatId).catch(() => {});
     return;
   }
@@ -1983,22 +2105,22 @@ async function sendPrompt(overrideText = null) {
   const streamId = 's_' + Date.now().toString(36) + '_' + Math.random().toString(36).slice(2, 6);
   const imagesToSend = S.attachedImages.map(({ mimeType, data, name }) => ({ mimeType, data, name }));
   const pinnedToSend = [...S.pinnedFiles];
-  const targetChatId = S.chat?.id || null;
-  const targetProjectId = S.chat?.projectId !== undefined ? S.chat.projectId : (S.activeProject?.id || '');
+  const targetChatId = forceChatId || S.chat?.id || null;
+  const targetProjectId = forceProjectId !== undefined
+    ? forceProjectId
+    : (S.chat?.projectId !== undefined ? S.chat.projectId : (S.activeProject?.id || ''));
   const chosenMode = S.mode;
   const chosenThink = S.think;
   const shieldOn = S.piiShield;
+  const activeContext = getActiveViewContext();
+  const isViewingTarget = !forceChatId || S.chat?.id === forceChatId;
 
-  // Clear attached screenshots after capturing them for this turn
   if (S.attachedImages.length) {
     S.attachedImages = [];
     renderPinned();
   }
 
   const userMsg = { id: 'tmp-u-' + streamId, role: 'user', content: prompt };
-  S.messages.push(userMsg);
-  renderMessages(true);
-
   const initialPhase = chosenMode === 'copilot_b'
     ? 'Copilot (B) planning…'
     : chosenMode === 'copilot'
@@ -2015,14 +2137,21 @@ async function sendPrompt(overrideText = null) {
     workers: [],
     sources: [],
     fileActions: [],
+    tableEdits: [],
     codeRuns: [],
     shieldSummary: null,
     livePhase: initialPhase,
     queuePos: 0,
     streaming: true,
   };
-  S.messages.push(assistant);
-  const live = mountLiveAssistantDom(initialPhase);
+
+  let live = null;
+  if (isViewingTarget) {
+    S.messages.push(userMsg);
+    renderMessages(true);
+    S.messages.push(assistant);
+    live = mountLiveAssistantDom(initialPhase);
+  }
 
   const st = {
     streamId,
@@ -2038,11 +2167,16 @@ async function sendPrompt(overrideText = null) {
     completedArtIds: new Set(),
   };
   S.activeStreams.set(streamId, st);
-  if (!targetChatId) S.viewingTempStreamId = streamId;
+  if (!targetChatId && isViewingTarget) S.viewingTempStreamId = streamId;
   updateSendButtonState();
   renderSidebarTree();
 
-  // Fire concurrently — user can immediately switch to another chat/project and launch another model!
+  // If user has a file/spreadsheet open right now, immediately start the gentle live reading cursor!
+  if (isViewingTarget && activeContext.openFile?.path) {
+    startCopilotReadingCursor(activeContext.openFile.path, `Reading ${activeContext.openFile.name}…`);
+  }
+
+  // Fire concurrently — user can pre-send follow-ups OR switch chats & run another model!
   CW.runCowork({
     streamId,
     chatId: targetChatId,
@@ -2052,6 +2186,7 @@ async function sendPrompt(overrideText = null) {
     prompt,
     pinnedFiles: pinnedToSend,
     images: imagesToSend,
+    activeContext,
     piiShield: shieldOn,
     toolOverrides: {
       toolWebSearch: S.toolWebSearch,
@@ -2209,21 +2344,389 @@ function updateEditorPinBtn() {
   $('#edPinBtn').classList.toggle('primary', pinned);
 }
 
+function colToLetter(n) {
+  let s = '';
+  let idx = n + 1;
+  while (idx > 0) {
+    const rem = (idx - 1) % 26;
+    s = String.fromCharCode(65 + rem) + s;
+    idx = Math.floor((idx - 1) / 26);
+  }
+  return s;
+}
+
+async function loadOfficeQuickStrip() {
+  const bar = $('#officeQuickBar');
+  if (!bar) return;
+  try {
+    const d = await CW.listOfficeFiles();
+    S.officeFiles = d.files || [];
+    if (!S.officeFiles.length) { bar.hidden = true; bar.innerHTML = ''; return; }
+    bar.hidden = false;
+    bar.innerHTML = '<span class="office-quick-lbl">Office Docs</span>';
+    for (const f of S.officeFiles.slice(0, 12)) {
+      const extClean = (f.ext || '').replace(/^\./, '').toLowerCase();
+      const btn = document.createElement('button');
+      btn.type = 'button';
+      btn.className = 'office-chip';
+      btn.title = `Open ${f.relPath} (${f.sizeLabel}) in Live Sidebar`;
+      btn.innerHTML = `<span class="office-ext ${esc(extClean)}">${esc(extClean.toUpperCase())}</span><span>${esc(f.name)}</span>`;
+      btn.onclick = () => openFileInEditor(f.relPath);
+      bar.appendChild(btn);
+    }
+  } catch {
+    bar.hidden = true;
+  }
+}
+
+function getCurrentSheetObj() {
+  if (!S.editorTable) return null;
+  if (Array.isArray(S.editorTable.sheets) && S.editorTable.sheets.length) {
+    const idx = Math.max(0, Math.min(S.editorTable.sheets.length - 1, S.editorSheetIndex || 0));
+    return S.editorTable.sheets[idx];
+  }
+  return { name: 'Sheet1', rows: S.editorTable.rows || [] };
+}
+
+function renderSheetTabs() {
+  const wrap = $('#edSheetTabs');
+  if (!wrap) return;
+  const sheets = S.editorTable?.sheets || [];
+  if (sheets.length <= 1) { wrap.hidden = true; wrap.innerHTML = ''; return; }
+  wrap.hidden = false;
+  wrap.innerHTML = '';
+  sheets.forEach((sh, idx) => {
+    const b = document.createElement('button');
+    b.type = 'button';
+    b.className = 'ed-sheet-tab' + (idx === S.editorSheetIndex ? ' active' : '');
+    b.textContent = sh.name || `Sheet${idx + 1}`;
+    b.onclick = () => {
+      S.editorSheetIndex = idx;
+      S.selectedCell = null;
+      renderSheetTabs();
+      renderEditorTable($('#edTableFilter').value);
+      renderPinned();
+    };
+    wrap.appendChild(b);
+  });
+}
+
 function renderEditorTable(filterText = '') {
-  const tbl = S.editorTable;
+  const sheet = getCurrentSheetObj();
   const grid = $('#edTableGrid');
-  if (!tbl || !tbl.rows?.length) {
+  if (!sheet || !sheet.rows?.length) {
     grid.innerHTML = '<tbody><tr><td style="color:var(--muted);padding:12px">No table rows found.</td></tr></tbody>';
     $('#edTableStats').textContent = '0 rows';
     return;
   }
   const q = filterText.trim().toLowerCase();
-  const [header, ...bodyRows] = tbl.rows;
-  const filtered = q ? bodyRows.filter((r) => r.some((c) => String(c || '').toLowerCase().includes(q))) : bodyRows;
-  const visible = filtered.slice(0, 250);
-  $('#edTableStats').textContent = `${filtered.length} / ${bodyRows.length} rows · ${header.length} cols`;
-  grid.innerHTML = `<thead><tr>${header.map((h) => `<th title="${esc(h)}">${esc(h)}</th>`).join('')}</tr></thead>`
-    + `<tbody>${visible.map((r) => `<tr>${header.map((_, i) => `<td title="${esc(r[i] ?? '')}">${esc(r[i] ?? '')}</td>`).join('')}</tr>`).join('')}</tbody>`;
+  const allRows = sheet.rows;
+  const colCount = Math.max(1, ...allRows.slice(0, 60).map((r) => r.length));
+  const indexed = allRows.map((r, rIdx) => ({ r, rIdx }));
+  const filtered = q
+    ? indexed.filter(({ r, rIdx }) => rIdx === 0 || r.some((c) => String(c || '').toLowerCase().includes(q)))
+    : indexed;
+  const visible = filtered.slice(0, 260);
+  $('#edTableStats').textContent = `${Math.max(0, filtered.length - 1)} rows · ${colCount} cols`;
+
+  const colHdrs = Array.from({ length: colCount }, (_, i) => `<th class="col-hdr">${colToLetter(i)}</th>`).join('');
+  const bodyHtml = visible.map(({ r, rIdx }) => {
+    const cells = Array.from({ length: colCount }, (_, cIdx) => {
+      const val = r[cIdx] ?? '';
+      const sel = S.selectedCell && S.selectedCell.row === rIdx && S.selectedCell.col === cIdx ? ' cell-selected' : '';
+      const hdrCls = rIdx === 0 ? ' style="font-weight:600;background:color-mix(in srgb, var(--code-bg) 65%, var(--bg-elev))"' : '';
+      return `<td data-row="${rIdx}" data-col="${cIdx}" class="${sel}"${hdrCls} title="${colToLetter(cIdx)}${rIdx + 1}: ${esc(val)}">${esc(val)}</td>`;
+    }).join('');
+    return `<tr><td class="row-num">${rIdx + 1}</td>${cells}</tr>`;
+  }).join('');
+
+  grid.innerHTML = `<thead><tr><th class="row-num">#</th>${colHdrs}</tr></thead><tbody>${bodyHtml}</tbody>`;
+}
+
+// Click to select cell (shared live with Copilot!) + Double-click for inline editing
+$('#edTableGrid').addEventListener('click', (e) => {
+  const td = e.target.closest('td[data-row][data-col]');
+  if (!td) return;
+  const row = Number(td.dataset.row);
+  const col = Number(td.dataset.col);
+  const sheet = getCurrentSheetObj();
+  const val = sheet?.rows?.[row]?.[col] ?? '';
+  S.selectedCell = { row, col, colLetter: colToLetter(col), value: String(val) };
+  $$('#edTableGrid td.cell-selected').forEach((x) => x.classList.remove('cell-selected'));
+  td.classList.add('cell-selected');
+  $('#edCellRef').textContent = `${S.selectedCell.colLetter}${row + 1}`;
+  renderPinned();
+});
+
+$('#edTableGrid').addEventListener('dblclick', (e) => {
+  const td = e.target.closest('td[data-row][data-col]');
+  if (!td || td.querySelector('input')) return;
+  const row = Number(td.dataset.row);
+  const col = Number(td.dataset.col);
+  const sheet = getCurrentSheetObj();
+  if (!sheet?.rows?.[row]) return;
+  const prevVal = String(sheet.rows[row][col] ?? '');
+  const inp = document.createElement('input');
+  inp.className = 'cell-edit-inp';
+  inp.value = prevVal;
+  td.textContent = '';
+  td.appendChild(inp);
+  inp.focus();
+  inp.select();
+
+  const commit = () => {
+    const nextVal = inp.value;
+    sheet.rows[row][col] = nextVal;
+    td.textContent = nextVal;
+    td.title = `${colToLetter(col)}${row + 1}: ${nextVal}`;
+    if (nextVal !== prevVal) {
+      S.editorTableDirty = true;
+      $('#edDirtyDot').hidden = false;
+      $('#edSaveBtn').disabled = false;
+    }
+    if (S.selectedCell && S.selectedCell.row === row && S.selectedCell.col === col) {
+      S.selectedCell.value = nextVal;
+    }
+  };
+  inp.onblur = commit;
+  inp.onkeydown = (ev) => {
+    if (ev.key === 'Enter') { ev.preventDefault(); inp.blur(); }
+    if (ev.key === 'Escape') { inp.value = prevVal; inp.blur(); }
+  };
+});
+
+// ---- Live Animated Copilot Cursor Engine (glides live across .xlsx / .csv cells!)
+function moveCopilotCursorToCell(rowIdx, colIdx, label = 'Copilot', editing = false) {
+  const cursor = $('#copilotCursor');
+  const scroll = $('#edTableScroll');
+  const grid = $('#edTableGrid');
+  if (!cursor || !scroll || !grid) return;
+  const td = grid.querySelector(`td[data-row="${rowIdx}"][data-col="${colIdx}"]`);
+  if (!td) return;
+
+  td.scrollIntoView({ block: 'nearest', inline: 'nearest', behavior: 'smooth' });
+  const scrollRect = scroll.getBoundingClientRect();
+  const tdRect = td.getBoundingClientRect();
+  const x = Math.max(8, (tdRect.left - scrollRect.left) + scroll.scrollLeft + Math.min(26, tdRect.width * 0.35));
+  const y = Math.max(8, (tdRect.top - scrollRect.top) + scroll.scrollTop + Math.min(14, tdRect.height * 0.45));
+
+  cursor.hidden = false;
+  cursor.classList.toggle('editing', Boolean(editing));
+  $('#copilotCursorLabel').textContent = label;
+  cursor.style.transform = `translate3d(${Math.round(x)}px, ${Math.round(y)}px, 0)`;
+
+  $$('#edTableGrid td.cell-ai-scan').forEach((c) => c.classList.remove('cell-ai-scan'));
+  if (editing) {
+    td.classList.add('cell-ai-edited');
+    setTimeout(() => td.classList.remove('cell-ai-edited'), 2200);
+  } else {
+    td.classList.add('cell-ai-scan');
+  }
+}
+
+function startCopilotReadingCursor(filePath, label = 'Copilot is inspecting…') {
+  if (!S.editor || S.editor.path !== filePath) return;
+  const banner = $('#edLiveBanner');
+  if (banner) {
+    banner.hidden = false;
+    $('#edLiveBannerTxt').textContent = label;
+  }
+  if (!S.editorTable || !S.editorTableMode) return;
+  stopCopilotReadingCursor(true);
+
+  const sheet = getCurrentSheetObj();
+  const maxR = Math.min(14, (sheet?.rows?.length || 1) - 1);
+  const maxC = Math.min(7, Math.max(1, (sheet?.rows?.[0]?.length || 1)) - 1);
+  let step = 0;
+
+  const tick = () => {
+    if (!S.editor || S.editor.path !== filePath || !S.editorTableMode) {
+      stopCopilotReadingCursor();
+      return;
+    }
+    const r = step <= maxC ? 0 : Math.min(maxR, 1 + ((step - maxC) % Math.max(1, maxR)));
+    const c = step <= maxC ? step : ((step * 3) % Math.max(1, maxC + 1));
+    const ref = `${colToLetter(c)}${r + 1}`;
+    moveCopilotCursorToCell(r, c, `Copilot · Reading ${ref}`, false);
+    step++;
+  };
+  tick();
+  S.copilotScanTimer = setInterval(tick, 680);
+}
+
+function stopCopilotReadingCursor(keepBanner = false) {
+  if (S.copilotScanTimer) {
+    clearInterval(S.copilotScanTimer);
+    S.copilotScanTimer = null;
+  }
+  $$('#edTableGrid td.cell-ai-scan').forEach((c) => c.classList.remove('cell-ai-scan'));
+  const cursor = $('#copilotCursor');
+  if (cursor && !keepBanner) cursor.hidden = true;
+  const banner = $('#edLiveBanner');
+  if (banner && !keepBanner) banner.hidden = true;
+}
+
+async function playCopilotTableEditsLive(te, { applyToDisk = true } = {}) {
+  if (!te || !te.path || !Array.isArray(te.operations)) return;
+  stopCopilotReadingCursor(true);
+
+  // Open the spreadsheet in the right sidebar automatically so the user watches Copilot work live!
+  openPanel('files', false);
+  if (!S.editor || S.editor.path !== te.path || !S.editorTable) {
+    await openFileInEditor(te.path);
+  }
+  if (!S.editorTable) return;
+  if (typeof te.sheetIndex === 'number' && te.sheetIndex !== S.editorSheetIndex) {
+    S.editorSheetIndex = Math.max(0, Math.min((S.editorTable.sheets?.length || 1) - 1, te.sheetIndex));
+    renderSheetTabs();
+    renderEditorTable('');
+  }
+  setEditorTableMode(true);
+  $('#edLiveBanner').hidden = false;
+  $('#edLiveBannerTxt').textContent = `Copilot live editing ${te.path} (${te.operations.length} change${te.operations.length === 1 ? '' : 's'})…`;
+
+  const sheet = getCurrentSheetObj();
+  const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+  const ensureSize = (rIdx, cIdx) => {
+    const colCount = Math.max(cIdx + 1, sheet.rows[0]?.length || 1);
+    while (sheet.rows.length <= rIdx) sheet.rows.push(new Array(colCount).fill(''));
+    for (const r of sheet.rows) while (r.length < colCount) r.push('');
+  };
+
+  for (const op of te.operations) {
+    if (!op || !op.op) continue;
+    const kind = String(op.op).toLowerCase();
+    if (kind === 'set_cell' || kind === 'update_cell') {
+      const rIdx = Math.max(0, Number(op.row) || 0);
+      const cIdx = Math.max(0, Number(op.col) || 0);
+      ensureSize(rIdx, cIdx);
+      const ref = `${colToLetter(cIdx)}${rIdx + 1}`;
+      moveCopilotCursorToCell(rIdx, cIdx, `Copilot · ${ref} → ${String(op.value ?? '').slice(0, 22)}`, true);
+      await sleep(220);
+      sheet.rows[rIdx][cIdx] = String(op.value ?? '');
+      renderEditorTable($('#edTableFilter').value);
+      moveCopilotCursorToCell(rIdx, cIdx, `Copilot · Updated ${ref}`, true);
+      await sleep(240);
+    } else if (kind === 'add_column') {
+      const cIdx = sheet.rows[0]?.length || 0;
+      const header = String(op.header || `Col ${cIdx + 1}`);
+      const vals = Array.isArray(op.values) ? op.values : [];
+      if (!sheet.rows.length) sheet.rows.push([]);
+      sheet.rows[0][cIdx] = header;
+      renderEditorTable($('#edTableFilter').value);
+      moveCopilotCursorToCell(0, cIdx, `Copilot · + Column "${header}"`, true);
+      await sleep(260);
+      for (let i = 0; i < Math.min(vals.length, 25); i++) {
+        const rIdx = i + 1;
+        ensureSize(rIdx, cIdx);
+        sheet.rows[rIdx][cIdx] = String(vals[i] ?? '');
+        renderEditorTable($('#edTableFilter').value);
+        moveCopilotCursorToCell(rIdx, cIdx, `Copilot · ${colToLetter(cIdx)}${rIdx + 1} = ${String(vals[i] ?? '').slice(0, 18)}`, true);
+        await sleep(160);
+      }
+      for (let i = 25; i < vals.length; i++) {
+        ensureSize(i + 1, cIdx);
+        sheet.rows[i + 1][cIdx] = String(vals[i] ?? '');
+      }
+      if (vals.length > 25) renderEditorTable($('#edTableFilter').value);
+    } else if (kind === 'add_row') {
+      const vals = Array.isArray(op.values) ? op.values.map((v) => String(v ?? '')) : [];
+      const rIdx = sheet.rows.length;
+      const cols = Math.max(sheet.rows[0]?.length || 1, vals.length);
+      const newRow = new Array(cols).fill('');
+      vals.forEach((v, i) => { newRow[i] = v; });
+      sheet.rows.push(newRow);
+      renderEditorTable($('#edTableFilter').value);
+      moveCopilotCursorToCell(rIdx, 0, `Copilot · + Row ${rIdx + 1}`, true);
+      await sleep(260);
+    }
+  }
+
+  if (applyToDisk) {
+    try {
+      const r = await CW.applyTableEdits(te);
+      te.status = 'applied';
+      te.undoId = r.undoId;
+      te.result = r.summary;
+      loadUndo();
+      renderMessages(false);
+      toast(`Copilot saved ${te.path} (1-click Undo available)`);
+    } catch (e) {
+      te.status = 'error';
+      te.result = e.message;
+      toast(e.message, 4000);
+    }
+  } else {
+    // Reload exact persisted spreadsheet from disk so view matches saved file
+    try {
+      const fresh = await CW.parseTableFile(te.path);
+      if (fresh?.sheets?.length) {
+        S.editorTable = fresh;
+        renderSheetTabs();
+        renderEditorTable($('#edTableFilter').value);
+      }
+    } catch {}
+    loadUndo();
+  }
+
+  setTimeout(() => stopCopilotReadingCursor(), 1400);
+}
+
+function renderTableEditsCard(edits) {
+  const card = document.createElement('div');
+  card.className = 'action-card';
+  card.innerHTML = `<div class="ac-head"><div class="ac-title">Live Spreadsheet Edits (${edits.length})</div><span class="cr-badge">Copilot Cursor</span></div>`;
+
+  for (const te of edits) {
+    const row = document.createElement('div');
+    row.className = 'ac-row';
+    const opPreview = (te.operations || []).slice(0, 4).map((o) => {
+      if (o.op === 'set_cell') return `${colToLetter(Number(o.col) || 0)}${(Number(o.row) || 0) + 1}→${o.value}`;
+      if (o.op === 'add_column') return `+Col "${o.header}"`;
+      if (o.op === 'add_row') return '+Row';
+      return o.op;
+    }).join(' · ');
+
+    row.innerHTML = `
+      <span class="ac-verb write">sheet</span>
+      <div class="ac-desc">
+        <div><code>${esc(te.path)}</code> · ${esc(te.summary || `${te.operations.length} edits`)}</div>
+        <div class="ac-reason">${esc(opPreview)}${te.operations.length > 4 ? ` (+${te.operations.length - 4} more)` : ''}</div>
+        ${te.result ? `<div class="ac-reason">${esc(te.result)}</div>` : ''}
+      </div>
+      <div class="row-gap"></div>`;
+    const btns = row.querySelector('.row-gap');
+
+    if (te.status !== 'applied') {
+      const liveBtn = document.createElement('button');
+      liveBtn.className = 'btn tiny primary';
+      liveBtn.textContent = 'Watch & Apply Live';
+      liveBtn.onclick = () => playCopilotTableEditsLive(te, { applyToDisk: true });
+      btns.appendChild(liveBtn);
+    } else {
+      const st = document.createElement('span');
+      st.className = 'ac-stat'; st.textContent = 'Applied';
+      const replayBtn = document.createElement('button');
+      replayBtn.className = 'btn tiny';
+      replayBtn.textContent = 'Open Sheet';
+      replayBtn.onclick = () => { openPanel('files', false); openFileInEditor(te.path); };
+      btns.append(st, replayBtn);
+      if (te.undoId) {
+        const uBtn = document.createElement('button');
+        uBtn.className = 'btn tiny'; uBtn.textContent = 'Undo';
+        uBtn.onclick = async () => {
+          const r = await CW.undoFileAction(te.undoId);
+          te.status = 'pending'; te.undoId = null; te.result = r.summary;
+          toast(r.summary);
+          if (S.editor?.path === te.path) openFileInEditor(te.path);
+          loadUndo(); renderMessages(false);
+        };
+        btns.appendChild(uBtn);
+      }
+    }
+    card.appendChild(row);
+  }
+  return card;
 }
 
 function setEditorTableMode(on) {
@@ -2232,6 +2735,7 @@ function setEditorTableMode(on) {
   $('#edTextarea').hidden = S.editorTableMode;
   $('#edTableToggleBtn').classList.toggle('primary', S.editorTableMode);
   $('#edTableToggleBtn').innerHTML = `<svg><use href="#i-table"/></svg>${S.editorTableMode ? 'Raw Text' : 'Table'}`;
+  if (S.editorTableMode) $('#edSaveBtn').disabled = false;
 }
 
 async function openFileInEditor(relPath) {
@@ -2240,6 +2744,10 @@ async function openFileInEditor(relPath) {
     S.editor = { ...f, savedContent: f.content };
     S.editorTable = null;
     S.editorTableMode = false;
+    S.editorSheetIndex = 0;
+    S.editorTableDirty = false;
+    S.selectedCell = { row: 0, col: 0, colLetter: 'A', value: '' };
+    stopCopilotReadingCursor();
     $('#filesBrowserView').hidden = true;
     $('#fileEditorView').hidden = false;
     $('#edFileName').textContent = f.name;
@@ -2255,12 +2763,17 @@ async function openFileInEditor(relPath) {
     $('#edTableWrap').hidden = true;
     $('#edTextarea').hidden = false;
     $('#edTableFilter').value = '';
+    $('#edCellRef').textContent = 'A1';
 
     if (isTabular) {
       try {
         const tbl = await CW.parseTableFile(relPath);
         if (tbl?.rows?.length) {
           S.editorTable = tbl;
+          S.editor.editable = true; // .xlsx & .csv are both directly editable in the live grid!
+          $('#edReadonlyNote').hidden = true;
+          $('#edSaveBtn').disabled = false;
+          renderSheetTabs();
           renderEditorTable('');
           setEditorTableMode(true);
         }
@@ -2269,28 +2782,49 @@ async function openFileInEditor(relPath) {
 
     updateEditorStats();
     updateEditorPinBtn();
+    renderPinned();
   } catch (e) {
     toast(e.message, 4000);
   }
 }
 
 function closeFileEditor(force = false) {
-  if (!force && S.editor?.editable && $('#edTextarea').value !== S.editor.savedContent) {
+  if (!force && S.editor?.editable && ($('#edTextarea').value !== S.editor.savedContent || S.editorTableDirty)) {
     toast('Closed without saving (use Undo or re-open)');
   }
+  stopCopilotReadingCursor();
   S.editor = null;
   S.editorTable = null;
   S.editorTableMode = false;
+  S.editorTableDirty = false;
+  S.selectedCell = null;
   $('#edTableWrap').hidden = true;
   $('#edTextarea').hidden = false;
   $('#fileEditorView').hidden = true;
   $('#filesBrowserView').hidden = false;
+  renderPinned();
 }
 
 async function saveEditorFile() {
-  if (!S.editor || !S.editor.editable) return;
-  const content = $('#edTextarea').value;
+  if (!S.editor) return;
   try {
+    if (S.editorTable && (S.editorTableMode || /\.xlsx$/i.test(S.editor.name || ''))) {
+      const sheet = getCurrentSheetObj();
+      const r = await CW.saveTableFile({
+        path: S.editor.path,
+        rows: sheet.rows,
+        sheets: S.editorTable.sheets,
+        sheetIndex: S.editorSheetIndex,
+        delimiter: S.editorTable.delimiter,
+      });
+      S.editorTableDirty = false;
+      $('#edDirtyDot').hidden = true;
+      loadUndo();
+      toast(r.summary || `Saved ${S.editor.name}`);
+      return;
+    }
+    if (!S.editor.editable) return;
+    const content = $('#edTextarea').value;
     const r = await CW.writeFile({ path: S.editor.path, content });
     S.editor.savedContent = content;
     updateEditorStats();
@@ -3689,9 +4223,40 @@ $('#attachFileBtn').onclick = async () => {
 $('#modeSeg').onclick = (e) => { const b = e.target.closest('button[data-mode]'); if (b) setMode(b.dataset.mode); };
 $('#thinkSeg').onclick = (e) => { const b = e.target.closest('button[data-think]'); if (b) setThink(b.dataset.think); };
 $('#sendBtn').onclick = () => sendPrompt();
+$('#queueSendBtn').onclick = () => {
+  const inp = $('#promptInput');
+  const txt = inp.value.trim();
+  if (!txt) { toast('Type a follow-up message to queue'); inp.focus(); return; }
+  if (queuePromptForCurrentChat(txt)) {
+    inp.value = '';
+    inp.style.height = 'auto';
+  }
+};
 $('#promptInput').addEventListener('keydown', (e) => {
-  if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); sendPrompt(); }
+  if (e.key === 'Enter' && !e.shiftKey) {
+    e.preventDefault();
+    if (getStreamForCurrentView()) {
+      const inp = $('#promptInput');
+      const txt = inp.value.trim();
+      if (txt && queuePromptForCurrentChat(txt)) {
+        inp.value = '';
+        inp.style.height = 'auto';
+      }
+      return;
+    }
+    sendPrompt();
+  }
 });
+$('#edAddRowBtn').onclick = () => {
+  const sheet = getCurrentSheetObj();
+  if (!sheet) return;
+  const cols = Math.max(1, sheet.rows[0]?.length || 1);
+  sheet.rows.push(new Array(cols).fill(''));
+  S.editorTableDirty = true;
+  $('#edDirtyDot').hidden = false;
+  $('#edSaveBtn').disabled = false;
+  renderEditorTable($('#edTableFilter').value);
+};
 $('#promptInput').addEventListener('input', (e) => {
   e.target.style.height = 'auto';
   e.target.style.height = Math.min(e.target.scrollHeight, 200) + 'px';

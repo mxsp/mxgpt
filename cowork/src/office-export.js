@@ -465,6 +465,225 @@ function buildXlsxBuffer(sheetsInput) {
   ]);
 }
 
+// ---- Central-Directory-Aware ZIP Reader + Exact .xlsx Sheet/Cell Parser
+function readZipEntries(buf) {
+  const entries = new Map();
+  // Locate End of Central Directory (PK\x05\x06) scanning backwards
+  let eocd = -1;
+  const minPos = Math.max(0, buf.length - 65557);
+  for (let i = buf.length - 22; i >= minPos; i--) {
+    if (buf.readUInt32LE(i) === 0x06054b50) { eocd = i; break; }
+  }
+  if (eocd >= 0) {
+    const cdCount = buf.readUInt16LE(eocd + 10);
+    let pos = buf.readUInt32LE(eocd + 16);
+    for (let k = 0; k < cdCount && pos + 46 <= buf.length; k++) {
+      if (buf.readUInt32LE(pos) !== 0x02014b50) break;
+      const method = buf.readUInt16LE(pos + 10);
+      const compSize = buf.readUInt32LE(pos + 20);
+      const nameLen = buf.readUInt16LE(pos + 28);
+      const extraLen = buf.readUInt16LE(pos + 30);
+      const commentLen = buf.readUInt16LE(pos + 32);
+      const lfhOffset = buf.readUInt32LE(pos + 42);
+      const name = buf.toString('utf8', pos + 46, pos + 46 + nameLen);
+      pos += 46 + nameLen + extraLen + commentLen;
+
+      if (lfhOffset + 30 <= buf.length && buf.readUInt32LE(lfhOffset) === 0x04034b50) {
+        const lNameLen = buf.readUInt16LE(lfhOffset + 26);
+        const lExtraLen = buf.readUInt16LE(lfhOffset + 28);
+        const dataStart = lfhOffset + 30 + lNameLen + lExtraLen;
+        if (dataStart + compSize <= buf.length) {
+          try {
+            const slice = buf.subarray(dataStart, dataStart + compSize);
+            const raw = method === 8 ? zlib.inflateRawSync(slice) : method === 0 ? slice : null;
+            if (raw) entries.set(name, raw);
+          } catch {}
+        }
+      }
+    }
+  }
+  return entries;
+}
+
+function xmlUnesc(s) {
+  return String(s || '')
+    .replace(/&amp;/g, '&')
+    .replace(/&lt;/g, '<')
+    .replace(/&gt;/g, '>')
+    .replace(/&quot;/g, '"')
+    .replace(/&apos;/g, "'")
+    .replace(/&#(\d+);/g, (_, n) => String.fromCharCode(Number(n)))
+    .replace(/&#x([0-9a-f]+);/gi, (_, h) => String.fromCharCode(parseInt(h, 16)));
+}
+
+function colLettersToIndex(letters) {
+  let idx = 0;
+  for (const ch of String(letters || '').toUpperCase()) {
+    idx = idx * 26 + (ch.charCodeAt(0) - 64);
+  }
+  return Math.max(0, idx - 1);
+}
+
+function parseXlsxBuffer(buf) {
+  const entries = readZipEntries(buf);
+  const sharedStrings = [];
+  const ssBuf = entries.get('xl/sharedStrings.xml');
+  if (ssBuf) {
+    const ssXml = ssBuf.toString('utf8');
+    for (const m of ssXml.matchAll(/<si\b[^>]*>([\s\S]*?)<\/si>/gi)) {
+      const parts = [...m[1].matchAll(/<t(?:\s[^>]*)?>([\s\S]*?)<\/t>/gi)].map((x) => xmlUnesc(x[1]));
+      sharedStrings.push(parts.join(''));
+    }
+  }
+
+  // Extract sheet names from workbook.xml
+  const sheetNames = [];
+  const wbBuf = entries.get('xl/workbook.xml');
+  if (wbBuf) {
+    const wbXml = wbBuf.toString('utf8');
+    for (const m of wbXml.matchAll(/<sheet\b[^>]*name="([^"]+)"[^>]*>/gi)) {
+      sheetNames.push(xmlUnesc(m[1]));
+    }
+  }
+
+  const sheetFiles = [...entries.keys()]
+    .filter((k) => /^xl\/worksheets\/sheet\d+\.xml$/i.test(k))
+    .sort((a, b) => {
+      const na = Number(a.match(/sheet(\d+)/i)?.[1] || 0);
+      const nb = Number(b.match(/sheet(\d+)/i)?.[1] || 0);
+      return na - nb;
+    });
+
+  const sheets = [];
+  sheetFiles.forEach((sf, sIdx) => {
+    const xml = entries.get(sf).toString('utf8');
+    const rowMap = new Map();
+    let maxCol = 0;
+
+    for (const rm of xml.matchAll(/<row\b([^>]*)>([\s\S]*?)<\/row>/gi)) {
+      const rAttr = rm[1] || '';
+      const rBody = rm[2] || '';
+      const rNumMatch = rAttr.match(/\br="(\d+)"/i);
+      const rowIdx = rNumMatch ? Number(rNumMatch[1]) - 1 : rowMap.size;
+      const cells = [];
+
+      let autoCol = 0;
+      for (const cm of rBody.matchAll(/<c\b([^>]*)(?:\/>|>([\s\S]*?)<\/c>)/gi)) {
+        const cAttr = cm[1] || '';
+        const cBody = cm[2] || '';
+        const refM = cAttr.match(/\br="([A-Z]+)\d+"/i);
+        const colIdx = refM ? colLettersToIndex(refM[1]) : autoCol;
+        autoCol = colIdx + 1;
+        if (colIdx > maxCol) maxCol = colIdx;
+
+        const tM = cAttr.match(/\bt="([^"]+)"/i);
+        const cellType = tM ? tM[1] : '';
+        let val = '';
+        if (cellType === 'inlineStr') {
+          val = [...cBody.matchAll(/<t(?:\s[^>]*)?>([\s\S]*?)<\/t>/gi)].map((x) => xmlUnesc(x[1])).join('');
+        } else {
+          const vM = cBody.match(/<v[^>]*>([\s\S]*?)<\/v>/i);
+          const rawV = vM ? xmlUnesc(vM[1]) : '';
+          if (cellType === 's') {
+            val = sharedStrings[Number(rawV)] ?? rawV;
+          } else if (cellType === 'b') {
+            val = rawV === '1' ? 'TRUE' : 'FALSE';
+          } else {
+            val = rawV;
+          }
+        }
+        cells[colIdx] = val;
+      }
+      rowMap.set(rowIdx, cells);
+    }
+
+    const sortedRowNums = [...rowMap.keys()].sort((a, b) => a - b);
+    const colCount = maxCol + 1;
+    const rows = [];
+    for (const rn of sortedRowNums) {
+      const arr = rowMap.get(rn) || [];
+      const dense = [];
+      for (let c = 0; c < colCount; c++) dense.push(arr[c] ?? '');
+      if (dense.some((v) => v !== '')) rows.push(dense);
+    }
+
+    sheets.push({
+      name: sheetNames[sIdx] || `Sheet${sIdx + 1}`,
+      rows: rows.length ? rows : [['']],
+    });
+  });
+
+  return { sheets: sheets.length ? sheets : [{ name: 'Sheet1', rows: [['']] }] };
+}
+
+function serializeCsv(rows, delimiter = ',') {
+  const d = delimiter || ',';
+  return (rows || []).map((row) =>
+    (row || []).map((cell) => {
+      const s = String(cell ?? '');
+      if (s.includes(d) || s.includes('"') || s.includes('\n') || s.includes('\r')) {
+        return '"' + s.replace(/"/g, '""') + '"';
+      }
+      return s;
+    }).join(d)
+  ).join('\n') + '\n';
+}
+
+function applyTableOperations(rowsInput, operations = []) {
+  const rows = (rowsInput || []).map((r) => [...r]);
+  const applied = [];
+
+  const ensureSize = (rIdx, cIdx) => {
+    const colCount = Math.max(cIdx + 1, rows[0]?.length || 1);
+    while (rows.length <= rIdx) rows.push(new Array(colCount).fill(''));
+    for (const r of rows) {
+      while (r.length < colCount) r.push('');
+    }
+  };
+
+  for (const op of operations || []) {
+    if (!op || !op.op) continue;
+    const kind = String(op.op).toLowerCase();
+    if (kind === 'set_cell' || kind === 'update_cell') {
+      const rIdx = Math.max(0, Number(op.row) || 0);
+      const cIdx = typeof op.col === 'string' && /^[A-Z]+$/i.test(op.col)
+        ? colLettersToIndex(op.col)
+        : Math.max(0, Number(op.col) || 0);
+      ensureSize(rIdx, cIdx);
+      const prev = rows[rIdx][cIdx];
+      rows[rIdx][cIdx] = String(op.value ?? '');
+      applied.push({ op: 'set_cell', row: rIdx, col: cIdx, prev, value: rows[rIdx][cIdx], note: op.note || '' });
+    } else if (kind === 'add_column') {
+      const colIdx = rows[0]?.length || 0;
+      const header = String(op.header || `Column ${colIdx + 1}`);
+      const vals = Array.isArray(op.values) ? op.values : [];
+      if (!rows.length) rows.push([]);
+      rows[0][colIdx] = header;
+      const totalRows = Math.max(rows.length, vals.length + 1);
+      for (let r = 1; r < totalRows; r++) {
+        if (!rows[r]) rows[r] = new Array(colIdx).fill('');
+        rows[r][colIdx] = String(vals[r - 1] ?? '');
+      }
+      applied.push({ op: 'add_column', col: colIdx, header, count: vals.length, note: op.note || '' });
+    } else if (kind === 'add_row') {
+      const vals = Array.isArray(op.values) ? op.values.map((v) => String(v ?? '')) : [];
+      const rIdx = rows.length;
+      const cols = Math.max(rows[0]?.length || 0, vals.length);
+      const newRow = new Array(cols).fill('');
+      vals.forEach((v, i) => { newRow[i] = v; });
+      rows.push(newRow);
+      applied.push({ op: 'add_row', row: rIdx, values: newRow, note: op.note || '' });
+    } else if (kind === 'delete_row') {
+      const rIdx = Number(op.row);
+      if (rIdx >= 1 && rIdx < rows.length) {
+        rows.splice(rIdx, 1);
+        applied.push({ op: 'delete_row', row: rIdx, note: op.note || '' });
+      }
+    }
+  }
+  return { rows, applied };
+}
+
 // ---- RFC-5545 Calendar Invite (.ics) Generator
 function fmtIcsDate(dt) {
   const d = dt instanceof Date ? dt : new Date(dt);
@@ -602,6 +821,10 @@ module.exports = {
   buildXlsxBuffer,
   extractTablesFromMarkdown,
   parseCsvText,
+  serializeCsv,
+  parseXlsxBuffer,
+  applyTableOperations,
+  colLetter,
   buildIcsText,
   buildPrintableHtml,
 };

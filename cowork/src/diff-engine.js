@@ -219,9 +219,9 @@ function computeLineDiff(beforeText, afterText, { context = 3, maxLines = 1200 }
   };
 }
 
-function compareWorkspaceFiles(leftRelPath, rightRelPath) {
-  const left = localFiles.readFileContent(leftRelPath, 160000);
-  const right = localFiles.readFileContent(rightRelPath, 160000);
+async function compareWorkspaceFiles(leftRelPath, rightRelPath) {
+  const left = await localFiles.readFileContent(leftRelPath, 160000);
+  const right = await localFiles.readFileContent(rightRelPath, 160000);
   const diff = computeLineDiff(left.content || '', right.content || '', { context: 3 });
   return {
     left: { path: left.path, name: left.name, sizeLabel: left.sizeLabel },
@@ -230,7 +230,7 @@ function compareWorkspaceFiles(leftRelPath, rightRelPath) {
   };
 }
 
-function previewFileActionDiff(action) {
+async function previewFileActionDiff(action) {
   const type = String(action?.type || '').toLowerCase();
   const relPath = action?.path || action?.to || '';
   if (!relPath || !['write', 'append', 'create'].includes(type)) {
@@ -239,7 +239,7 @@ function previewFileActionDiff(action) {
   let before = '';
   let exists = false;
   try {
-    const cur = localFiles.readFileContent(relPath, 120000);
+    const cur = await localFiles.readFileContent(relPath, 120000);
     before = cur.content || '';
     exists = true;
   } catch {

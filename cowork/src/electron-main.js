@@ -463,6 +463,7 @@ function registerIpc() {
         history: priorHistory,
         pinnedFiles: Array.isArray(payload?.pinnedFiles) ? payload.pinnedFiles : [],
         images: Array.isArray(payload?.images) ? payload.images : [],
+        activeContext: payload?.activeContext || null,
         piiShieldOverride: payload?.piiShield,
         toolOverrides: payload?.toolOverrides || {},
         think,
@@ -503,6 +504,32 @@ function registerIpc() {
           }
         }
         emit('file_actions', result.fileActions);
+      }
+
+      if (result.tableEdits?.length && autoAcceptEdits) {
+        for (const te of result.tableEdits) {
+          try {
+            const parsed = await localFiles.parseTableFile(te.path);
+            const sIdx = Math.max(0, Math.min((parsed.sheets?.length || 1) - 1, Number(te.sheetIndex) || 0));
+            const sheetRows = parsed.sheets?.[sIdx]?.rows || parsed.rows || [];
+            const { rows: nextRows, applied } = officeExport.applyTableOperations(sheetRows, te.operations || []);
+            const saved = await localFiles.saveTableFile({
+              path: te.path,
+              rows: nextRows,
+              sheets: parsed.sheets,
+              sheetIndex: sIdx,
+              delimiter: parsed.delimiter,
+            });
+            te.status = 'applied';
+            te.appliedCount = applied.length;
+            te.undoId = saved.undoId;
+            te.result = `Applied ${applied.length} edit(s) to ${te.path}`;
+          } catch (e) {
+            te.status = 'error';
+            te.result = e.message;
+          }
+        }
+        emit('table_edits', result.tableEdits);
       }
 
       if (result.codeRuns?.length && autoRunContainer) {
@@ -548,6 +575,7 @@ function registerIpc() {
         workers: result.workers,
         sources: result.sources,
         fileActions: result.fileActions || [],
+        tableEdits: result.tableEdits || [],
         codeRuns: result.codeRuns || [],
         shieldSummary: result.shieldSummary || null,
         ts: Date.now(),
@@ -728,21 +756,25 @@ function registerIpc() {
   });
   ipcMain.handle('diff:previewAction', (_, action) => diffEngine.previewFileActionDiff(action));
 
-  // ---- CSV / Excel Table Parser for Data Desk Viewer
-  ipcMain.handle('files:parseTable', (_, relPath) => {
-    const f = localFiles.readFileContent(relPath, 240000);
-    const ext = path.extname(f.name || '').toLowerCase();
-    if (ext === '.xlsx') {
-      // localFiles.readFileContent extracts tab-separated rows per sheet
-      const rows = String(f.content || '')
-        .split(/\r?\n/)
-        .filter((l) => l.trim() && !l.startsWith('--- Sheet'))
-        .map((l) => l.split(/\t/));
-      return { path: f.path, name: f.name, delimiter: '\t', rows: rows.slice(0, 500), totalRows: rows.length };
-    }
-    const parsed = officeExport.parseCsvText(f.content || '');
-    return { path: f.path, name: f.name, delimiter: parsed.delimiter, rows: parsed.rows.slice(0, 500), totalRows: parsed.rows.length };
+  // ---- CSV / Excel Table Parser, Live Save & Office Doc Listing (v1.7.0)
+  ipcMain.handle('files:parseTable', (_, relPath) => localFiles.parseTableFile(relPath || ''));
+  ipcMain.handle('files:saveTable', (_, opts) => localFiles.saveTableFile(opts || {}));
+  ipcMain.handle('files:applyTableEdits', async (_, te) => {
+    if (!te?.path || !Array.isArray(te.operations)) throw new Error('Invalid table edit payload');
+    const parsed = await localFiles.parseTableFile(te.path);
+    const sIdx = Math.max(0, Math.min((parsed.sheets?.length || 1) - 1, Number(te.sheetIndex) || 0));
+    const sheetRows = parsed.sheets?.[sIdx]?.rows || parsed.rows || [];
+    const { rows: nextRows, applied } = officeExport.applyTableOperations(sheetRows, te.operations);
+    const saved = await localFiles.saveTableFile({
+      path: te.path,
+      rows: nextRows,
+      sheets: parsed.sheets,
+      sheetIndex: sIdx,
+      delimiter: parsed.delimiter,
+    });
+    return { ok: true, rows: nextRows, applied, undoId: saved.undoId, summary: `Applied ${applied.length} edit(s) to ${te.path}` };
   });
+  ipcMain.handle('files:officeList', async () => ({ files: await localFiles.listOfficeFiles() }));
 
   // ---- Real Office & PDF Exports (.docx, .xlsx, .pdf, .ics)
   const slugify = (s, fallback = 'mx-cowork-export') =>
@@ -998,6 +1030,9 @@ app.whenReady().then(() => {
               hasAutomationsApi: typeof window.cowork.listAutomations === 'function',
               hasMoveChatApi: typeof window.cowork.moveChatToProject === 'function',
               hasUsageResetDisabled: typeof window.cowork.resetUsage === 'undefined',
+              hasLiveCursorApi: typeof window.cowork.saveTableFile === 'function' && Boolean(document.querySelector('#copilotCursor')),
+              hasPreSendQueue: Boolean(document.querySelector('#queuedBar')),
+              hasOfficeStrip: Boolean(document.querySelector('#officeQuickBar')),
               hasUpdateBtn: Boolean(document.querySelector('#openUpdatesBtn')),
               hasUpdateModal: Boolean(document.querySelector('#updatesModal')),
               updaterOk: upd.ok,

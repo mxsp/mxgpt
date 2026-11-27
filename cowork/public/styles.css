@@ -840,3 +840,47 @@ svg { width: 20px; height: 20px; fill: none; stroke: currentColor; stroke-width:
 .limit-sub { font-size: 11px; color: var(--muted); }
 .cr-badge.host { background: var(--amber-soft); color: var(--amber); border-color: transparent; font-weight: 600; }
 @media (max-width: 660px) { .limit-grid { grid-template-columns: 1fr; } }
+
+/* ============ v1.7.0 Pre-Send Message Queue, Context-Aware Office Strip & Live Copilot Cursor ============ */
+.queued-bar { margin-bottom: 7px; display: flex; flex-direction: column; gap: 5px; }
+.queued-item { display: flex; align-items: center; gap: 8px; padding: 7px 10px; border-radius: 10px; border: 1px dashed color-mix(in srgb, var(--accent) 55%, var(--border)); background: color-mix(in srgb, var(--accent-soft) 35%, var(--bg-elev)); font-size: 12px; }
+.queued-num { font-family: var(--font-mono); font-size: 10.5px; font-weight: 700; color: var(--accent-ink); background: var(--accent-soft); padding: 2px 6px; border-radius: 999px; flex: none; }
+.queued-txt { flex: 1; min-width: 0; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; color: var(--text); }
+.queue-send-btn { height: 32px; padding: 0 11px; border-radius: 9px; border: 1px solid color-mix(in srgb, var(--accent) 45%, var(--border)); background: var(--accent-soft); color: var(--accent-ink); font-size: 12px; font-weight: 600; white-space: nowrap; transition: all .13s; }
+.queue-send-btn:hover { background: var(--accent); color: #fff; }
+
+.ctx-view-pill { display: inline-flex; align-items: center; gap: 5px; padding: 3px 9px; border-radius: 999px; background: color-mix(in srgb, var(--accent-soft) 65%, var(--bg-elev)); border: 1px solid color-mix(in srgb, var(--accent) 35%, transparent); color: var(--accent-ink); font-size: 11px; font-weight: 600; }
+.ctx-view-pill .chat-live-dot { width: 6px; height: 6px; }
+
+.office-quick-bar { display: flex; flex-wrap: wrap; gap: 5px; padding: 6px 10px; border-bottom: 1px solid var(--border); background: color-mix(in srgb, var(--code-bg) 55%, var(--bg)); align-items: center; }
+.office-quick-lbl { font-size: 10px; font-weight: 700; text-transform: uppercase; letter-spacing: .05em; color: var(--muted); margin-right: 2px; }
+.office-chip { display: inline-flex; align-items: center; gap: 5px; padding: 3px 8px; border-radius: 7px; border: 1px solid var(--border); background: var(--bg-elev); font-size: 11px; color: var(--text); max-width: 190px; transition: border-color .12s, background .12s; }
+.office-chip:hover { border-color: var(--accent); background: var(--accent-soft); }
+.office-chip span { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.office-ext { font-family: var(--font-mono); font-size: 9px; font-weight: 700; padding: 1px 4px; border-radius: 4px; color: #fff; flex: none; }
+.office-ext.xlsx, .office-ext.csv, .office-ext.tsv { background: #1d6f42; }
+.office-ext.docx { background: #2b579a; }
+.office-ext.pdf { background: #b91c1c; }
+.office-ext.pptx { background: #c2410c; }
+
+.ed-live-banner { display: flex; align-items: center; gap: 8px; padding: 6px 10px; border-radius: 8px; background: var(--accent-soft); color: var(--accent-ink); font-size: 11.5px; font-weight: 600; margin-bottom: 4px; }
+.ed-sheet-tabs { display: flex; gap: 4px; flex-wrap: wrap; }
+.ed-sheet-tab { padding: 3px 9px; border-radius: 7px; border: 1px solid var(--border); background: var(--bg-elev); font-size: 11px; font-weight: 500; color: var(--muted); }
+.ed-sheet-tab.active { background: var(--accent-soft); border-color: var(--accent); color: var(--accent-ink); font-weight: 600; }
+.cell-ref-pill { font-family: var(--font-mono); font-size: 11px; font-weight: 700; padding: 4px 8px; border-radius: 7px; background: var(--code-bg); border: 1px solid var(--border); color: var(--text); min-width: 34px; text-align: center; }
+
+.ed-table-scroll { position: relative; }
+.data-grid .row-num { position: sticky; left: 0; background: var(--code-bg); color: var(--muted); font-family: var(--font-mono); font-size: 10.5px; text-align: right; width: 32px; min-width: 32px; user-select: none; z-index: 2; }
+.data-grid th.col-hdr { font-family: var(--font-mono); font-size: 10.5px; color: var(--muted); text-align: center; }
+.data-grid td { cursor: cell; transition: background .18s, box-shadow .18s; }
+.data-grid td.cell-selected { outline: 2px solid var(--accent); outline-offset: -2px; background: color-mix(in srgb, var(--accent-soft) 50%, var(--bg-elev)); }
+.data-grid td.cell-ai-scan { background: color-mix(in srgb, var(--accent) 18%, var(--bg-elev)) !important; box-shadow: inset 0 0 0 1.5px var(--accent); }
+.data-grid td.cell-ai-edited { background: color-mix(in srgb, #16a34a 24%, var(--bg-elev)) !important; box-shadow: inset 0 0 0 1.5px #15803d; font-weight: 600; }
+.cell-edit-inp { width: 100%; min-width: 70px; border: 0; outline: 0; background: var(--bg); color: var(--text); font: inherit; padding: 0; }
+
+/* Animated Live Copilot Cursor over Spreadsheet */
+.copilot-cursor { position: absolute; top: 0; left: 0; z-index: 25; pointer-events: none; display: inline-flex; align-items: flex-start; gap: 3px; will-change: transform; transition: transform .28s cubic-bezier(.22, .8, .36, 1), opacity .2s; filter: drop-shadow(0 3px 8px rgba(0, 0, 0, .24)); }
+.cc-arrow { width: 18px; height: 18px; fill: var(--accent); stroke: #ffffff; stroke-width: 1.5; flex: none; }
+.cc-tag { margin-top: 12px; padding: 3px 8px; border-radius: 999px; background: var(--accent); color: #fff; font-size: 10.5px; font-weight: 600; white-space: nowrap; max-width: 240px; overflow: hidden; text-overflow: ellipsis; }
+.copilot-cursor.editing .cc-arrow { fill: #15803d; }
+.copilot-cursor.editing .cc-tag { background: #15803d; }

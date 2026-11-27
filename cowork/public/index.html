@@ -158,7 +158,7 @@
         <span class="upd-dot" id="updDot" hidden></span>
         <svg><use href="#i-download"/></svg>
         <span id="updBtnLabel">Updates</span>
-        <span class="upd-ver" id="appVersionBadge">v1.6.0</span>
+        <span class="upd-ver" id="appVersionBadge">v1.7.0</span>
       </button>
       <div class="user-row">
         <button class="user-chip" id="openSettingsBtn" title="Endpoint, providers &amp; account settings">
@@ -237,6 +237,7 @@
             <button type="button" class="btn tiny" data-qcb="paste">Paste into Box</button>
           </div>
         </div>
+        <div class="queued-bar" id="queuedBar" hidden></div>
         <div class="slash-menu" id="slashMenu" hidden></div>
         <div class="composer" id="composer">
           <div class="attach-row" id="pinnedBar" hidden></div>
@@ -269,6 +270,7 @@
                   <button type="button" data-mode="copilot_b" role="radio" aria-checked="false" title="Copilot (B) — nemotron-3.5-lightning orchestrates Fast workers &amp; local tools"><svg><use href="#i-agents"/></svg><span>Copilot (B)</span></button>
                 </div>
               </div>
+              <button class="queue-send-btn" id="queueSendBtn" hidden title="Pre-send / queue follow-up message (runs automatically when current turn finishes)">Queue</button>
               <button class="send-btn" id="sendBtn" title="Send (Enter)"><svg id="sendIcon"><use href="#i-send"/></svg></button>
             </div>
           </div>
@@ -324,6 +326,7 @@
         <!-- Directory Browser View -->
         <div class="files-view" id="filesBrowserView">
           <div class="os-quick-bar" id="wsQuick"></div>
+          <div class="office-quick-bar" id="officeQuickBar" hidden></div>
           <div class="files-toolbar">
             <button class="icon-btn sm" id="osUpBtn" title="Go to parent OS folder"><svg><use href="#i-arrow-up"/></svg></button>
             <input class="os-path-input" id="osPathInput" type="text" title="Type any local OS folder path and press Enter" />
@@ -367,13 +370,26 @@
             <button class="btn tiny" id="edOpenOsBtn" title="Open with default OS app"><svg><use href="#i-external"/></svg>OS App</button>
             <button class="btn tiny" id="edRevealBtn" title="Reveal in OS File Manager">Reveal</button>
           </div>
+          <div class="ed-live-banner" id="edLiveBanner" hidden>
+            <span class="chat-live-dot"></span>
+            <span id="edLiveBannerTxt">Copilot is working on this file…</span>
+          </div>
           <div class="ed-readonly-note" id="edReadonlyNote" hidden>Read-only extracted text preview (PDF / Office / binary). Use "OS App" to edit externally.</div>
           <div class="ed-table-wrap" id="edTableWrap" hidden>
+            <div class="ed-sheet-tabs" id="edSheetTabs" hidden></div>
             <div class="ed-table-bar">
-              <input type="text" id="edTableFilter" placeholder="Filter table rows…" />
+              <span class="cell-ref-pill" id="edCellRef" title="Active cell shared with Copilot">A1</span>
+              <input type="text" id="edTableFilter" placeholder="Filter rows… (dbl-click any cell to edit)" />
               <span id="edTableStats">0 rows</span>
+              <button class="btn tiny" id="edAddRowBtn" title="Add empty row">+ Row</button>
             </div>
-            <div class="ed-table-scroll"><table class="data-grid" id="edTableGrid"></table></div>
+            <div class="ed-table-scroll" id="edTableScroll">
+              <table class="data-grid" id="edTableGrid"></table>
+              <div class="copilot-cursor" id="copilotCursor" hidden>
+                <svg class="cc-arrow" viewBox="0 0 20 20" aria-hidden="true"><path d="M2 2l6 15 2.7-5.6L16.5 9 2 2z"/></svg>
+                <span class="cc-tag" id="copilotCursorLabel">Copilot</span>
+              </div>
+            </div>
           </div>
           <textarea class="ed-textarea" id="edTextarea" spellcheck="false"></textarea>
           <div class="ed-foot">

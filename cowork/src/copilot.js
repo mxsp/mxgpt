@@ -49,8 +49,9 @@ function extractJsonObject(text) {
   return null;
 }
 
-function extractSpecialBlocks(markdown, toolsCfg) {
+async function extractSpecialBlocks(markdown, toolsCfg) {
   let fileActions = [];
+  let tableEdits = [];
   let codeRuns = [];
   let savedNotes = [];
   let savedTasks = [];
@@ -63,26 +64,45 @@ function extractSpecialBlocks(markdown, toolsCfg) {
       try {
         const arr = JSON.parse(actionsMatch[1].trim());
         if (Array.isArray(arr)) {
-          fileActions = arr
+          const rawActs = arr
             .filter((a) => a && a.type && ['mkdir', 'write', 'create', 'move', 'rename', 'copy', 'delete'].includes(String(a.type).toLowerCase()))
-            .slice(0, 30)
-            .map((a, i) => {
-              const act = {
-                id: `act_${Date.now().toString(36)}_${i}`,
-                type: String(a.type).toLowerCase(),
-                path: a.path ? String(a.path) : '',
-                from: a.from ? String(a.from) : '',
-                to: a.to ? String(a.to) : '',
-                content: typeof a.content === 'string' ? a.content : undefined,
-                reason: String(a.reason || '').slice(0, 180),
-                status: 'pending',
-              };
-              try {
-                const d = diffEngine.previewFileActionDiff(act);
-                if (d) act.diff = d;
-              } catch {}
-              return act;
-            });
+            .slice(0, 30);
+          for (let i = 0; i < rawActs.length; i++) {
+            const a = rawActs[i];
+            const act = {
+              id: `act_${Date.now().toString(36)}_${i}`,
+              type: String(a.type).toLowerCase(),
+              path: a.path ? String(a.path) : '',
+              from: a.from ? String(a.from) : '',
+              to: a.to ? String(a.to) : '',
+              content: typeof a.content === 'string' ? a.content : undefined,
+              reason: String(a.reason || '').slice(0, 180),
+              status: 'pending',
+            };
+            try {
+              const d = await diffEngine.previewFileActionDiff(act);
+              if (d) act.diff = d;
+            } catch {}
+            fileActions.push(act);
+          }
+        }
+      } catch {}
+    }
+
+    for (const m of text.matchAll(/```table-edits\s*\n([\s\S]*?)```/gi)) {
+      try {
+        const parsed = JSON.parse(m[1].trim());
+        const items = Array.isArray(parsed) ? parsed : [parsed];
+        for (const item of items) {
+          if (!item || !item.path || !Array.isArray(item.operations) || !item.operations.length) continue;
+          tableEdits.push({
+            id: `tbl_${Date.now().toString(36)}_${tableEdits.length}`,
+            path: String(item.path).trim(),
+            sheetIndex: Math.max(0, Number(item.sheetIndex) || 0),
+            summary: String(item.summary || `${item.operations.length} spreadsheet edit(s)`).slice(0, 160),
+            operations: item.operations.slice(0, 80),
+            status: 'pending',
+          });
         }
       } catch {}
     }
@@ -152,6 +172,7 @@ function extractSpecialBlocks(markdown, toolsCfg) {
 
   return {
     fileActions,
+    tableEdits: tableEdits.slice(0, 6),
     codeRuns: codeRuns.slice(0, 8),
     savedNotes: savedNotes.slice(0, 5),
     savedTasks: savedTasks.slice(0, 20),
@@ -467,6 +488,7 @@ async function runCoworkTurn({
   history = [],
   pinnedFiles = [],
   images = [],
+  activeContext = null,
   piiShieldOverride = undefined,
   toolOverrides = {},
   think = 'low',
@@ -522,8 +544,69 @@ async function runCoworkTurn({
     projectContextBlock = pParts.join('\n');
   }
 
+  // Deep Context Awareness: know every Office doc in the project AND the exact file/spreadsheet open in the right sidebar!
+  let activeViewContextBlock = '';
+  if (toolsCfg.osFiles) {
+    const viewParts = [];
+    try {
+      const officeDocs = await localFiles.listOfficeFiles(workspace, 24);
+      if (officeDocs.length) {
+        viewParts.push('Office & Data Documents in Active Project:\n' + officeDocs.map((f) => `- ${f.relPath} (${f.ext.slice(1).toUpperCase()}, ${f.sizeLabel})`).join('\n'));
+      }
+    } catch {}
+
+    const openFile = activeContext?.openFile;
+    if (openFile && openFile.path) {
+      onEvent('copilot_cursor', {
+        phase: 'reading',
+        path: openFile.path,
+        label: `Reading ${openFile.name || openFile.path}…`,
+        row: openFile.selectedCell?.row ?? 0,
+        col: openFile.selectedCell?.col ?? 0,
+      });
+
+      const isTab = /\.(xlsx|csv|tsv)$/i.test(openFile.path);
+      if (isTab) {
+        try {
+          const parsed = await localFiles.parseTableFile(openFile.path, workspace);
+          const sIdx = Math.max(0, Math.min((parsed.sheets?.length || 1) - 1, Number(openFile.sheetIndex) || 0));
+          const sheet = parsed.sheets?.[sIdx] || { name: 'Sheet1', rows: parsed.rows || [] };
+          const sampleRows = (sheet.rows || []).slice(0, 45);
+          const colLetters = (sampleRows[0] || []).map((_, i) => {
+            let s = ''; let n = i + 1;
+            while (n > 0) { const rem = (n - 1) % 26; s = String.fromCharCode(65 + rem) + s; n = Math.floor((n - 1) / 26); }
+            return s;
+          });
+          const formatted = sampleRows.map((r, rIdx) =>
+            `Row ${rIdx}${rIdx === 0 ? ' (Header)' : ''}: ` + r.map((v, cIdx) => `${colLetters[cIdx] || cIdx}${rIdx + 1}=${JSON.stringify(String(v ?? ''))}`).join(' | ')
+          ).join('\n');
+          const sel = openFile.selectedCell
+            ? `User currently selected cell: ${openFile.selectedCell.colLetter || ''}${(openFile.selectedCell.row ?? 0) + 1} (row=${openFile.selectedCell.row}, col=${openFile.selectedCell.col}, value=${JSON.stringify(openFile.selectedCell.value ?? '')})`
+            : '';
+          viewParts.push([
+            `CURRENTLY OPEN SPREADSHEET IN SIDEBAR: "${openFile.path}" (sheet "${sheet.name}", sheetIndex=${sIdx}, ${sheet.rows.length} rows × ${(sampleRows[0] || []).length} cols)`,
+            sel,
+            `Spreadsheet contents (0-based row & col indices for table-edits):\n${formatted.slice(0, 7500)}`,
+          ].filter(Boolean).join('\n'));
+        } catch {}
+      } else {
+        try {
+          const txt = await localFiles.readTextContent(localFiles.resolveSafe(openFile.path, workspace).abs, 6000);
+          viewParts.push(`CURRENTLY OPEN FILE IN SIDEBAR: "${openFile.path}"\n${txt}`);
+        } catch {}
+      }
+    }
+
+    if (viewParts.length) {
+      activeViewContextBlock = `<active_workspace_view>\n${viewParts.join('\n\n')}\n</active_workspace_view>`;
+    }
+  }
+
   const fileActionsHint = toolsCfg.osFiles
     ? `If proposing local OS file edits/creates/moves/renames/deletes, include a \`\`\`file-actions JSON array: [{"type":"mkdir"|"write"|"move"|"rename"|"copy"|"delete","path":"...","from":"...","to":"...","content":"...","reason":"..."}].`
+    : '';
+  const tableEditsHint = toolsCfg.osFiles
+    ? `When updating or adding cells, rows, or columns in an .xlsx or .csv spreadsheet (especially the currently open spreadsheet in sidebar), output a \`\`\`table-edits JSON block so mx-Cowork animates your live cursor editing each cell directly in the sidebar:\n\`\`\`table-edits\n{"path":"relative/file.xlsx","sheetIndex":0,"summary":"short description","operations":[{"op":"set_cell","row":1,"col":2,"value":"1450","note":"Fixed Q1"},{"op":"add_column","header":"Margin %","values":["32%","28%"],"note":"Computed margin"},{"op":"add_row","values":["Total","","4200","30%"],"note":"Added totals"}]}\n\`\`\` (row=0 is header row, col=0 is column A).`
     : '';
   const codeRunHint = toolsCfg.container
     ? `Container execution is ENABLED (isolated Docker/Podman container mounted at /workspace; default image ${cfg.containerImage || 'python:3.12-slim'}). When executing Python, Node.js, or Shell code on the workspace helps verify, test, compute, or automate, include a \`\`\`code-run JSON block: {"title":"short label","language":"python"|"javascript"|"bash","image":"python:3.12-slim","code":"...","reason":"why"}.`
@@ -551,11 +634,13 @@ async function runCoworkTurn({
     }
 
     const sys = [
-      `You are mx-Cowork, a local desktop AI copilot. Today: ${today}. Workspace: ${workspace}.`,
+      `You are mx-Cowork, a context-aware local desktop AI copilot. Today: ${today}. Workspace: ${workspace}.`,
       globalCustomInstr,
       projectContextBlock,
+      activeViewContextBlock,
       `Be crisp, structured, and actionable. Use Markdown.`,
       artifactHint,
+      tableEditsHint,
       fileActionsHint,
       codeRunHint,
       memoryHint,
@@ -602,8 +687,9 @@ async function runCoworkTurn({
       tokensPerSec: res.usage?.tokensPerSec || 0,
     });
 
-    const { fileActions, codeRuns, savedNotes, savedTasks } = extractSpecialBlocks(finalContent, toolsCfg);
+    const { fileActions, tableEdits, codeRuns, savedNotes, savedTasks } = await extractSpecialBlocks(finalContent, toolsCfg);
     if (fileActions.length) onEvent('file_actions', fileActions);
+    if (tableEdits.length) onEvent('table_edits', tableEdits);
     if (codeRuns.length) onEvent('code_runs', codeRuns);
 
     return {
@@ -617,6 +703,7 @@ async function runCoworkTurn({
       workers: [],
       sources: [],
       fileActions,
+      tableEdits,
       codeRuns,
       savedNotes,
       savedTasks,
@@ -669,6 +756,7 @@ Rules:
       `Today: ${today}`,
       `Workspace: ${workspace}`,
       wsSnapshot ? `Top-level items: ${wsSnapshot}` : '',
+      activeContext?.openFile?.path ? `Currently open file in user's sidebar (already loaded in context): ${activeContext.openFile.path}` : '',
       pinnedFiles?.length ? `Pinned files: ${pinnedFiles.join(', ')}` : '',
       `User request: ${prompt}`,
     ].filter(Boolean).join('\n');
@@ -759,9 +847,11 @@ Rules:
     `You are mx-Cowork's ${orchestratorLabel} Orchestrator. Today: ${today}. Workspace: ${workspace}.`,
     globalCustomInstr,
     projectContextBlock,
+    activeViewContextBlock,
     `Your local tools and fast worker models retrieved the evidence below. Synthesize a crisp, deeply helpful, accurate response using Markdown.`,
     `Cite web sources as Markdown links and reference local files by relative path.`,
     artifactHint,
+    tableEditsHint,
     fileActionsHint,
     codeRunHint,
     memoryHint,
@@ -817,8 +907,9 @@ Rules:
     tokensPerSec: finalRes.usage?.tokensPerSec || 0,
   });
 
-  const { fileActions, codeRuns, savedNotes, savedTasks } = extractSpecialBlocks(finalContent, toolsCfg);
+  const { fileActions, tableEdits, codeRuns, savedNotes, savedTasks } = await extractSpecialBlocks(finalContent, toolsCfg);
   if (fileActions.length) onEvent('file_actions', fileActions);
+  if (tableEdits.length) onEvent('table_edits', tableEdits);
   if (codeRuns.length) onEvent('code_runs', codeRuns);
   if (allSources.length) onEvent('sources', allSources);
 
@@ -833,6 +924,7 @@ Rules:
     workers: workerResults,
     sources: allSources,
     fileActions,
+    tableEdits,
     codeRuns,
     savedNotes,
     savedTasks,

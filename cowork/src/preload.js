@@ -136,6 +136,9 @@ contextBridge.exposeInMainWorld('cowork', {
   compareFiles: (opts) => ipcRenderer.invoke('diff:compareFiles', opts),
   previewActionDiff: (action) => ipcRenderer.invoke('diff:previewAction', action),
   parseTableFile: (relPath) => ipcRenderer.invoke('files:parseTable', relPath),
+  saveTableFile: (opts) => ipcRenderer.invoke('files:saveTable', opts),
+  applyTableEdits: (te) => ipcRenderer.invoke('files:applyTableEdits', te),
+  listOfficeFiles: () => ipcRenderer.invoke('files:officeList'),
 
   // Real Office & PDF Exports (.docx, .xlsx, .pdf, .ics)
   exportDocx: (opts) => ipcRenderer.invoke('export:docx', opts),
