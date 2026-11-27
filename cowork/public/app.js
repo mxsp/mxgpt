@@ -787,7 +787,7 @@ async function boot() {
   S.projects = projData?.projects || [];
   S.activeProject = projData?.activeProject || null;
 
-  $('#appVersionBadge').textContent = `v${info.version || '1.8.2'}`;
+  $('#appVersionBadge').textContent = `v${info.version || '1.8.3'}`;
   applyThemeUI(S.settings.theme || 'light');
   setMode(S.settings.defaultMode || 'copilot');
   setThink(S.settings.think || 'low');
@@ -1613,7 +1613,7 @@ function renderCopilotPanel(msg) {
   panel.className = 'subagents-panel';
   const workers = msg.workers || [];
   const running = workers.filter((w) => w.status === 'running').length;
-  const done = workers.filter((w) => w.status === 'done' || w.ok).length;
+  const done = workers.filter((w) => w.status !== 'running' && !w.error && w.ok !== false).length;
 
   const head = document.createElement('div');
   head.className = 'subagents-header';
@@ -1782,7 +1782,19 @@ function renderFileActionsCard(actions) {
 function renderCodeRunsCard(runs) {
   const card = document.createElement('div');
   card.className = 'action-card';
-  card.innerHTML = `<div class="ac-head"><div class="ac-title">Container Code Execution (${runs.length})</div><span class="cr-badge">/workspace mounted</span></div>`;
+  const hostCount = runs.filter((r) => (r.execTarget || getEffectiveExecTarget()) === 'host').length;
+  const allHost = hostCount === runs.length;
+  const headerTitle = allHost
+    ? `Local Code Execution (${runs.length})`
+    : hostCount > 0
+      ? `Code Execution (${runs.length})`
+      : `Container Code Execution (${runs.length})`;
+  const headerBadge = allHost
+    ? 'On-Machine Host'
+    : hostCount > 0
+      ? 'Host & Container'
+      : '/workspace mounted';
+  card.innerHTML = `<div class="ac-head"><div class="ac-title">${headerTitle}</div><span class="cr-badge${allHost ? ' host' : ''}">${headerBadge}</span></div>`;
 
   for (const run of runs) {
     const box = document.createElement('div');
@@ -1977,25 +1989,165 @@ function renderHarnessMessage(m) {
   return el;
 }
 
+function renderAgentTraceGroup(steps) {
+  let stepNum = 0;
+  let codeRunCount = 0;
+  let fileActCount = 0;
+  let tableEditCount = 0;
+  let workerCount = 0;
+  let failCount = 0;
+
+  for (const item of steps) {
+    if (item.role === 'assistant') {
+      stepNum++;
+      codeRunCount += item.codeRuns?.length || 0;
+      fileActCount += item.fileActions?.length || 0;
+      tableEditCount += item.tableEdits?.length || 0;
+      workerCount += item.workers?.length || 0;
+      if (item.codeRuns?.some((r) => r.status === 'error')) failCount++;
+      if (item.fileActions?.some((a) => a.status === 'error')) failCount++;
+    } else if (isHarnessMessage(item)) {
+      const meta = item.harnessMeta || {};
+      if (meta.status === 'error' || /failed|with an error|exit [1-9]/i.test(meta.title || String(item.content || '').slice(0, 200))) {
+        if (!failCount) failCount++;
+      }
+    }
+  }
+
+  const summaryBits = [];
+  if (stepNum) summaryBits.push(`${stepNum} step${stepNum > 1 ? 's' : ''}`);
+  if (codeRunCount) summaryBits.push(`${codeRunCount} code run${codeRunCount > 1 ? 's' : ''}`);
+  if (fileActCount) summaryBits.push(`${fileActCount} file action${fileActCount > 1 ? 's' : ''}`);
+  if (tableEditCount) summaryBits.push(`${tableEditCount} sheet edit${tableEditCount > 1 ? 's' : ''}`);
+  if (workerCount) summaryBits.push(`${workerCount} worker${workerCount > 1 ? 's' : ''}`);
+
+  const details = document.createElement('details');
+  details.className = 'agent-trace' + (failCount ? ' has-err' : '');
+
+  const sum = document.createElement('summary');
+  sum.className = 'at-head';
+  sum.innerHTML = `
+    <span class="harness-badge">HARNESS</span>
+    <span class="at-title">${esc(summaryBits.join(' · ') || 'Agent steps')}</span>
+    <span class="harness-status ${failCount ? 'err' : 'ok'}">${failCount ? `✗ ${failCount} issue${failCount > 1 ? 's' : ''}` : '✓ Completed'}</span>
+    <span class="harness-toggle">Steps ▾</span>`;
+  details.appendChild(sum);
+
+  const list = document.createElement('div');
+  list.className = 'at-body';
+
+  let idx = 0;
+  let prevHadCodeRuns = false;
+  for (let i = 0; i < steps.length; i++) {
+    const item = steps[i];
+    if (isHarnessMessage(item)) {
+      const meta = item.harnessMeta || {};
+      const raw = String(item.content || '');
+      const isErr = meta.status === 'error' || /failed|with an error|exit [1-9]/i.test(meta.title || raw.slice(0, 220));
+      // If the previous step already showed the full code run output card, show a compact handoff pill instead of duplicating stdout
+      if (prevHadCodeRuns) {
+        const pill = document.createElement('div');
+        pill.className = 'at-handoff ' + (isErr ? 'err' : 'ok');
+        pill.innerHTML = `<span>↪ Harness ${isErr ? 'reported error to Copilot for recovery' : 'fed output to Copilot'}</span>`;
+        list.appendChild(pill);
+      } else {
+        list.appendChild(renderHarnessMessage(item));
+      }
+      prevHadCodeRuns = false;
+      continue;
+    }
+
+    idx++;
+    prevHadCodeRuns = Boolean(item.codeRuns?.length);
+    const stepEl = document.createElement('div');
+    stepEl.className = 'at-step';
+
+    const firstLabel = item.codeRuns?.[0]?.title
+      || (item.fileActions?.length ? `File edits (${item.fileActions.map((a) => a.path || a.to).filter(Boolean).slice(0, 2).join(', ')})` : '')
+      || item.plan?.goal
+      || `Step ${idx}`;
+    const stepErr = item.codeRuns?.some((r) => r.status === 'error') || item.fileActions?.some((a) => a.status === 'error');
+    const tps = item.usage?.tokensPerSec ? `${item.usage.tokensPerSec} t/s` : '';
+
+    const sHead = document.createElement('div');
+    sHead.className = 'at-step-head';
+    sHead.innerHTML = `
+      <span class="at-step-num">${idx}</span>
+      <span class="at-step-label">${esc(firstLabel)}</span>
+      ${tps ? `<span class="at-step-meta">${esc(tps)}</span>` : ''}
+      <span class="harness-status ${stepErr ? 'err' : 'ok'}">${stepErr ? '✗' : '✓'}</span>`;
+    stepEl.appendChild(sHead);
+
+    const cp = renderCopilotPanel(item);
+    if (cp) stepEl.appendChild(cp);
+
+    if (item.thinking) {
+      const th = document.createElement('details');
+      th.className = 'think-box';
+      th.innerHTML = `<summary>Thinking (${item.thinking.length} chars)</summary><pre>${esc(item.thinking)}</pre>`;
+      stepEl.appendChild(th);
+    }
+
+    // Omit boilerplate "Prepared 1 code run: ..." text inside trace when cards already show full details
+    const cleanProse = String(item.content || '').trim();
+    const isBoilerplate = /^Prepared \*\*\d+\*\*/i.test(cleanProse) && (item.codeRuns?.length || item.fileActions?.length || item.tableEdits?.length);
+    if (cleanProse && !isBoilerplate) {
+      const pr = document.createElement('div');
+      pr.className = 'prose at-prose';
+      pr.innerHTML = renderMd(cleanProse, { msgKey: item.id || `step_${i}`, isStreaming: false });
+      stepEl.appendChild(pr);
+    }
+
+    if (item.fileActions?.length) stepEl.appendChild(renderFileActionsCard(item.fileActions));
+    if (item.tableEdits?.length) stepEl.appendChild(renderTableEditsCard(item.tableEdits));
+    if (item.codeRuns?.length) stepEl.appendChild(renderCodeRunsCard(item.codeRuns));
+    list.appendChild(stepEl);
+  }
+
+  details.appendChild(list);
+  return details;
+}
+
 function renderMessages(forceScroll = true) {
   const wrap = $('#messages');
   $('#welcome').classList.toggle('hidden', S.messages.length > 0);
   wrap.innerHTML = '';
 
-  for (let mi = 0; mi < S.messages.length; mi++) {
-    const m = S.messages[mi];
-    const msgKey = m.id || `m_${mi}`;
-    if (isHarnessMessage(m)) {
-      wrap.appendChild(renderHarnessMessage(m));
-      continue;
-    }
-    const el = document.createElement('div');
-    el.className = `msg ${m.role}`;
-    if (m.role === 'user') {
-      el.innerHTML = `<div class="bubble">${esc(m.content)}</div>`;
+  let mi = 0;
+  while (mi < S.messages.length) {
+    const first = S.messages[mi];
+    if (first.role === 'user' && !isHarnessMessage(first)) {
+      const el = document.createElement('div');
+      el.className = 'msg user';
+      el.innerHTML = `<div class="bubble">${esc(first.content)}</div>`;
       wrap.appendChild(el);
+      mi++;
       continue;
     }
+
+    // Collect all consecutive assistant + harness messages into ONE unified Copilot turn!
+    const group = [];
+    while (mi < S.messages.length) {
+      const cur = S.messages[mi];
+      if (cur.role === 'user' && !isHarnessMessage(cur)) break;
+      group.push({ msg: cur, idx: mi });
+      mi++;
+    }
+
+    // Standalone harness message with no assistant message at all
+    const lastAssistantPos = group.map((g) => g.msg.role).lastIndexOf('assistant');
+    if (lastAssistantPos < 0) {
+      for (const g of group) wrap.appendChild(renderHarnessMessage(g.msg));
+      continue;
+    }
+
+    const priorSteps = group.slice(0, lastAssistantPos).map((g) => g.msg);
+    const trailingHarness = group.slice(lastAssistantPos + 1).map((g) => g.msg);
+    const { msg: m, idx: finalIdx } = group[lastAssistantPos];
+    const msgKey = m.id || `m_${finalIdx}`;
+
+    const el = document.createElement('div');
+    el.className = 'msg assistant';
 
     const av = document.createElement('div');
     av.className = 'msg-avatar';
@@ -2004,6 +2156,11 @@ function renderMessages(forceScroll = true) {
 
     const body = document.createElement('div');
     body.className = 'msg-body';
+
+    // Grouped collapsible Agent + Harness timeline for all prior intermediate steps
+    if (priorSteps.length) {
+      body.appendChild(renderAgentTraceGroup(priorSteps));
+    }
 
     if (m.livePhase) {
       const ph = document.createElement('div');
@@ -2032,6 +2189,9 @@ function renderMessages(forceScroll = true) {
     if (m.fileActions?.length) body.appendChild(renderFileActionsCard(m.fileActions));
     if (m.tableEdits?.length) body.appendChild(renderTableEditsCard(m.tableEdits));
     if (m.codeRuns?.length) body.appendChild(renderCodeRunsCard(m.codeRuns));
+    if (trailingHarness.length) {
+      for (const hm of trailingHarness) body.appendChild(renderHarnessMessage(hm));
+    }
     if (m.graphReady) {
       const gb = document.createElement('div');
       gb.className = 'action-card';
