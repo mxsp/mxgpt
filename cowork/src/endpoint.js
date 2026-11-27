@@ -396,6 +396,7 @@ async function chatCompletion({
   systemPrompt = '',
   messages = [],
   images = [],
+  tools = [],
   think = 'off',
   priority = '',
   signal,
@@ -440,6 +441,7 @@ async function chatCompletion({
       systemPrompt,
       messages,
       images: cleanImages,
+      tools,
       think,
       signal,
       onEvent,
@@ -463,6 +465,7 @@ async function chatCompletion({
       systemPrompt,
       messages,
       images: cleanImages,
+      tools,
       think,
       signal,
       onEvent,
@@ -479,7 +482,7 @@ async function chatCompletion({
   });
 }
 
-async function chatViaOpenAI(cfg, { model, systemPrompt, messages, images = [], signal, onEvent }) {
+async function chatViaOpenAI(cfg, { model, systemPrompt, messages, images = [], tools = [], think = 'off', signal, onEvent }) {
   const base = normalizeOpenAIBase(cfg.endpointUrl);
   const fullMsgs = [];
   if (systemPrompt) fullMsgs.push({ role: 'system', content: systemPrompt });
@@ -508,15 +511,42 @@ async function chatViaOpenAI(cfg, { model, systemPrompt, messages, images = [], 
     stream: true,
     temperature: 0.4,
   };
+  if (Array.isArray(tools) && tools.length) {
+    body.tools = tools;
+    body.tool_choice = 'auto';
+  }
+  if (think && think !== 'off') {
+    body.reasoning_effort = think === 'max' ? 'high' : think;
+  }
 
   const t0 = Date.now();
   let firstTokenAt = 0;
-  const res = await fetch(`${base}/chat/completions`, {
+  let res = await fetch(`${base}/chat/completions`, {
     method: 'POST',
     headers: openAIHeaders(cfg),
     body: JSON.stringify(body),
     signal,
   });
+  if (!res.ok && (res.status === 400 || res.status === 422) && (body.reasoning_effort || body.tools)) {
+    const retryBody = { ...body };
+    delete retryBody.reasoning_effort;
+    res = await fetch(`${base}/chat/completions`, {
+      method: 'POST',
+      headers: openAIHeaders(cfg),
+      body: JSON.stringify(retryBody),
+      signal,
+    });
+    if (!res.ok && (res.status === 400 || res.status === 422) && retryBody.tools) {
+      delete retryBody.tools;
+      delete retryBody.tool_choice;
+      res = await fetch(`${base}/chat/completions`, {
+        method: 'POST',
+        headers: openAIHeaders(cfg),
+        body: JSON.stringify(retryBody),
+        signal,
+      });
+    }
+  }
   if (!res.ok) {
     const errTxt = (await res.text().catch(() => '')).slice(0, 350);
     throw new Error(`Provider HTTP ${res.status}: ${errTxt || res.statusText}`);
@@ -527,6 +557,7 @@ async function chatViaOpenAI(cfg, { model, systemPrompt, messages, images = [], 
   let buf = '';
   let content = '';
   let thinking = '';
+  const rawToolCalls = [];
   let promptTokens = 0;
   let evalTokens = 0;
   let chunks = 0;
@@ -541,8 +572,8 @@ async function chatViaOpenAI(cfg, { model, systemPrompt, messages, images = [], 
     if (obj.error) {
       throw new Error(obj.error.message || JSON.stringify(obj.error));
     }
-    const delta = obj.choices?.[0]?.delta || {};
-    const rDelta = delta.reasoning_content || delta.reasoning || '';
+    const delta = obj.choices?.[0]?.delta || obj.choices?.[0]?.message || {};
+    const rDelta = delta.reasoning_content || delta.reasoning || delta.thinking || '';
     if (rDelta) {
       if (!firstTokenAt) firstTokenAt = Date.now();
       thinking += rDelta;
@@ -554,6 +585,17 @@ async function chatViaOpenAI(cfg, { model, systemPrompt, messages, images = [], 
       content += delta.content;
       chunks++;
       onEvent?.({ type: 'text', delta: delta.content });
+    }
+    if (Array.isArray(delta.tool_calls)) {
+      for (const [i, tc] of delta.tool_calls.entries()) {
+        const idx = tc.index ?? i;
+        rawToolCalls[idx] = rawToolCalls[idx] || { id: '', name: '', arguments: '' };
+        if (tc.id) rawToolCalls[idx].id = tc.id;
+        if (tc.function?.name) rawToolCalls[idx].name += tc.function.name;
+        if (tc.function?.arguments) rawToolCalls[idx].arguments += tc.function.arguments;
+      }
+      if (!firstTokenAt) firstTokenAt = Date.now();
+      chunks++;
     }
     if (obj.usage) {
       promptTokens = obj.usage.prompt_tokens || promptTokens;
@@ -573,6 +615,12 @@ async function chatViaOpenAI(cfg, { model, systemPrompt, messages, images = [], 
   }
   if (buf.trim()) handleLine(buf);
 
+  const toolCalls = rawToolCalls.filter((c) => c && c.name).map((c, i) => {
+    let args = {};
+    try { args = JSON.parse(c.arguments || '{}'); } catch { args = {}; }
+    return { id: c.id || `tc_${Date.now().toString(36)}_${i}`, name: c.name, args };
+  });
+
   const elapsedMs = Date.now() - t0;
   const genSec = Math.max(0.05, (Date.now() - (firstTokenAt || t0)) / 1000);
   const estTokens = evalTokens || Math.max(chunks, Math.round((content.length + thinking.length) / 4));
@@ -581,6 +629,7 @@ async function chatViaOpenAI(cfg, { model, systemPrompt, messages, images = [], 
   return {
     content: content.trim(),
     thinking: thinking.trim(),
+    toolCalls,
     model,
     elapsedMs,
     usage: { promptTokens, evalTokens: estTokens, tokensPerSec },
@@ -802,7 +851,7 @@ async function chatViaOllama(cfg, { model, systemPrompt, messages, images = [], 
   };
 }
 
-async function chatViaMxgptOpencodeProxy(cfg, { model, systemPrompt, messages, images = [], think, signal, onEvent }) {
+async function chatViaMxgptOpencodeProxy(cfg, { model, systemPrompt, messages, images = [], tools = [], think, signal, onEvent }) {
   const t0 = Date.now();
   const fullMsgs = [];
   if (systemPrompt) fullMsgs.push({ role: 'system', content: systemPrompt });
@@ -831,33 +880,35 @@ async function chatViaMxgptOpencodeProxy(cfg, { model, systemPrompt, messages, i
     stream: true,
     stream_options: { include_usage: true },
   };
+  if (Array.isArray(tools) && tools.length) {
+    body.tools = tools;
+    body.tool_choice = 'auto';
+  }
   if (think && think !== 'off') {
     body.reasoning_effort = think === 'max' ? 'high' : think;
   }
 
-  let res = await mxgptFetch(cfg, '/opencode/v1/chat/completions', {
+  const doPost = (payload) => mxgptFetch(cfg, '/opencode/v1/chat/completions', {
     method: 'POST',
     headers: {
       'content-type': 'application/json',
       accept: 'text/event-stream',
       'x-opencode-session': `mxcw-${Date.now().toString(36)}`,
     },
-    body: JSON.stringify(body),
+    body: JSON.stringify(payload),
     signal,
   });
-  if (!res.ok && (res.status === 400 || res.status === 422) && body.reasoning_effort) {
+
+  let res = await doPost(body);
+  if (!res.ok && (res.status === 400 || res.status === 422) && (body.reasoning_effort || body.tools)) {
     const retryBody = { ...body };
     delete retryBody.reasoning_effort;
-    res = await mxgptFetch(cfg, '/opencode/v1/chat/completions', {
-      method: 'POST',
-      headers: {
-        'content-type': 'application/json',
-        accept: 'text/event-stream',
-        'x-opencode-session': `mxcw-${Date.now().toString(36)}`,
-      },
-      body: JSON.stringify(retryBody),
-      signal,
-    });
+    res = await doPost(retryBody);
+    if (!res.ok && (res.status === 400 || res.status === 422) && retryBody.tools) {
+      delete retryBody.tools;
+      delete retryBody.tool_choice;
+      res = await doPost(retryBody);
+    }
   }
   if (!res.ok) {
     const txt = (await res.text().catch(() => '')).slice(0, 350);
@@ -869,6 +920,7 @@ async function chatViaMxgptOpencodeProxy(cfg, { model, systemPrompt, messages, i
   let buf = '';
   let content = '';
   let thinking = '';
+  const rawToolCalls = [];
   let promptTokens = 0;
   let evalTokens = 0;
 
@@ -891,6 +943,15 @@ async function chatViaMxgptOpencodeProxy(cfg, { model, systemPrompt, messages, i
       content += c;
       onEvent?.({ type: 'text', delta: c });
     }
+    if (Array.isArray(delta.tool_calls)) {
+      for (const [i, tc] of delta.tool_calls.entries()) {
+        const idx = tc.index ?? i;
+        rawToolCalls[idx] = rawToolCalls[idx] || { id: '', name: '', arguments: '' };
+        if (tc.id) rawToolCalls[idx].id = tc.id;
+        if (tc.function?.name) rawToolCalls[idx].name += tc.function.name;
+        if (tc.function?.arguments) rawToolCalls[idx].arguments += tc.function.arguments;
+      }
+    }
     if (obj.usage) {
       promptTokens = obj.usage.prompt_tokens || promptTokens;
       evalTokens = obj.usage.completion_tokens || evalTokens;
@@ -909,12 +970,19 @@ async function chatViaMxgptOpencodeProxy(cfg, { model, systemPrompt, messages, i
   }
   if (buf.trim()) processLine(buf);
 
+  const toolCalls = rawToolCalls.filter((c) => c && c.name).map((c, i) => {
+    let args = {};
+    try { args = JSON.parse(c.arguments || '{}'); } catch { args = {}; }
+    return { id: c.id || `tc_${Date.now().toString(36)}_${i}`, name: c.name, args };
+  });
+
   const elapsedMs = Date.now() - t0;
   const sec = elapsedMs / 1000;
   const tokensPerSec = evalTokens > 0 && sec > 0.2 ? Math.round((evalTokens / sec) * 10) / 10 : 0;
   return {
     content: content.trim(),
     thinking: thinking.trim(),
+    toolCalls,
     model: `opencode-go/${model}`,
     elapsedMs,
     usage: { promptTokens, evalTokens, tokensPerSec },

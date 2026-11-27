@@ -183,6 +183,194 @@ async function extractSpecialBlocks(markdown, toolsCfg, stdExecTarget = '') {
   };
 }
 
+function buildNativeTools(toolsCfg, resolvedExecTarget = 'container') {
+  const tools = [];
+  if (toolsCfg.osFiles) {
+    tools.push({
+      type: 'function',
+      function: {
+        name: 'write_file',
+        description: 'Create or overwrite a text/code/config file in the active workspace (recorded with 1-click Undo).',
+        parameters: {
+          type: 'object',
+          properties: {
+            path: { type: 'string', description: 'Relative path inside the workspace, e.g. app.py or src/index.js' },
+            content: { type: 'string', description: 'Complete file contents' },
+            reason: { type: 'string', description: 'Short explanation of the change' },
+          },
+          required: ['path', 'content'],
+        },
+      },
+    });
+    tools.push({
+      type: 'function',
+      function: {
+        name: 'file_action',
+        description: 'Perform a workspace filesystem action (mkdir, write, move, rename, copy, or delete).',
+        parameters: {
+          type: 'object',
+          properties: {
+            type: { type: 'string', enum: ['mkdir', 'write', 'move', 'rename', 'copy', 'delete'] },
+            path: { type: 'string', description: 'Target relative path (for mkdir/write/delete)' },
+            from: { type: 'string', description: 'Source relative path (for move/rename/copy)' },
+            to: { type: 'string', description: 'Destination relative path (for move/rename/copy)' },
+            content: { type: 'string', description: 'File contents (for write)' },
+            reason: { type: 'string' },
+          },
+          required: ['type'],
+        },
+      },
+    });
+    tools.push({
+      type: 'function',
+      function: {
+        name: 'edit_table',
+        description: 'Update cells, rows, or columns in an .xlsx or .csv spreadsheet in the workspace.',
+        parameters: {
+          type: 'object',
+          properties: {
+            path: { type: 'string', description: 'Relative path to .xlsx or .csv file' },
+            sheetIndex: { type: 'integer', description: '0-based sheet index' },
+            summary: { type: 'string' },
+            operations: {
+              type: 'array',
+              items: { type: 'object' },
+              description: 'List of set_cell / add_column / add_row operations',
+            },
+          },
+          required: ['path', 'operations'],
+        },
+      },
+    });
+  }
+  if (toolsCfg.container) {
+    tools.push({
+      type: 'function',
+      function: {
+        name: 'run_code',
+        description: `Execute Python, JavaScript (Node.js), or Bash code on the preselected ${resolvedExecTarget === 'host' ? 'On-Machine Host' : 'Isolated Container'} environment in the workspace.`,
+        parameters: {
+          type: 'object',
+          properties: {
+            title: { type: 'string', description: 'Short label for this execution' },
+            language: { type: 'string', enum: ['python', 'javascript', 'bash'] },
+            code: { type: 'string', description: 'Executable script or command' },
+            reason: { type: 'string', description: 'Why this code should run' },
+          },
+          required: ['language', 'code'],
+        },
+      },
+    });
+  }
+  if (toolsCfg.notes) {
+    tools.push({
+      type: 'function',
+      function: {
+        name: 'save_memory',
+        description: 'Save a persistent user preference or project note.',
+        parameters: {
+          type: 'object',
+          properties: {
+            title: { type: 'string' },
+            content: { type: 'string' },
+            tags: { type: 'array', items: { type: 'string' } },
+          },
+          required: ['title', 'content'],
+        },
+      },
+    });
+  }
+  return tools;
+}
+
+async function mergeNativeToolCalls(toolCalls, blocks, toolsCfg, resolvedExecTarget = 'container') {
+  if (!Array.isArray(toolCalls) || !toolCalls.length) return blocks;
+  const cfg = storage.getSettings();
+  for (let i = 0; i < toolCalls.length; i++) {
+    const tc = toolCalls[i];
+    const name = String(tc?.name || '').toLowerCase();
+    const args = tc?.args && typeof tc.args === 'object' ? tc.args : {};
+
+    if ((name === 'write_file' || name === 'file_action') && toolsCfg.osFiles) {
+      const type = name === 'write_file' ? 'write' : String(args.type || 'write').toLowerCase();
+      if (!['mkdir', 'write', 'create', 'move', 'rename', 'copy', 'delete'].includes(type)) continue;
+      const act = {
+        id: `act_${Date.now().toString(36)}_tc${i}`,
+        type,
+        path: args.path ? String(args.path) : '',
+        from: args.from ? String(args.from) : '',
+        to: args.to ? String(args.to) : '',
+        content: typeof args.content === 'string' ? args.content : undefined,
+        reason: String(args.reason || '').slice(0, 180),
+        status: 'pending',
+      };
+      try {
+        const d = await diffEngine.previewFileActionDiff(act);
+        if (d) act.diff = d;
+      } catch {}
+      blocks.fileActions.push(act);
+    } else if (name === 'run_code' && toolsCfg.container) {
+      const code = typeof args.code === 'string' ? args.code : (typeof args.command === 'string' ? args.command : '');
+      if (!code.trim()) continue;
+      const lang = String(args.language || 'python').toLowerCase();
+      blocks.codeRuns.push({
+        id: `run_${Date.now().toString(36)}_tc${i}`,
+        title: String(args.title || `Run ${lang} ${resolvedExecTarget === 'host' ? 'on host' : 'in container'}`).slice(0, 100),
+        language: lang,
+        image: String(args.image || containerRunner.defaultImageForLanguage(lang, cfg.containerImage)),
+        code,
+        command: '',
+        network: cfg.containerNetwork || 'none',
+        mountMode: cfg.containerMountMode || 'rw',
+        execTarget: resolvedExecTarget,
+        reason: String(args.reason || '').slice(0, 180),
+        status: 'pending',
+        output: '',
+      });
+    } else if (name === 'edit_table' && toolsCfg.osFiles) {
+      if (!args.path || !Array.isArray(args.operations) || !args.operations.length) continue;
+      blocks.tableEdits.push({
+        id: `tbl_${Date.now().toString(36)}_tc${i}`,
+        path: String(args.path).trim(),
+        sheetIndex: Math.max(0, Number(args.sheetIndex) || 0),
+        summary: String(args.summary || `${args.operations.length} spreadsheet edit(s)`).slice(0, 160),
+        operations: args.operations.slice(0, 80),
+        status: 'pending',
+      });
+    } else if (name === 'save_memory' && toolsCfg.notes) {
+      if (args.title || args.content) {
+        blocks.savedNotes.push({
+          title: String(args.title || 'Saved note').slice(0, 120),
+          content: String(args.content || '').trim(),
+          tags: Array.isArray(args.tags) ? args.tags : [],
+        });
+      }
+    }
+  }
+  blocks.fileActions = blocks.fileActions.slice(0, 30);
+  blocks.codeRuns = blocks.codeRuns.slice(0, 8);
+  blocks.tableEdits = blocks.tableEdits.slice(0, 6);
+  blocks.savedNotes = blocks.savedNotes.slice(0, 5);
+  return blocks;
+}
+
+function summarizeBlocksMarkdown(blocks) {
+  const parts = [];
+  if (blocks.fileActions?.length) {
+    const names = blocks.fileActions.map((a) => `\`${a.path || a.to || a.from}\``).join(', ');
+    parts.push(`Prepared **${blocks.fileActions.length}** file action${blocks.fileActions.length > 1 ? 's' : ''}: ${names}.`);
+  }
+  if (blocks.codeRuns?.length) {
+    const labels = blocks.codeRuns.map((r) => `**${r.title || r.language}**`).join(', ');
+    parts.push(`Prepared **${blocks.codeRuns.length}** code run${blocks.codeRuns.length > 1 ? 's' : ''}: ${labels}.`);
+  }
+  if (blocks.tableEdits?.length) {
+    const names = blocks.tableEdits.map((t) => `\`${t.path}\``).join(', ');
+    parts.push(`Prepared **${blocks.tableEdits.length}** spreadsheet edit${blocks.tableEdits.length > 1 ? 's' : ''} for ${names}.`);
+  }
+  return parts.join('\n\n');
+}
+
 function resolveEnabledTools(cfg, overrides = {}) {
   return {
     webSearch: overrides.toolWebSearch !== undefined ? Boolean(overrides.toolWebSearch) : cfg.toolWebSearch !== false,
@@ -648,13 +836,21 @@ async function runCoworkTurn({
     : '';
   const artifactHint = `When creating interactive dashboards, web apps, charts, diagrams, or visual UI mockups, output a complete self-contained fenced \`\`\`html, \`\`\`svg, \`\`\`jsx, or \`\`\`mermaid code block so mx-Cowork opens it automatically in the live Artifact Preview Canvas.`;
   const globalCustomInstr = cfg.customInstructions ? `User Custom Instructions:\n${cfg.customInstructions}` : '';
-  const workerModel = guardModel(cfg.agentModel || cfg.fastModel, 'lfm3:latest');
+  const supportsNativeTools = (m) => cfg.endpointType === 'openai' || /^opencode-go\//i.test(String(m || ''));
+  let workerModel = guardModel(cfg.agentModel || cfg.fastModel, 'lfm3:latest');
+  // On remote OpenAI/OpenCode Go endpoints, never send local Ollama tags like "lfm3:latest" for workers
+  if (cfg.endpointType === 'openai' && /:latest$/i.test(workerModel)) {
+    const fallbackRemote = (mode === 'copilot_b' ? cfg.copilotBModel : cfg.smartModel) || cfg.fastModel;
+    if (fallbackRemote && !/:latest$/i.test(fallbackRemote)) workerModel = fallbackRemote;
+  }
 
   // ---- Direct Fast or Smart modes
   if (mode === 'fast' || mode === 'smart') {
     const chosenModel = mode === 'fast'
       ? guardModel(cfg.fastModel, 'lfm3:latest')
       : guardModel(cfg.smartModel, 'inkling-2-mini:latest');
+    const useNativeTools = supportsNativeTools(chosenModel);
+    const nativeTools = useNativeTools ? buildNativeTools(toolsCfg, resolvedExecTarget) : [];
     onEvent('phase', { phase: 'preparing', label: `${mode === 'fast' ? 'Fast' : 'Smart'} · ${chosenModel.replace(/:latest$/, '')}` });
     let directWsSnapshot = '';
     if (toolsCfg.osFiles) {
@@ -681,7 +877,9 @@ async function runCoworkTurn({
       projectContextBlock,
       activeViewContextBlock,
       `Be crisp, structured, and actionable. Use Markdown.`,
-      noNativeToolHint,
+      useNativeTools
+        ? `Use the attached tools (write_file, file_action, run_code, edit_table, save_memory) directly whenever creating/editing files or running code, and also write a clear Markdown explanation.`
+        : noNativeToolHint,
       artifactHint,
       tableEditsHint,
       fileActionsHint,
@@ -706,6 +904,7 @@ async function runCoworkTurn({
       systemPrompt: maskedSys,
       messages: msgs,
       images,
+      tools: nativeTools,
       think: mode === 'fast' ? 'off' : think,
       priority: mode,
       signal,
@@ -716,8 +915,8 @@ async function runCoworkTurn({
       },
     });
 
-    // Guard against reasoning-only cutoffs (model produced thinking but empty content)
-    if (!String(res.content || '').trim() && !signal?.aborted) {
+    // Guard against reasoning-only cutoffs (empty content AND no native tool calls)
+    if (!String(res.content || '').trim() && !(res.toolCalls?.length) && !signal?.aborted) {
       onEvent('phase', { phase: 'synthesizing', label: 'Completing response…' });
       const thoughtHint = String(res.thinking || '').trim().slice(0, 1200);
       const recoverRes = await endpoint.chatCompletion({
@@ -729,10 +928,11 @@ async function runCoworkTurn({
           {
             role: 'user',
             content: mask(
-              `${thoughtHint ? `Your internal plan was:\n${thoughtHint}\n\n` : ''}You stopped after thinking without writing a visible answer. Now output the complete final Markdown answer and any required fenced \`\`\`code-run, \`\`\`file-actions, or \`\`\`table-edits blocks immediately.`
+              `${thoughtHint ? `Your internal plan was:\n${thoughtHint}\n\n` : ''}You stopped after thinking without writing a visible answer or tool call. Now immediately output the complete Markdown answer and call write_file / run_code (or emit fenced \`\`\`file-actions / \`\`\`code-run blocks).`
             ),
           },
         ],
+        tools: nativeTools,
         think: 'off',
         priority: mode,
         signal,
@@ -747,7 +947,7 @@ async function runCoworkTurn({
       };
     }
 
-    const finalContent = unmask(res.content);
+    let finalContent = unmask(res.content);
     const finalThinking = unmask(res.thinking);
 
     storage.recordUsage({
@@ -762,7 +962,13 @@ async function runCoworkTurn({
       tokensPerSec: res.usage?.tokensPerSec || 0,
     });
 
-    const { fileActions, tableEdits, codeRuns, savedNotes, savedTasks } = await extractSpecialBlocks(finalContent, toolsCfg, resolvedExecTarget);
+    const blocks = await extractSpecialBlocks(finalContent, toolsCfg, resolvedExecTarget);
+    await mergeNativeToolCalls(res.toolCalls, blocks, toolsCfg, resolvedExecTarget);
+    const { fileActions, tableEdits, codeRuns, savedNotes, savedTasks } = blocks;
+    if (!finalContent.trim() && (fileActions.length || codeRuns.length || tableEdits.length)) {
+      finalContent = summarizeBlocksMarkdown(blocks);
+      onEvent('text', { delta: finalContent });
+    }
     if (fileActions.length) onEvent('file_actions', fileActions);
     if (tableEdits.length) onEvent('table_edits', tableEdits);
     if (codeRuns.length) onEvent('code_runs', codeRuns);
@@ -917,15 +1123,20 @@ Rules:
 
   // Stage 3: Orchestrator synthesizes final response + action cards
   onEvent('phase', { phase: 'synthesizing', label: `${orchestratorLabel} synthesizing…` });
+  const useNativeTools = supportsNativeTools(orchestratorModel);
+  const nativeTools = useNativeTools ? buildNativeTools(toolsCfg, resolvedExecTarget) : [];
 
   const synthSys = [
     `You are mx-Cowork's ${orchestratorLabel} Orchestrator. Today: ${today}. Workspace: ${workspace}.`,
+    wsSnapshot ? `Workspace top-level items: ${wsSnapshot}` : '',
     globalCustomInstr,
     projectContextBlock,
     activeViewContextBlock,
     `Your local tools and fast worker models retrieved the evidence below. Synthesize a crisp, deeply helpful, accurate response using Markdown.`,
     `Cite web sources as Markdown links and reference local files by relative path.`,
-    noNativeToolHint,
+    useNativeTools
+      ? `Use the attached tools (write_file, file_action, run_code, edit_table, save_memory) directly whenever creating/editing files or running code, and also write a clear Markdown explanation.`
+      : noNativeToolHint,
     artifactHint,
     tableEditsHint,
     fileActionsHint,
@@ -959,6 +1170,7 @@ Rules:
     systemPrompt: maskedSynthSys,
     messages: synthMessages,
     images,
+    tools: nativeTools,
     think,
     priority: 'smart',
     signal,
@@ -970,7 +1182,7 @@ Rules:
   });
 
   // Guard against reasoning-only cutoffs in Copilot synthesis
-  if (!String(finalRes.content || '').trim() && !signal?.aborted) {
+  if (!String(finalRes.content || '').trim() && !(finalRes.toolCalls?.length) && !signal?.aborted) {
     onEvent('phase', { phase: 'synthesizing', label: 'Completing response…' });
     const thoughtHint = String(finalRes.thinking || '').trim().slice(0, 1200);
     const recoverRes = await endpoint.chatCompletion({
@@ -982,10 +1194,11 @@ Rules:
         {
           role: 'user',
           content: mask(
-            `${thoughtHint ? `Your internal plan was:\n${thoughtHint}\n\n` : ''}You stopped after thinking without writing a visible answer. Now output the complete final Markdown answer and any required fenced \`\`\`code-run, \`\`\`file-actions, or \`\`\`table-edits blocks immediately.`
+            `${thoughtHint ? `Your internal plan was:\n${thoughtHint}\n\n` : ''}You stopped after thinking without writing a visible answer or tool call. Now immediately output the complete Markdown answer and call write_file / run_code (or emit fenced \`\`\`file-actions / \`\`\`code-run blocks).`
           ),
         },
       ],
+      tools: nativeTools,
       think: 'off',
       priority: 'smart',
       signal,
@@ -1000,7 +1213,7 @@ Rules:
     };
   }
 
-  const finalContent = unmask(finalRes.content);
+  let finalContent = unmask(finalRes.content);
   const finalThinking = unmask(finalRes.thinking);
 
   storage.recordUsage({
@@ -1015,7 +1228,13 @@ Rules:
     tokensPerSec: finalRes.usage?.tokensPerSec || 0,
   });
 
-  const { fileActions, tableEdits, codeRuns, savedNotes, savedTasks } = await extractSpecialBlocks(finalContent, toolsCfg, resolvedExecTarget);
+  const blocks = await extractSpecialBlocks(finalContent, toolsCfg, resolvedExecTarget);
+  await mergeNativeToolCalls(finalRes.toolCalls, blocks, toolsCfg, resolvedExecTarget);
+  const { fileActions, tableEdits, codeRuns, savedNotes, savedTasks } = blocks;
+  if (!finalContent.trim() && (fileActions.length || codeRuns.length || tableEdits.length)) {
+    finalContent = summarizeBlocksMarkdown(blocks);
+    onEvent('text', { delta: finalContent });
+  }
   if (fileActions.length) onEvent('file_actions', fileActions);
   if (tableEdits.length) onEvent('table_edits', tableEdits);
   if (codeRuns.length) onEvent('code_runs', codeRuns);

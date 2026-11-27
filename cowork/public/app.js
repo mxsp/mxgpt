@@ -552,7 +552,7 @@ function renderAvailableModelsDropdown() {
 
   if (localModels.length && ocModels.length) {
     const g1 = document.createElement('optgroup');
-    g1.label = 'Local / Endpoint Models';
+    g1.label = /fyreflysystems/i.test(S.settings?.endpointUrl || '') ? 'FyreFlySystems Models' : 'Local / Endpoint Models';
     addOptions(g1, localModels);
     sel.appendChild(g1);
 
@@ -787,7 +787,7 @@ async function boot() {
   S.projects = projData?.projects || [];
   S.activeProject = projData?.activeProject || null;
 
-  $('#appVersionBadge').textContent = `v${info.version || '1.8.0'}`;
+  $('#appVersionBadge').textContent = `v${info.version || '1.8.1'}`;
   applyThemeUI(S.settings.theme || 'light');
   setMode(S.settings.defaultMode || 'copilot');
   setThink(S.settings.think || 'low');
