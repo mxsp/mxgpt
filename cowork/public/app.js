@@ -2,6 +2,7 @@
 
 const $ = (s, root = document) => root.querySelector(s);
 const $$ = (s, root = document) => [...root.querySelectorAll(s)];
+const CW = window.cowork;
 
 const S = {
   settings: null,
@@ -12,7 +13,7 @@ const S = {
   chat: null,
   messages: [],
   streaming: false,
-  abortCtrl: null,
+  activeStreamId: null,
   pinnedFiles: [],
   cwd: '',
   drafts: [],
@@ -38,19 +39,7 @@ function toast(msg, ms = 2600) {
   toast._t = setTimeout(() => { el.hidden = true; }, ms);
 }
 
-async function api(path, opts = {}) {
-  const init = { method: opts.method || 'GET', headers: {} };
-  if (opts.body !== undefined) {
-    init.headers['content-type'] = 'application/json';
-    init.body = JSON.stringify(opts.body);
-  }
-  const r = await fetch(path, init);
-  const d = await r.json().catch(() => ({}));
-  if (!r.ok) throw new Error(d.error || `HTTP ${r.status}`);
-  return d;
-}
-
-// Lightweight safe Markdown renderer (hides raw email-draft / file-actions JSON blocks cleanly)
+// Lightweight safe Markdown renderer (hides raw email-draft / file-actions JSON blocks)
 function renderMd(raw) {
   let src = String(raw || '')
     .replace(/```email-draft[\s\S]*?```/gi, '')
@@ -106,10 +95,7 @@ function renderMd(raw) {
       out.push(`<li>${inline(olm[1])}</li>`);
       continue;
     }
-    if (!line.trim()) {
-      closeLists();
-      continue;
-    }
+    if (!line.trim()) { closeLists(); continue; }
     closeLists();
     out.push(`<p>${inline(line)}</p>`);
   }
@@ -148,7 +134,8 @@ function setDrawerTab(tab) {
 
 // ---- Boot & Settings
 async function boot() {
-  const data = await api('/api/settings');
+  if (!CW) throw new Error('Native Electron preload bridge unavailable');
+  const data = await CW.getSettings();
   S.settings = data.settings;
   S.quickFolders = data.quickFolders || [];
   document.documentElement.dataset.theme = S.settings.theme || 'light';
@@ -157,6 +144,53 @@ async function boot() {
   renderWorkspaceBox();
   await Promise.all([loadChats(), loadFiles(''), loadDrafts(), loadBriefs(), loadUndo()]);
   checkConnectionQuiet();
+
+  // Native OS menu bar actions
+  CW.onMenuAction(({ action, payload }) => {
+    if (action === 'new-task') newChat();
+    else if (action === 'pick-folder') pickWorkspaceFolder();
+    else if (action === 'open-settings') openSettings();
+    else if (action === 'set-mode') setMode(payload);
+    else if (action === 'toggle-drawer') $('#app').classList.toggle('drawer-closed');
+    else if (action === 'toggle-theme') toggleTheme();
+  });
+
+  // Drag & drop local files anywhere onto the app window to pin them to chat
+  document.addEventListener('dragover', (e) => { e.preventDefault(); });
+  document.addEventListener('drop', async (e) => {
+    e.preventDefault();
+    const files = [...(e.dataTransfer?.files || [])];
+    if (!files.length) return;
+    const res = await CW.pinDroppedFiles(files);
+    if (res?.pinned?.length) {
+      for (const p of res.pinned) {
+        if (!S.pinnedFiles.includes(p)) S.pinnedFiles.push(p);
+      }
+      renderPinned();
+      loadFiles(S.cwd);
+      toast(`Pinned ${res.pinned.length} file${res.pinned.length > 1 ? 's' : ''}`);
+    } else {
+      toast('Drop files inside your current workspace folder to pin them');
+    }
+  });
+}
+
+async function pickWorkspaceFolder() {
+  const res = await CW.pickFolder();
+  if (res.canceled) return;
+  S.settings = res.settings;
+  S.cwd = '';
+  S.pinnedFiles = [];
+  renderWorkspaceBox();
+  renderPinned();
+  loadFiles('');
+  toast(`Workspace → ${res.workspace}`);
+}
+
+async function toggleTheme() {
+  const next = document.documentElement.dataset.theme === 'dark' ? 'light' : 'dark';
+  document.documentElement.dataset.theme = next;
+  await CW.saveSettings({ theme: next });
 }
 
 function renderWorkspaceBox() {
@@ -170,8 +204,8 @@ function renderWorkspaceBox() {
     btn.textContent = f.label;
     btn.title = f.path;
     btn.onclick = async () => {
-      await api('/api/settings', { method: 'POST', body: { workspace: f.path } });
-      S.settings.workspace = f.path;
+      const res = await CW.saveSettings({ workspace: f.path });
+      S.settings = res.settings;
       S.cwd = '';
       S.pinnedFiles = [];
       renderWorkspaceBox();
@@ -187,11 +221,11 @@ async function checkConnectionQuiet() {
   const pill = $('#connPill');
   const lbl = $('#connLabel');
   try {
-    const r = await api('/api/endpoint/test', { method: 'POST', body: {} });
+    const r = await CW.testEndpoint({});
     pill.className = 'conn-pill ok';
     const host = new URL(r.endpointUrl).host;
     lbl.textContent = `${host} · ${r.latencyMs}ms`;
-  } catch (e) {
+  } catch {
     pill.className = 'conn-pill err';
     lbl.textContent = S.settings?.username ? 'Endpoint error — click' : 'Sign in to endpoint';
   }
@@ -199,7 +233,7 @@ async function checkConnectionQuiet() {
 
 // ---- Chats
 async function loadChats() {
-  const d = await api('/api/chats');
+  const d = await CW.listChats();
   S.chats = d.chats || [];
   const list = $('#chatList');
   list.innerHTML = '';
@@ -214,7 +248,7 @@ async function loadChats() {
     };
     row.querySelector('.cr-del').onclick = async (e) => {
       e.stopPropagation();
-      await api(`/api/chats/${c.id}`, { method: 'DELETE' });
+      await CW.deleteChat(c.id);
       if (S.chat?.id === c.id) { S.chat = null; S.messages = []; renderMessages(); }
       loadChats();
     };
@@ -223,7 +257,7 @@ async function loadChats() {
 }
 
 async function openChat(id) {
-  const d = await api(`/api/chats/${id}`);
+  const d = await CW.getChat(id);
   S.chat = d.chat;
   S.messages = d.chat.messages || [];
   if (d.chat.mode) setMode(d.chat.mode);
@@ -308,8 +342,9 @@ function renderEmailCard(draft) {
       <div class="ac-title">✉️ Email Draft Ready</div>
       <div class="pane-btns">
         <button class="mini-btn" data-em="copy">Copy</button>
-        <button class="mini-btn" data-em="eml">Export .eml</button>
-        <button class="mini-btn primary" data-em="edit">Open in Email Studio</button>
+        <button class="mini-btn" data-em="open">Open in Mail</button>
+        <button class="mini-btn" data-em="eml">Save .eml…</button>
+        <button class="mini-btn primary" data-em="edit">Edit in Studio</button>
       </div>
     </div>
     <div class="ac-row">
@@ -323,7 +358,11 @@ function renderEmailCard(draft) {
     navigator.clipboard?.writeText(`To: ${draft.to || ''}\nSubject: ${draft.subject || ''}\n\n${draft.body || ''}`);
     toast('Email copied');
   };
-  card.querySelector('[data-em="eml"]').onclick = () => downloadEml(draft);
+  card.querySelector('[data-em="open"]').onclick = () => CW.openEmlInMail(draft);
+  card.querySelector('[data-em="eml"]').onclick = async () => {
+    const r = await CW.saveEml(draft);
+    if (!r.canceled) toast(`Saved ${r.filePath}`);
+  };
   card.querySelector('[data-em="edit"]').onclick = () => {
     loadDraftIntoStudio(draft);
     setDrawerTab('email');
@@ -363,7 +402,7 @@ function renderFileActionsCard(actions) {
       appBtn.onclick = async () => {
         appBtn.disabled = true;
         try {
-          const r = await api('/api/files/action', { method: 'POST', body: act });
+          const r = await CW.executeFileAction(act);
           act.status = 'applied'; act.result = r.summary; act.undoId = r.undoId;
           toast(r.summary);
           loadFiles(S.cwd); loadUndo(); renderMessages();
@@ -385,7 +424,7 @@ function renderFileActionsCard(actions) {
         const uBtn = document.createElement('button');
         uBtn.className = 'mini-btn'; uBtn.textContent = 'Undo';
         uBtn.onclick = async () => {
-          const r = await api('/api/files/undo', { method: 'POST', body: { id: act.undoId } });
+          const r = await CW.undoFileAction(act.undoId);
           act.status = 'pending'; act.undoId = null; act.result = r.summary;
           toast(r.summary); loadFiles(S.cwd); loadUndo(); renderMessages();
         };
@@ -406,7 +445,7 @@ function renderFileActionsCard(actions) {
       for (const act of actions) {
         if (act.status !== 'pending') continue;
         try {
-          const r = await api('/api/files/action', { method: 'POST', body: act });
+          const r = await CW.executeFileAction(act);
           act.status = 'applied'; act.result = r.summary; act.undoId = r.undoId;
         } catch (e) {
           act.status = 'error'; act.result = e.message;
@@ -472,10 +511,11 @@ function renderMessages() {
       sr.className = 'sources-row';
       for (const s of m.sources.slice(0, 10)) {
         if (s.type === 'url' && s.url) {
-          const a = document.createElement('a');
-          a.className = 'src-pill'; a.href = s.url; a.target = '_blank'; a.rel = 'noopener noreferrer';
-          a.innerHTML = `🌐 <span>${esc(s.title || s.url)}</span>`;
-          sr.appendChild(a);
+          const b = document.createElement('button');
+          b.className = 'src-pill';
+          b.innerHTML = `🌐 <span>${esc(s.title || s.url)}</span>`;
+          b.onclick = () => CW.openExternal(s.url);
+          sr.appendChild(b);
         } else if (s.path) {
           const b = document.createElement('button');
           b.className = 'src-pill';
@@ -496,9 +536,10 @@ function renderMessages() {
       const svBtn = document.createElement('button');
       svBtn.className = 'mini-btn'; svBtn.textContent = 'Save as Research Brief';
       svBtn.onclick = async () => {
-        await api('/api/research/briefs', {
-          method: 'POST',
-          body: { title: (m.plan?.goal || S.chat?.title || 'Research Brief').slice(0, 80), markdown: m.content, sources: m.sources || [] },
+        await CW.saveBrief({
+          title: (m.plan?.goal || S.chat?.title || 'Research Brief').slice(0, 80),
+          markdown: m.content,
+          sources: m.sources || [],
         });
         toast('Saved to Research Desk');
         loadBriefs();
@@ -513,11 +554,10 @@ function renderMessages() {
   feed.scrollTop = feed.scrollHeight;
 }
 
-// ---- Send / Stream Cowork Turn
+// ---- Send / Stream Cowork Turn over Direct Electron IPC
 async function sendPrompt(overrideText = null) {
   if (S.streaming) {
-    if (S.chat?.id) api('/api/cowork/stop', { method: 'POST', body: { chatId: S.chat.id } }).catch(() => {});
-    S.abortCtrl?.abort();
+    if (S.chat?.id) CW.stopCowork(S.chat.id).catch(() => {});
     return;
   }
   const input = $('#promptInput');
@@ -525,6 +565,8 @@ async function sendPrompt(overrideText = null) {
   if (!prompt) return;
   if (overrideText === null) { input.value = ''; input.style.height = 'auto'; }
 
+  const streamId = 's_' + Date.now().toString(36) + '_' + Math.random().toString(36).slice(2, 6);
+  S.activeStreamId = streamId;
   S.messages.push({ id: 'tmp-u', role: 'user', content: prompt });
   const assistant = {
     id: 'tmp-a',
@@ -543,7 +585,6 @@ async function sendPrompt(overrideText = null) {
   };
   S.messages.push(assistant);
   S.streaming = true;
-  S.abortCtrl = new AbortController();
   $('#sendBtn').classList.add('stop');
   $('#sendBtn').textContent = 'Stop ■';
   renderMessages();
@@ -555,124 +596,91 @@ async function sendPrompt(overrideText = null) {
   let renderTimer = null;
   const scheduleRender = () => {
     if (renderTimer) return;
-    renderTimer = setTimeout(() => { renderTimer = null; renderMessages(); }, 70);
+    renderTimer = setTimeout(() => { renderTimer = null; renderMessages(); }, 60);
   };
 
+  const off = CW.onCoworkEvent(({ streamId: sid, event: ev, data: d }) => {
+    if (sid !== streamId) return;
+    if (ev === 'chat' && d.chat) {
+      S.chat = d.chat;
+      loadChats();
+    } else if (ev === 'phase') {
+      assistant.queuePos = 0;
+      assistant.livePhase = d.label || d.phase;
+      scheduleRender();
+    } else if (ev === 'queue') {
+      if (d.acquired || !d.position) {
+        assistant.queuePos = 0;
+        assistant.livePhase = 'Preparing response…';
+      } else {
+        assistant.queuePos = d.position;
+        assistant.livePhase = `Queued #${d.position}${d.runningLabel ? ` · waiting for ${d.runningLabel}` : ''}`;
+      }
+      scheduleRender();
+    } else if (ev === 'copilot_plan') {
+      assistant.plan = d;
+      scheduleRender();
+    } else if (ev === 'worker_start') {
+      assistant.workers.push({ ...d, status: 'running', stream: '' });
+      scheduleRender();
+    } else if (ev === 'worker_delta') {
+      const w = assistant.workers.find((x) => x.id === d.id);
+      if (w) { w.stream = (w.stream || '') + (d.delta || ''); scheduleRender(); }
+    } else if (ev === 'worker_done') {
+      const w = assistant.workers.find((x) => x.id === d.id);
+      if (w) { Object.assign(w, d, { status: d.ok ? 'done' : 'error' }); scheduleRender(); }
+    } else if (ev === 'thinking') {
+      assistant.queuePos = 0;
+      assistant.livePhase = 'Thinking…';
+      assistant.thinking += d.delta || '';
+      scheduleRender();
+    } else if (ev === 'text') {
+      assistant.livePhase = '';
+      assistant.content += d.delta || '';
+      scheduleRender();
+    } else if (ev === 'email_draft_saved' || ev === 'email_draft') {
+      assistant.emailDraft = d;
+      loadDraftIntoStudio(d);
+      loadDrafts();
+      scheduleRender();
+    } else if (ev === 'file_actions') {
+      assistant.fileActions = d;
+      scheduleRender();
+    } else if (ev === 'sources') {
+      assistant.sources = d;
+      scheduleRender();
+    } else if (ev === 'done') {
+      Object.assign(assistant, d.message || {}, { streaming: false, livePhase: '' });
+      renderMessages();
+      loadChats();
+    } else if (ev === 'error') {
+      assistant.livePhase = '';
+      assistant.streaming = false;
+      assistant.content += `\n\n> **Error:** ${d.message}`;
+      toast(d.message, 4000);
+      renderMessages();
+    }
+  });
+
   try {
-    const res = await fetch('/api/cowork/chat', {
-      method: 'POST',
-      headers: { 'content-type': 'application/json' },
-      body: JSON.stringify({
-        chatId: S.chat?.id || null,
-        mode: S.mode,
-        think: S.think,
-        prompt,
-        pinnedFiles: S.pinnedFiles,
-        activeDraft,
-      }),
-      signal: S.abortCtrl.signal,
+    await CW.runCowork({
+      streamId,
+      chatId: S.chat?.id || null,
+      mode: S.mode,
+      think: S.think,
+      prompt,
+      pinnedFiles: S.pinnedFiles,
+      activeDraft,
     });
-    if (!res.ok) {
-      const d = await res.json().catch(() => ({}));
-      throw new Error(d.error || `HTTP ${res.status}`);
-    }
-    const reader = res.body.getReader();
-    const dec = new TextDecoder();
-    let buf = '';
-
-    const handleBlock = (raw) => {
-      let ev = '';
-      const dl = [];
-      for (const line of raw.split(/\r?\n/)) {
-        if (line.startsWith('event:')) ev = line.slice(6).trim();
-        else if (line.startsWith('data:')) dl.push(line.slice(5).trim());
-      }
-      if (!ev || !dl.length) return;
-      let d;
-      try { d = JSON.parse(dl.join('\n')); } catch { return; }
-
-      if (ev === 'chat' && d.chat) {
-        S.chat = d.chat;
-        loadChats();
-      } else if (ev === 'phase') {
-        assistant.queuePos = 0;
-        assistant.livePhase = d.label || d.phase;
-        scheduleRender();
-      } else if (ev === 'queue') {
-        if (d.acquired || !d.position) {
-          assistant.queuePos = 0;
-          assistant.livePhase = 'Preparing response…';
-        } else {
-          assistant.queuePos = d.position;
-          assistant.livePhase = `Queued #${d.position}${d.runningLabel ? ` · waiting for ${d.runningLabel}` : ''}`;
-        }
-        scheduleRender();
-      } else if (ev === 'copilot_plan') {
-        assistant.plan = d;
-        scheduleRender();
-      } else if (ev === 'worker_start') {
-        assistant.workers.push({ ...d, status: 'running', stream: '' });
-        scheduleRender();
-      } else if (ev === 'worker_delta') {
-        const w = assistant.workers.find((x) => x.id === d.id);
-        if (w) { w.stream = (w.stream || '') + (d.delta || ''); scheduleRender(); }
-      } else if (ev === 'worker_done') {
-        const w = assistant.workers.find((x) => x.id === d.id);
-        if (w) { Object.assign(w, d, { status: d.ok ? 'done' : 'error' }); scheduleRender(); }
-      } else if (ev === 'thinking') {
-        assistant.queuePos = 0;
-        assistant.livePhase = 'Thinking…';
-        assistant.thinking += d.delta || '';
-        scheduleRender();
-      } else if (ev === 'text') {
-        assistant.livePhase = '';
-        assistant.content += d.delta || '';
-        scheduleRender();
-      } else if (ev === 'email_draft_saved' || ev === 'email_draft') {
-        assistant.emailDraft = d;
-        loadDraftIntoStudio(d);
-        loadDrafts();
-        scheduleRender();
-      } else if (ev === 'file_actions') {
-        assistant.fileActions = d;
-        scheduleRender();
-      } else if (ev === 'sources') {
-        assistant.sources = d;
-        scheduleRender();
-      } else if (ev === 'done') {
-        Object.assign(assistant, d.message || {}, { streaming: false, livePhase: '' });
-        renderMessages();
-        loadChats();
-      } else if (ev === 'error') {
-        assistant.livePhase = '';
-        assistant.streaming = false;
-        assistant.content += `\n\n> **Error:** ${d.message}`;
-        toast(d.message, 4000);
-        renderMessages();
-      }
-    };
-
-    while (true) {
-      const { value, done } = await reader.read();
-      if (done) break;
-      buf += dec.decode(value, { stream: true });
-      let sep;
-      while ((sep = buf.indexOf('\n\n')) >= 0) {
-        handleBlock(buf.slice(0, sep));
-        buf = buf.slice(sep + 2);
-      }
-    }
-    if (buf.trim()) handleBlock(buf);
   } catch (e) {
-    if (e.name !== 'AbortError') {
-      assistant.content += `\n\n> **Error:** ${e.message}`;
-      toast(e.message, 4000);
-    }
+    assistant.content += `\n\n> **Error:** ${e.message}`;
+    toast(e.message, 4000);
   } finally {
+    off();
     assistant.streaming = false;
     assistant.livePhase = '';
     S.streaming = false;
-    S.abortCtrl = null;
+    S.activeStreamId = null;
     $('#sendBtn').classList.remove('stop');
     $('#sendBtn').textContent = 'Send ↑';
     renderMessages();
@@ -682,7 +690,7 @@ async function sendPrompt(overrideText = null) {
 // ---- Files Pane
 async function loadFiles(relPath = '') {
   try {
-    const d = await api(`/api/files/list?path=${encodeURIComponent(relPath)}`);
+    const d = await CW.listFiles(relPath);
     S.cwd = d.path || '';
     $('#fileCrumb').textContent = '/' + S.cwd;
     const list = $('#fileList');
@@ -712,10 +720,7 @@ async function loadFiles(relPath = '') {
       };
       const pinBtn = row.querySelector('.f-pin');
       if (pinBtn) {
-        pinBtn.onclick = (e) => {
-          e.stopPropagation();
-          togglePin(it.relPath);
-        };
+        pinBtn.onclick = (e) => { e.stopPropagation(); togglePin(it.relPath); };
       }
       list.appendChild(row);
     }
@@ -736,7 +741,7 @@ async function searchLocalFiles() {
   if (!q) { loadFiles(S.cwd); return; }
   $('#fileList').innerHTML = '<div class="muted-note">Searching files &amp; contents…</div>';
   try {
-    const d = await api(`/api/files/search?q=${encodeURIComponent(q)}&path=${encodeURIComponent(S.cwd)}`);
+    const d = await CW.searchFiles({ query: q, relPath: S.cwd });
     const list = $('#fileList');
     list.innerHTML = `<div class="muted-note" style="padding:2px 6px">${d.results.length} matches (scanned ${d.scanned} files)</div>`;
     for (const hit of d.results) {
@@ -757,21 +762,19 @@ async function searchLocalFiles() {
       box.querySelector('.f-pin').onclick = (e) => { e.stopPropagation(); togglePin(hit.relPath); };
       list.appendChild(box);
     }
-  } catch (e) {
-    toast(e.message);
-  }
+  } catch (e) { toast(e.message); }
 }
 
 async function previewFile(relPath) {
   try {
-    const d = await api(`/api/files/read?path=${encodeURIComponent(relPath)}`);
+    const d = await CW.readFile(relPath);
     $('#filePreview').hidden = false;
     $('#fpName').textContent = d.path;
     $('#fpBody').textContent = d.content;
     $('#fpPinBtn').onclick = () => togglePin(d.path);
-  } catch (e) {
-    toast(e.message);
-  }
+    $('#fpRevealBtn').onclick = () => CW.revealFile(d.path);
+    $('#fpOpenBtn').onclick = () => CW.openFile(d.path).catch((e) => toast(e.message));
+  } catch (e) { toast(e.message); }
 }
 
 // ---- Email Studio
@@ -784,7 +787,7 @@ function loadDraftIntoStudio(d) {
 }
 
 async function loadDrafts() {
-  const d = await api('/api/email/drafts');
+  const d = await CW.listDrafts();
   S.drafts = d.drafts || [];
   const list = $('#draftsList');
   list.innerHTML = S.drafts.length ? '' : '<div class="muted-note">No saved drafts yet. Ask Copilot to draft an email!</div>';
@@ -795,33 +798,19 @@ async function loadDrafts() {
     card.onclick = (e) => { if (!e.target.closest('button')) loadDraftIntoStudio(dr); };
     card.querySelector('button').onclick = async (e) => {
       e.stopPropagation();
-      await api(`/api/email/drafts/${dr.id}`, { method: 'DELETE' });
+      await CW.deleteDraft(dr.id);
       loadDrafts();
     };
     list.appendChild(card);
   }
 }
 
-async function downloadEml(draft) {
-  const r = await fetch('/api/email/eml', {
-    method: 'POST',
-    headers: { 'content-type': 'application/json' },
-    body: JSON.stringify(draft),
-  });
-  const blob = await r.blob();
-  const a = document.createElement('a');
-  a.href = URL.createObjectURL(blob);
-  a.download = ((draft.subject || 'email-draft').replace(/[^a-zA-Z0-9_-]+/g, '_').slice(0, 48) || 'email-draft') + '.eml';
-  a.click();
-  setTimeout(() => URL.revokeObjectURL(a.href), 5000);
-}
-
 // ---- Research Desk
 async function loadBriefs() {
-  const d = await api('/api/research/briefs');
+  const d = await CW.listBriefs();
   S.briefs = d.briefs || [];
   const list = $('#briefsList');
-  list.innerHTML = S.briefs.length ? '' : '<div class="muted-note">Save any Copilot research output here or export it to your workspace.</div>';
+  list.innerHTML = S.briefs.length ? '' : '<div class="muted-note">Save any Copilot research output here or export it to disk.</div>';
   for (const b of S.briefs) {
     const card = document.createElement('div');
     card.className = 'saved-card';
@@ -829,19 +818,16 @@ async function loadBriefs() {
       <div class="sc-row"><b>${esc(b.title)}</b><button class="mini-btn danger" data-del>✕</button></div>
       <small>${new Date(b.updatedAt).toLocaleString()}</small>
       <div class="pane-btns" style="margin-top:4px">
-        <button class="mini-btn" data-save-md>Save .md to Workspace</button>
+        <button class="mini-btn" data-save-md>Save .md…</button>
         <button class="mini-btn" data-mail>Draft Email</button>
       </div>`;
     card.querySelector('[data-del]').onclick = async () => {
-      await api(`/api/research/briefs/${b.id}`, { method: 'DELETE' });
+      await CW.deleteBrief(b.id);
       loadBriefs();
     };
     card.querySelector('[data-save-md]').onclick = async () => {
-      const slug = b.title.toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-|-$/g, '').slice(0, 48) || 'research-brief';
-      const rel = `${slug}.md`;
-      const r = await api('/api/files/action', { method: 'POST', body: { type: 'write', path: rel, content: `# ${b.title}\n\n${b.markdown}\n` } });
-      toast(r.summary);
-      loadFiles(S.cwd); loadUndo();
+      const r = await CW.exportBriefMd(b);
+      if (!r.canceled) { toast(`Saved ${r.filePath}`); loadFiles(S.cwd); }
     };
     card.querySelector('[data-mail]').onclick = () => {
       loadDraftIntoStudio({ subject: b.title, body: b.markdown });
@@ -857,20 +843,20 @@ async function quickResearch() {
   const out = $('#resLive');
   out.innerHTML = '<div class="muted-note">Searching DuckDuckGo + Wikipedia…</div>';
   try {
-    const d = await api(`/api/research/search?q=${encodeURIComponent(q)}`);
+    const d = await CW.researchSearch(q);
     out.innerHTML = '';
     if (d.wiki) {
       const w = document.createElement('div');
       w.className = 'saved-card';
       w.innerHTML = `<b>Wikipedia: ${esc(d.wiki.title)}</b><small>${esc(d.wiki.extract.slice(0, 220))}…</small>`;
-      w.onclick = () => window.open(d.wiki.url, '_blank');
+      w.onclick = () => CW.openExternal(d.wiki.url);
       out.appendChild(w);
     }
     for (const r of d.results || []) {
       const c = document.createElement('div');
       c.className = 'saved-card';
       c.innerHTML = `<b>${esc(r.title)}</b><small>${esc(r.snippet.slice(0, 160))}</small>`;
-      c.onclick = () => window.open(r.url, '_blank');
+      c.onclick = () => CW.openExternal(r.url);
       out.appendChild(c);
     }
     const askBtn = document.createElement('button');
@@ -885,7 +871,7 @@ async function quickResearch() {
 
 // ---- Undo Log
 async function loadUndo() {
-  const d = await api('/api/files/undo');
+  const d = await CW.listUndo();
   S.undo = d.history || [];
   const cnt = $('#undoCount');
   cnt.textContent = String(S.undo.length);
@@ -898,7 +884,7 @@ async function loadUndo() {
     card.innerHTML = `<div class="sc-row"><b>${esc(u.summary)}</b><button class="mini-btn">Undo</button></div><small>${new Date(u.ts).toLocaleString()}</small>`;
     card.querySelector('button').onclick = async () => {
       try {
-        const r = await api('/api/files/undo', { method: 'POST', body: { id: u.id } });
+        const r = await CW.undoFileAction(u.id);
         toast(r.summary);
         loadUndo(); loadFiles(S.cwd);
       } catch (e) { toast(e.message); }
@@ -941,50 +927,40 @@ function collectSettingsForm() {
 }
 
 // ---- Event Wiring
-$('#modeSeg').onclick = (e) => {
-  const b = e.target.closest('button[data-mode]');
-  if (b) setMode(b.dataset.mode);
-};
-$('#thinkSeg').onclick = (e) => {
-  const b = e.target.closest('button[data-think]');
-  if (b) setThink(b.dataset.think);
-};
-$('#drawerTabs').onclick = (e) => {
-  const b = e.target.closest('button[data-tab]');
-  if (b) setDrawerTab(b.dataset.tab);
-};
+$('#modeSeg').onclick = (e) => { const b = e.target.closest('button[data-mode]'); if (b) setMode(b.dataset.mode); };
+$('#thinkSeg').onclick = (e) => { const b = e.target.closest('button[data-think]'); if (b) setThink(b.dataset.think); };
+$('#drawerTabs').onclick = (e) => { const b = e.target.closest('button[data-tab]'); if (b) setDrawerTab(b.dataset.tab); };
 $('#toggleDrawerBtn').onclick = () => $('#app').classList.toggle('drawer-closed');
 $('#newChatBtn').onclick = newChat;
-$('#themeBtn').onclick = async () => {
-  const next = document.documentElement.dataset.theme === 'dark' ? 'light' : 'dark';
-  document.documentElement.dataset.theme = next;
-  await api('/api/settings', { method: 'POST', body: { theme: next } });
-};
+$('#themeBtn').onclick = toggleTheme;
 $('#openSettingsBtn').onclick = openSettings;
 $('#connPill').onclick = openSettings;
-$('#wsEditBtn').onclick = openSettings;
+$('#wsPickBtn').onclick = pickWorkspaceFolder;
 $('#closeSettingsBtn').onclick = () => { $('#settingsModal').hidden = true; };
+
 $('#setEndpointType').onchange = () => {
   const isMxgpt = $('#setEndpointType').value === 'mxgpt';
   $('#authFields').style.display = isMxgpt ? 'flex' : 'none';
   if (isMxgpt && !$('#setEndpointUrl').value.includes('fyrefly')) $('#setEndpointUrl').value = 'https://max.fyreflysystems.de';
   if (!isMxgpt && $('#setEndpointUrl').value.includes('fyrefly')) $('#setEndpointUrl').value = 'http://127.0.0.1:11434';
 };
+
 $('#testConnBtn').onclick = async () => {
   const out = $('#testOut');
   out.hidden = false; out.className = 'test-out'; out.textContent = 'Testing connection…';
   try {
-    const r = await api('/api/endpoint/test', { method: 'POST', body: collectSettingsForm() });
+    const r = await CW.testEndpoint(collectSettingsForm());
     out.className = 'test-out ok';
-    out.textContent = `Connected to ${r.endpointUrl} (${r.latencyMs}ms) · ${r.models.length} models available: ${r.models.map((m) => m.name).slice(0, 5).join(', ')}`;
+    out.textContent = `Connected to ${r.endpointUrl} (${r.latencyMs}ms) · ${r.models.length} models: ${r.models.map((m) => m.name).slice(0, 5).join(', ')}`;
   } catch (e) {
     out.className = 'test-out err';
     out.textContent = `Connection failed: ${e.message}`;
   }
 };
+
 $('#saveSettingsBtn').onclick = async () => {
   try {
-    const d = await api('/api/settings', { method: 'POST', body: collectSettingsForm() });
+    const d = await CW.saveSettings(collectSettingsForm());
     S.settings = d.settings;
     S.cwd = '';
     $('#settingsModal').hidden = true;
@@ -1018,9 +994,12 @@ $('#auditWsBtn').onclick = () => {
 
 $('#newDraftBtn').onclick = () => loadDraftIntoStudio({});
 $('#saveDraftBtn').onclick = async () => {
-  const d = await api('/api/email/drafts', {
-    method: 'POST',
-    body: { id: S.activeDraftId, to: $('#mailTo').value, cc: $('#mailCc').value, subject: $('#mailSubject').value, body: $('#mailBody').value },
+  const d = await CW.saveDraft({
+    id: S.activeDraftId,
+    to: $('#mailTo').value,
+    cc: $('#mailCc').value,
+    subject: $('#mailSubject').value,
+    body: $('#mailBody').value,
   });
   S.activeDraftId = d.draft.id;
   loadDrafts();
@@ -1030,13 +1009,16 @@ $('#copyMailBtn').onclick = () => {
   navigator.clipboard?.writeText(`To: ${$('#mailTo').value}\nSubject: ${$('#mailSubject').value}\n\n${$('#mailBody').value}`);
   toast('Copied email');
 };
-$('#mailtoBtn').onclick = () => {
-  const u = `mailto:${encodeURIComponent($('#mailTo').value)}?cc=${encodeURIComponent($('#mailCc').value)}&subject=${encodeURIComponent($('#mailSubject').value)}&body=${encodeURIComponent($('#mailBody').value)}`;
-  window.open(u, '_blank');
-};
-$('#exportEmlBtn').onclick = () => downloadEml({
+$('#mailtoBtn').onclick = () => CW.openEmlInMail({
   to: $('#mailTo').value, cc: $('#mailCc').value, subject: $('#mailSubject').value, body: $('#mailBody').value,
 });
+$('#exportEmlBtn').onclick = async () => {
+  const r = await CW.saveEml({
+    to: $('#mailTo').value, cc: $('#mailCc').value, subject: $('#mailSubject').value, body: $('#mailBody').value,
+  });
+  if (!r.canceled) toast(`Saved ${r.filePath}`);
+};
+
 $$('[data-refine]').forEach((b) => {
   b.onclick = async () => {
     const body = $('#mailBody').value.trim();
@@ -1045,13 +1027,10 @@ $$('[data-refine]').forEach((b) => {
     const orig = b.textContent;
     b.textContent = '…';
     try {
-      const r = await api('/api/email/refine', {
-        method: 'POST',
-        body: {
-          action: b.dataset.refine,
-          tier: S.mode === 'smart' ? 'smart' : 'fast',
-          draft: { to: $('#mailTo').value, subject: $('#mailSubject').value, body },
-        },
+      const r = await CW.refineDraft({
+        action: b.dataset.refine,
+        tier: S.mode === 'smart' ? 'smart' : 'fast',
+        draft: { to: $('#mailTo').value, subject: $('#mailSubject').value, body },
       });
       if (r.subject) $('#mailSubject').value = r.subject;
       if (r.body) $('#mailBody').value = r.body;

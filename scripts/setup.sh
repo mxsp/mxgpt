@@ -58,14 +58,14 @@ fi
 # 4. Syntax verification
 node --check "$ROOT_DIR/server/server.js"
 node --check "$ROOT_DIR/deploy/ollama-queue.cjs"
-node --check "$ROOT_DIR/cowork/src/main.js"
+node --check "$ROOT_DIR/cowork/src/electron-main.js"
 echo "[ok] Verified mx-GPT server, queue scheduler, and mx-Cowork"
 
 echo ""
 echo "Setup complete! Start services with:"
 echo "  1) Queue scheduler:  node deploy/ollama-queue.cjs"
-echo "  2) mx-GPT web app:   node server/server.js          -> http://127.0.0.1:8088"
-echo "  3) mx-Cowork app:    node cowork/src/main.js        -> http://127.0.0.1:4318"
+echo "  2) mx-GPT web app:   node server/server.js               -> http://127.0.0.1:8088"
+echo "  3) mx-Cowork app:    (cd cowork && npm install && npm start)"
 echo ""
 echo "To build standalone Linux & Windows executables for mx-Cowork:"
 echo "  ./scripts/build-cowork.sh"

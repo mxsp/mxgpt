@@ -4,7 +4,7 @@
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width,initial-scale=1" />
   <title>mx-Cowork — Local AI Coworker</title>
-  <link rel="stylesheet" href="/styles.css" />
+  <link rel="stylesheet" href="./styles.css" />
 </head>
 <body>
   <div class="app" id="app">
@@ -27,7 +27,7 @@
       <div class="ws-box">
         <div class="ws-head">
           <span class="sb-sec">Workspace</span>
-          <button class="link-btn" id="wsEditBtn">Change</button>
+          <button class="link-btn" id="wsPickBtn">Browse…</button>
         </div>
         <div class="ws-path" id="wsPath" title="">—</div>
         <div class="ws-quick" id="wsQuick"></div>
@@ -129,7 +129,9 @@
           <div class="fp-head">
             <b id="fpName"></b>
             <div class="fp-btns">
-              <button class="mini-btn" id="fpPinBtn">Pin to Chat</button>
+              <button class="mini-btn" id="fpRevealBtn" title="Show in OS file manager">Reveal</button>
+              <button class="mini-btn" id="fpOpenBtn" title="Open with default app">Open</button>
+              <button class="mini-btn" id="fpPinBtn">Pin</button>
               <button class="mini-btn" id="fpCloseBtn">✕</button>
             </div>
           </div>
@@ -258,6 +260,6 @@
   </div>
 
   <div class="toast" id="toast" hidden></div>
-  <script src="/app.js"></script>
+  <script src="./app.js"></script>
 </body>
 </html>

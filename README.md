@@ -33,19 +33,21 @@ flowchart LR
 
 ## One-Time Setup & Quick Start
 
-### Option 1: Standalone Desktop Coworker Binaries (Linux & Windows `.exe`)
+### Option 1: Native Desktop Coworker App (Linux & Windows — Zero WebUI)
 
-Download prebuilt zero-dependency executables directly from **[GitHub Releases](https://github.com/mxsp/mxgpt/releases)**:
+Download the native Electron desktop application directly from **[GitHub Releases](https://github.com/mxsp/mxgpt/releases)** (own OS window, native folder picker, native Save As dialogs, zero local HTTP server, zero browser tabs):
 
-- **Windows (`mx-cowork-win-x64.exe` or `mx-cowork-windows-x64.zip`):** Double-click `mx-cowork-win-x64.exe` — opens a native desktop window immediately. Open **⚙ Endpoint & Models** to point it at your `mx-GPT` URL (e.g. `https://your-domain.example`) or LAN Ollama (`http://192.168.x.x:11434`).
-- **Linux (`mx-cowork-linux-x64.tar.gz`):**
+- **Windows:** Run `mx-Cowork Setup 1.1.0.exe` (Setup Wizard with Start Menu/Desktop shortcuts) or extract `mx-Cowork-1.1.0-win-x64.zip` and double-click `mx-Cowork.exe`.
+- **Linux (AppImage):**
   ```bash
-  tar -xzf mx-cowork-linux-x64.tar.gz
-  cd mx-cowork-linux-x64
-  chmod +x mx-cowork-linux-x64
-  ./mx-cowork-linux-x64
+  chmod +x mx-Cowork-1.1.0.AppImage
+  ./mx-Cowork-1.1.0.AppImage
   ```
-- Optional CLI flags: `--port 4318`, `--no-open` (headless mode).
+- **Linux (Debian / Ubuntu / Kali `.deb`):**
+  ```bash
+  sudo apt install ./mx-cowork_1.1.0_amd64.deb
+  ```
+- Open **⚙ Endpoint & Models** (`Ctrl+,`) to connect to your `mx-GPT` URL or LAN Ollama (`http://192.168.x.x:11434`).
 
 ### Option 2: CLI One-Time Setup Script (Linux / macOS / Windows)
 
@@ -75,7 +77,7 @@ Start the stack:
 ```bash
 node deploy/ollama-queue.cjs   # Smart CPU-aware inference scheduler (:11435 -> :11434)
 node server/server.js          # mx-GPT web workspace -> http://127.0.0.1:8088
-node cowork/src/main.js        # mx-Cowork local desktop app -> http://127.0.0.1:4318
+(cd cowork && npm install && npm start)  # mx-Cowork native desktop app
 ```
 
 ### Option 3: Docker Compose (mx-GPT + Inference Queue Scheduler)

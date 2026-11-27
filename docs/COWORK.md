@@ -1,15 +1,15 @@
 # mx-Cowork Desktop App Guide
 
-**mx-Cowork** is a standalone local AI coworker desktop app for **Linux** and **Windows (`.exe`)**. It runs locally on your computer (`127.0.0.1:4318`) with direct access to your chosen local workspace folder, while connecting securely to your private **mx-GPT** endpoint or LAN **Ollama** server.
+**mx-Cowork** is a native Electron desktop application for **Linux** and **Windows** (zero local web server, zero browser tabs). It runs as a dedicated OS window using direct Electron IPC with native folder picker dialogs, native Save As dialogs, system file explorer integration, and drag-and-drop file pinning, while connecting securely to your private **mx-GPT** endpoint or LAN **Ollama** server.
 
 ---
 
 ## 1. Getting Started
 
 1. **Launch**:
-   - **Windows**: Double-click `mx-cowork-win-x64.exe` (from [GitHub Releases](https://github.com/mxsp/mxgpt/releases)).
-   - **Linux**: Run `./mx-cowork-linux-x64`.
-   - **From source**: Run `node cowork/src/main.js`.
+   - **Windows**: Install via `mx-Cowork Setup 1.1.0.exe` or extract `mx-Cowork-1.1.0-win-x64.zip` and double-click `mx-Cowork.exe`.
+   - **Linux**: Run `./mx-Cowork-1.1.0.AppImage` or install `mx-cowork_1.1.0_amd64.deb`.
+   - **From source**: `cd cowork && npm install && npm start`.
 2. **Connect Endpoint**:
    - Click **⚙ Endpoint & Models** in the bottom-left sidebar.
    - Choose **mx-GPT Remote Endpoint** (e.g. `https://your-mxgpt-domain`) and enter your username/password, **or** choose **Direct Ollama Endpoint** (`http://192.168.x.x:11434` on LAN).

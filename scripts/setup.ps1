@@ -27,13 +27,13 @@ New-Item -ItemType Directory -Force -Path "$RootDir\data", "$RootDir\workspace" 
 
 node --check "$RootDir\server\server.js"
 node --check "$RootDir\deploy\ollama-queue.cjs"
-node --check "$RootDir\cowork\src\main.js"
+node --check "$RootDir\cowork\src\electron-main.js"
 Write-Host "[ok] Verified mx-GPT server, queue scheduler, and mx-Cowork" -ForegroundColor Green
 
 Write-Host ""
 Write-Host "Setup complete! Start with:" -ForegroundColor Cyan
 Write-Host "  1) Queue scheduler:  node deploy\ollama-queue.cjs"
 Write-Host "  2) mx-GPT web app:   node server\server.js          -> http://127.0.0.1:8088"
-Write-Host "  3) mx-Cowork app:    node cowork\src\main.js        -> http://127.0.0.1:4318"
+Write-Host "  3) mx-Cowork app:    cd cowork; npm install; npm start"
 Write-Host ""
 Write-Host "Or download the prebuilt Windows executable (mx-cowork-win-x64.exe) from GitHub Releases."

@@ -1,0 +1,40 @@
+name: Build & Attach Native mx-Cowork Installers
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Release tag to attach assets to (e.g. v1.1.0)'
+        required: true
+        default: 'v1.1.0'
+
+permissions:
+  contents: write
+
+jobs:
+  build-windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - name: Install mx-Cowork dependencies
+        working-directory: cowork
+        run: npm install --no-audit --no-fund
+      - name: Build native Windows Setup & Portable EXE
+        working-directory: cowork
+        run: npx electron-builder --win nsis portable --x64 --config.win.signAndEditExecutable=true
+      - name: Upload Windows EXE installers to GitHub Release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ github.event.inputs.tag || github.ref_name }}
+        shell: pwsh
+        run: |
+          $files = Get-ChildItem -Path cowork/dist -Filter "*.exe" | Where-Object { $_.Length -gt 10MB }
+          foreach ($f in $files) {
+            gh release upload $env:TAG $f.FullName --clobber
+          }

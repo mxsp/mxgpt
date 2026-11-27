@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# Build standalone Linux x64 and Windows x64 executables + release archives for mx-Cowork
+# Build native Electron desktop apps for mx-Cowork (Linux AppImage + .deb, Windows GUI .zip)
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 CW_DIR="$ROOT_DIR/cowork"
@@ -10,33 +10,16 @@ OUT_DIR="$ROOT_DIR/dist"
 mkdir -p "$OUT_DIR"
 cd "$CW_DIR"
 
-echo "=== Installing mx-Cowork packaging dependencies ==="
+echo "=== Installing mx-Cowork Electron dependencies ==="
 npm install --no-audit --no-fund
 
-echo "=== Building standalone Linux x64 & Windows x64 executables ==="
+echo "=== Building native Linux (AppImage, .deb) and Windows GUI (.zip) apps ==="
 npm run build:all
 
-cp -f "$CW_DIR/dist/mx-cowork-linux-x64" "$OUT_DIR/mx-cowork-linux-x64"
-cp -f "$CW_DIR/dist/mx-cowork-win-x64.exe" "$OUT_DIR/mx-cowork-win-x64.exe"
+cp -f "$CW_DIR"/dist/*.AppImage "$OUT_DIR/"
+cp -f "$CW_DIR"/dist/*.deb "$OUT_DIR/"
+cp -f "$CW_DIR"/dist/*-win.zip "$OUT_DIR/mx-Cowork-1.1.0-win-x64.zip"
 
-echo "=== Packaging release archives ==="
-STAGE=$(mktemp -d)
-trap 'rm -rf "$STAGE"' EXIT
-
-mkdir -p "$STAGE/mx-cowork-linux-x64" "$STAGE/mx-cowork-windows-x64"
-cp "$OUT_DIR/mx-cowork-linux-x64" "$CW_DIR/README.md" "$STAGE/mx-cowork-linux-x64/"
-cp "$OUT_DIR/mx-cowork-win-x64.exe" "$CW_DIR/README.md" "$STAGE/mx-cowork-windows-x64/"
-
-tar -C "$STAGE" -czf "$OUT_DIR/mx-cowork-linux-x64.tar.gz" mx-cowork-linux-x64
-(cd "$STAGE" && python3 -c "
-import os, zipfile
-with zipfile.ZipFile('$OUT_DIR/mx-cowork-windows-x64.zip', 'w', zipfile.ZIP_DEFLATED) as zf:
-    for root, _, files in os.walk('mx-cowork-windows-x64'):
-        for f in files:
-            p = os.path.join(root, f)
-            zf.write(p, p)
-")
-
-(cd "$OUT_DIR" && sha256sum mx-cowork-linux-x64.tar.gz mx-cowork-windows-x64.zip mx-cowork-win-x64.exe > SHA256SUMS.txt)
+(cd "$OUT_DIR" && sha256sum *.AppImage *.deb *.zip > SHA256SUMS.txt)
 ls -lh "$OUT_DIR"
 cat "$OUT_DIR/SHA256SUMS.txt"
