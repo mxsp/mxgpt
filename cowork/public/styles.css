@@ -364,6 +364,16 @@ svg { width: 20px; height: 20px; fill: none; stroke: currentColor; stroke-width:
 .think-seg button.on { background: var(--accent-soft); color: var(--accent-ink); }
 .think-seg button[data-think="off"].on { background: var(--bg-elev); color: var(--text); box-shadow: inset 0 0 0 1px var(--border); }
 
+.env-control { display: inline-flex; align-items: center; gap: 5px; height: 28px; padding: 0 4px 0 9px; border: 1px solid var(--border); border-radius: 999px; background: var(--code-bg); color: var(--text-2); font-size: 11.5px; }
+.env-label { font-weight: 600; color: var(--muted); }
+.env-seg { display: inline-flex; align-items: center; gap: 1px; padding: 2px; background: var(--hover); border-radius: 999px; }
+.env-seg button { height: 20px; padding: 0 7px; border-radius: 999px; color: var(--muted); font-size: 11px; font-weight: 600; transition: all .12s; }
+.env-seg button:hover { color: var(--text); }
+.env-seg button[data-env="container"].on { background: var(--accent-soft); color: var(--accent-ink); }
+.env-seg button[data-env="host"].on { background: var(--amber-soft); color: var(--amber); }
+.tool-toggle.auto-btn.on { background: var(--accent-soft); color: var(--accent-ink); font-weight: 600; box-shadow: inset 0 0 0 1px color-mix(in srgb, var(--accent) 42%, transparent); }
+.auto-edit-pill.env-pill.host { background: var(--amber-soft); border-color: color-mix(in srgb, var(--amber) 45%, transparent); color: var(--amber); }
+
 /* 4-way Mode Pill (Fast | Smart | Copilot | Copilot B) */
 .mode-control { display: inline-flex; align-items: center; height: 28px; padding: 2px; border: 1px solid var(--border-strong); border-radius: 999px; background: var(--code-bg); }
 .mode-seg { position: relative; display: flex; align-items: stretch; height: 100%; }
@@ -566,7 +576,8 @@ svg { width: 20px; height: 20px; fill: none; stroke: currentColor; stroke-width:
 .app:has(.panel.open) .top-actions .ghost-btn span:not(.badge-cnt) { display: none; }
 .app:has(.panel.open) .top-actions .ghost-btn { padding: 0 8px; }
 .app:has(.panel.open) .tool-toggle span,
-.app:has(.panel.open) .think-label { display: none; }
+.app:has(.panel.open) .think-label,
+.app:has(.panel.open) .env-label { display: none; }
 .app:has(.panel.open) .model-pill { display: none; }
 
 /* ============ Interactive Project Knowledge Graph ============ */
@@ -839,6 +850,8 @@ svg { width: 20px; height: 20px; fill: none; stroke: currentColor; stroke-width:
 .limit-fill.hit { background: var(--danger, #dc2626); }
 .limit-sub { font-size: 11px; color: var(--muted); }
 .cr-badge.host { background: var(--amber-soft); color: var(--amber); border-color: transparent; font-weight: 600; }
+.cr-autocont { display: inline-flex; align-items: center; gap: 4px; font-size: 11px; color: var(--muted); cursor: pointer; user-select: none; margin-right: 2px; }
+.cr-autocont input { accent-color: var(--accent); margin: 0; }
 @media (max-width: 660px) { .limit-grid { grid-template-columns: 1fr; } }
 
 /* ============ v1.7.0 Pre-Send Message Queue, Context-Aware Office Strip & Live Copilot Cursor ============ */

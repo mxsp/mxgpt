@@ -49,6 +49,8 @@ contextBridge.exposeInMainWorld('cowork', {
   selectProject: (id) => ipcRenderer.invoke('projects:select', id),
   deleteProject: (id) => ipcRenderer.invoke('projects:delete', id),
   toggleAutoAcceptEdits: (val) => ipcRenderer.invoke('projects:toggleAutoAccept', val),
+  setAutoMode: (val) => ipcRenderer.invoke('projects:setAutoMode', val),
+  setExecTarget: (target) => ipcRenderer.invoke('projects:setExecTarget', target),
 
   // Chats & Copilot Streaming
   listChats: () => ipcRenderer.invoke('chats:list'),

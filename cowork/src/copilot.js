@@ -49,7 +49,7 @@ function extractJsonObject(text) {
   return null;
 }
 
-async function extractSpecialBlocks(markdown, toolsCfg) {
+async function extractSpecialBlocks(markdown, toolsCfg, stdExecTarget = '') {
   let fileActions = [];
   let tableEdits = [];
   let codeRuns = [];
@@ -57,6 +57,10 @@ async function extractSpecialBlocks(markdown, toolsCfg) {
   let savedTasks = [];
   const text = String(markdown || '');
   const cfg = storage.getSettings();
+  const activeProj = storage.getActiveProject();
+  const resolvedTarget = (stdExecTarget === 'host' || stdExecTarget === 'container')
+    ? stdExecTarget
+    : ((activeProj?.codeExecutionTarget || cfg.codeExecutionTarget) === 'host' ? 'host' : 'container');
 
   if (toolsCfg.osFiles) {
     const actionsMatch = text.match(/```file-actions\s*\n([\s\S]*?)```/i);
@@ -118,14 +122,14 @@ async function extractSpecialBlocks(markdown, toolsCfg) {
           const lang = String(item.language || (item.command ? 'bash' : 'python')).toLowerCase();
           codeRuns.push({
             id: `run_${Date.now().toString(36)}_${codeRuns.length}`,
-            title: String(item.title || `Run ${lang} in container`).slice(0, 100),
+            title: String(item.title || `Run ${lang} ${resolvedTarget === 'host' ? 'on host' : 'in container'}`).slice(0, 100),
             language: lang,
             image: String(item.image || containerRunner.defaultImageForLanguage(lang, cfg.containerImage)),
             code: typeof item.code === 'string' ? item.code : '',
             command: typeof item.command === 'string' ? item.command : '',
             network: item.network === 'bridge' ? 'bridge' : (cfg.containerNetwork || 'none'),
             mountMode: item.mountMode === 'ro' ? 'ro' : (cfg.containerMountMode || 'rw'),
-            execTarget: item.execTarget === 'host' ? 'host' : (cfg.codeExecutionTarget || 'container'),
+            execTarget: resolvedTarget,
             reason: String(item.reason || '').slice(0, 180),
             status: 'pending',
             output: '',
@@ -491,6 +495,9 @@ async function runCoworkTurn({
   activeContext = null,
   piiShieldOverride = undefined,
   toolOverrides = {},
+  stdExecTarget = '',
+  autoAcceptEdits = undefined,
+  autoRunCode = undefined,
   think = 'low',
   signal,
   onEvent,
@@ -610,8 +617,23 @@ async function runCoworkTurn({
   const tableEditsHint = toolsCfg.osFiles
     ? `When updating or adding cells, rows, or columns in an .xlsx or .csv spreadsheet (especially the currently open spreadsheet in sidebar), output a \`\`\`table-edits JSON block so mx-Cowork animates your live cursor editing each cell directly in the sidebar:\n\`\`\`table-edits\n{"path":"relative/file.xlsx","sheetIndex":0,"summary":"short description","operations":[{"op":"set_cell","row":1,"col":2,"value":"1450","note":"Fixed Q1"},{"op":"add_column","header":"Margin %","values":["32%","28%"],"note":"Computed margin"},{"op":"add_row","values":["Total","","4200","30%"],"note":"Added totals"}]}\n\`\`\` (row=0 is header row, col=0 is column A).`
     : '';
+  const resolvedExecTarget = (stdExecTarget === 'host' || stdExecTarget === 'container')
+    ? stdExecTarget
+    : ((activeProject?.codeExecutionTarget || cfg.codeExecutionTarget) === 'host' ? 'host' : 'container');
+  const effAutoEdits = autoAcceptEdits !== undefined
+    ? Boolean(autoAcceptEdits)
+    : (activeProject ? Boolean(activeProject.autoAcceptEdits) : Boolean(cfg.autoApproveFileActions));
+  const effAutoCode = autoRunCode !== undefined
+    ? Boolean(autoRunCode)
+    : (activeProject ? Boolean(activeProject.autoRunContainer) : Boolean(cfg.autoApproveContainerRuns));
+
   const codeRunHint = toolsCfg.container
-    ? `Container execution is ENABLED (isolated Docker/Podman container mounted at /workspace; default image ${cfg.containerImage || 'python:3.12-slim'}). When executing Python, Node.js, or Shell code on the workspace helps verify, test, compute, or automate, include a \`\`\`code-run JSON block: {"title":"short label","language":"python"|"javascript"|"bash","image":"python:3.12-slim","code":"...","reason":"why"}.`
+    ? (resolvedExecTarget === 'host'
+      ? `Code execution is ENABLED on the user's preselected standard environment: ON-MACHINE HOST (runs directly in ${workspace} via local python3, node, or ${process.platform === 'win32' ? 'PowerShell' : 'bash'}). When executing Python, Node.js, or Shell code on the workspace helps verify, test, compute, or automate, include a \`\`\`code-run JSON block: {"title":"short label","language":"python"|"javascript"|"bash","code":"...","reason":"why"}. Use paths relative to the working directory (${workspace}); do NOT hardcode /workspace.`
+      : `Code execution is ENABLED on the user's preselected standard environment: ISOLATED CONTAINER (Docker/Podman mounted at /workspace; default image ${cfg.containerImage || 'python:3.12-slim'}). When executing Python, Node.js, or Shell code on the workspace helps verify, test, compute, or automate, include a \`\`\`code-run JSON block: {"title":"short label","language":"python"|"javascript"|"bash","image":"python:3.12-slim","code":"...","reason":"why"}.`)
+    : '';
+  const autoModeHint = (effAutoEdits || effAutoCode)
+    ? `AUTO MODE IS ACTIVE (${[effAutoCode ? `auto-run code on ${resolvedExecTarget.toUpperCase()}` : '', effAutoEdits ? 'auto-apply file & spreadsheet edits with 1-click Undo' : ''].filter(Boolean).join(' + ')}): emit executable \`\`\`code-run, \`\`\`file-actions, and \`\`\`table-edits blocks directly — they execute automatically right after your response.`
     : '';
   const memoryHint = toolsCfg.notes
     ? `If the user explicitly asks you to remember a preference, fact, or project note for future sessions, include a \`\`\`memory-save JSON block: {"title":"short title","content":"fact to remember","tags":["tag"]}.`
@@ -645,6 +667,7 @@ async function runCoworkTurn({
       tableEditsHint,
       fileActionsHint,
       codeRunHint,
+      autoModeHint,
       memoryHint,
     ].filter(Boolean).join('\n');
 
@@ -689,7 +712,7 @@ async function runCoworkTurn({
       tokensPerSec: res.usage?.tokensPerSec || 0,
     });
 
-    const { fileActions, tableEdits, codeRuns, savedNotes, savedTasks } = await extractSpecialBlocks(finalContent, toolsCfg);
+    const { fileActions, tableEdits, codeRuns, savedNotes, savedTasks } = await extractSpecialBlocks(finalContent, toolsCfg, resolvedExecTarget);
     if (fileActions.length) onEvent('file_actions', fileActions);
     if (tableEdits.length) onEvent('table_edits', tableEdits);
     if (codeRuns.length) onEvent('code_runs', codeRuns);
@@ -856,6 +879,7 @@ Rules:
     tableEditsHint,
     fileActionsHint,
     codeRunHint,
+    autoModeHint,
     memoryHint,
   ].filter(Boolean).join('\n');
 
@@ -909,7 +933,7 @@ Rules:
     tokensPerSec: finalRes.usage?.tokensPerSec || 0,
   });
 
-  const { fileActions, tableEdits, codeRuns, savedNotes, savedTasks } = await extractSpecialBlocks(finalContent, toolsCfg);
+  const { fileActions, tableEdits, codeRuns, savedNotes, savedTasks } = await extractSpecialBlocks(finalContent, toolsCfg, resolvedExecTarget);
   if (fileActions.length) onEvent('file_actions', fileActions);
   if (tableEdits.length) onEvent('table_edits', tableEdits);
   if (codeRuns.length) onEvent('code_runs', codeRuns);

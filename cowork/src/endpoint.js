@@ -37,10 +37,10 @@ const PROVIDER_PRESETS = [
     badge: 'Go',
     endpointType: 'openai',
     endpointUrl: 'https://opencode.ai/zen/go/v1',
-    fastModel: 'glm-5',
-    smartModel: 'kimi-k2.5',
+    fastModel: 'glm-5.3-flash',
+    smartModel: 'deepseek-v4.1-flash',
     authMode: 'apikey',
-    hint: 'OpenCode Go subscription (https://opencode.ai/zen/go/v1) — GLM, Kimi, MiniMax & open-weight coding models with your OpenCode API key.',
+    hint: 'OpenCode Go (direct https://opencode.ai/zen/go/v1 — or sign in to https://max.fyreflysystems.de to use the proxied OpenCode Go models with no extra key).',
   },
   {
     id: 'openai',
@@ -242,6 +242,9 @@ function openAIHeaders(cfg) {
     'user-agent': USER_AGENT,
   };
   if (cfg.apiKey) h.authorization = `Bearer ${cfg.apiKey}`;
+  if (/opencode\.ai|\/opencode\/v1/i.test(cfg.endpointUrl || '')) {
+    h['x-opencode-session'] = `mxcw-${Date.now().toString(36)}`;
+  }
   if (/openrouter\.ai/i.test(cfg.endpointUrl || '')) {
     h['HTTP-Referer'] = 'https://github.com/mxsp/mxgpt';
     h['X-Title'] = 'mx-Cowork';
@@ -433,6 +436,18 @@ async function chatCompletion({
   if (cfg.endpointType === 'anthropic') {
     return chatViaAnthropic(cfg, {
       model: chosenModel,
+      systemPrompt,
+      messages,
+      images: cleanImages,
+      think,
+      signal,
+      onEvent,
+    });
+  }
+  // Models prefixed with "opencode-go/" on mx-GPT route through the proxied /opencode/v1 endpoint on max.fyreflysystems.de
+  if (/^opencode-go\//i.test(chosenModel)) {
+    return chatViaMxgptOpencodeProxy(cfg, {
+      model: chosenModel.replace(/^opencode-go\//i, ''),
       systemPrompt,
       messages,
       images: cleanImages,
@@ -771,6 +786,125 @@ async function chatViaOllama(cfg, { model, systemPrompt, messages, images = [], 
     thinking: thinking.trim(),
     model,
     elapsedMs: Date.now() - t0,
+    usage: { promptTokens, evalTokens, tokensPerSec },
+  };
+}
+
+async function chatViaMxgptOpencodeProxy(cfg, { model, systemPrompt, messages, images = [], think, signal, onEvent }) {
+  const t0 = Date.now();
+  const fullMsgs = [];
+  if (systemPrompt) fullMsgs.push({ role: 'system', content: systemPrompt });
+  messages.forEach((m, idx) => {
+    const role = m.role === 'assistant' ? 'assistant' : 'user';
+    const isLastUser = idx === messages.length - 1 && role === 'user' && images.length > 0;
+    if (isLastUser) {
+      fullMsgs.push({
+        role,
+        content: [
+          { type: 'text', text: String(m.content || '') },
+          ...images.map((im) => ({
+            type: 'image_url',
+            image_url: { url: `data:${im.mimeType || 'image/png'};base64,${im.data}` },
+          })),
+        ],
+      });
+    } else {
+      fullMsgs.push({ role, content: String(m.content || '') });
+    }
+  });
+
+  const body = {
+    model,
+    messages: fullMsgs,
+    stream: true,
+    stream_options: { include_usage: true },
+  };
+  if (think && think !== 'off') {
+    body.reasoning_effort = think === 'max' ? 'high' : think;
+  }
+
+  let res = await mxgptFetch(cfg, '/opencode/v1/chat/completions', {
+    method: 'POST',
+    headers: {
+      'content-type': 'application/json',
+      accept: 'text/event-stream',
+      'x-opencode-session': `mxcw-${Date.now().toString(36)}`,
+    },
+    body: JSON.stringify(body),
+    signal,
+  });
+  if (!res.ok && (res.status === 400 || res.status === 422) && body.reasoning_effort) {
+    const retryBody = { ...body };
+    delete retryBody.reasoning_effort;
+    res = await mxgptFetch(cfg, '/opencode/v1/chat/completions', {
+      method: 'POST',
+      headers: {
+        'content-type': 'application/json',
+        accept: 'text/event-stream',
+        'x-opencode-session': `mxcw-${Date.now().toString(36)}`,
+      },
+      body: JSON.stringify(retryBody),
+      signal,
+    });
+  }
+  if (!res.ok) {
+    const txt = (await res.text().catch(() => '')).slice(0, 350);
+    throw new Error(`OpenCode Go proxy HTTP ${res.status}: ${txt || res.statusText}`);
+  }
+
+  const reader = res.body.getReader();
+  const dec = new TextDecoder();
+  let buf = '';
+  let content = '';
+  let thinking = '';
+  let promptTokens = 0;
+  let evalTokens = 0;
+
+  const processLine = (line) => {
+    const t = line.trim();
+    if (!t || !t.startsWith('data:')) return;
+    const payload = t.slice(5).trim();
+    if (payload === '[DONE]') return;
+    let obj;
+    try { obj = JSON.parse(payload); } catch { return; }
+    if (obj.error) throw new Error(obj.error.message || String(obj.error));
+    const delta = obj.choices?.[0]?.delta || obj.choices?.[0]?.message || {};
+    const r = delta.reasoning_content || delta.reasoning || delta.thinking || '';
+    if (r) {
+      thinking += r;
+      onEvent?.({ type: 'thinking', delta: r });
+    }
+    const c = typeof delta.content === 'string' ? delta.content : '';
+    if (c) {
+      content += c;
+      onEvent?.({ type: 'text', delta: c });
+    }
+    if (obj.usage) {
+      promptTokens = obj.usage.prompt_tokens || promptTokens;
+      evalTokens = obj.usage.completion_tokens || evalTokens;
+    }
+  };
+
+  while (true) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    buf += dec.decode(value, { stream: true });
+    let nl;
+    while ((nl = buf.indexOf('\n')) >= 0) {
+      processLine(buf.slice(0, nl));
+      buf = buf.slice(nl + 1);
+    }
+  }
+  if (buf.trim()) processLine(buf);
+
+  const elapsedMs = Date.now() - t0;
+  const sec = elapsedMs / 1000;
+  const tokensPerSec = evalTokens > 0 && sec > 0.2 ? Math.round((evalTokens / sec) * 10) / 10 : 0;
+  return {
+    content: content.trim(),
+    thinking: thinking.trim(),
+    model: `opencode-go/${model}`,
+    elapsedMs,
     usage: { promptTokens, evalTokens, tokensPerSec },
   };
 }

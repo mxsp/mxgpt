@@ -166,9 +166,18 @@ function registerIpc() {
   }));
 
   ipcMain.handle('settings:save', (_, patch) => {
-    storage.saveSettings(patch || {});
+    const p = patch || {};
+    storage.saveSettings(p);
+    const active = storage.getActiveProject();
+    if (active && ('autoApproveFileActions' in p || 'autoApproveContainerRuns' in p || 'codeExecutionTarget' in p)) {
+      const projPatch = { ...active };
+      if ('autoApproveFileActions' in p) projPatch.autoAcceptEdits = Boolean(p.autoApproveFileActions);
+      if ('autoApproveContainerRuns' in p) projPatch.autoRunContainer = Boolean(p.autoApproveContainerRuns);
+      if ('codeExecutionTarget' in p) projPatch.codeExecutionTarget = p.codeExecutionTarget === 'host' ? 'host' : 'container';
+      storage.saveProject(projPatch);
+    }
     endpoint.resetSession();
-    return { ok: true, settings: storage.publicSettings() };
+    return { ok: true, settings: storage.publicSettings(), activeProject: storage.getActiveProject() };
   });
 
   ipcMain.handle('endpoint:test', async (_, overrideCfg) => {
@@ -381,15 +390,49 @@ function registerIpc() {
     };
   });
 
-  ipcMain.handle('projects:toggleAutoAccept', (_, value) => {
+  const applyAutoMode = (value) => {
+    const on = Boolean(value);
     const active = storage.getActiveProject();
     if (active) {
-      const updated = storage.saveProject({ ...active, autoAcceptEdits: Boolean(value) });
-      storage.saveSettings({ autoApproveFileActions: Boolean(value) });
-      return { ok: true, autoAcceptEdits: Boolean(value), activeProject: updated, settings: storage.publicSettings() };
+      const updated = storage.saveProject({ ...active, autoAcceptEdits: on, autoRunContainer: on });
+      storage.saveSettings({ autoApproveFileActions: on, autoApproveContainerRuns: on });
+      return {
+        ok: true,
+        autoMode: on,
+        autoAcceptEdits: on,
+        autoRunContainer: on,
+        activeProject: updated,
+        settings: storage.publicSettings(),
+      };
     }
-    storage.saveSettings({ autoApproveFileActions: Boolean(value) });
-    return { ok: true, autoAcceptEdits: Boolean(value), activeProject: null, settings: storage.publicSettings() };
+    storage.saveSettings({ autoApproveFileActions: on, autoApproveContainerRuns: on });
+    return {
+      ok: true,
+      autoMode: on,
+      autoAcceptEdits: on,
+      autoRunContainer: on,
+      activeProject: null,
+      settings: storage.publicSettings(),
+    };
+  };
+
+  ipcMain.handle('projects:toggleAutoAccept', (_, value) => applyAutoMode(value));
+  ipcMain.handle('projects:setAutoMode', (_, value) => applyAutoMode(value));
+
+  ipcMain.handle('projects:setExecTarget', (_, target) => {
+    const clean = target === 'host' ? 'host' : 'container';
+    const active = storage.getActiveProject();
+    let updated = null;
+    if (active) {
+      updated = storage.saveProject({ ...active, codeExecutionTarget: clean });
+    }
+    storage.saveSettings({ codeExecutionTarget: clean });
+    return {
+      ok: true,
+      codeExecutionTarget: clean,
+      activeProject: updated,
+      settings: storage.publicSettings(),
+    };
   });
 
   // ---- Chats
@@ -461,6 +504,12 @@ function registerIpc() {
     emit('chat', { chat: { id: chat.id, title: chat.title, mode: chat.mode, projectId: chat.projectId || '' }, userMessage: userMsg });
 
     try {
+      const preCfg = storage.getSettings();
+      const preProj = storage.getActiveProject();
+      const preAutoAcceptEdits = preProj ? Boolean(preProj.autoAcceptEdits) : Boolean(preCfg.autoApproveFileActions);
+      const preAutoRunCode = preProj ? Boolean(preProj.autoRunContainer) : Boolean(preCfg.autoApproveContainerRuns);
+      const stdExecTarget = (payload?.execTarget || preProj?.codeExecutionTarget || preCfg.codeExecutionTarget || 'container') === 'host' ? 'host' : 'container';
+
       const result = await copilot.runCoworkTurn({
         mode,
         chatId: chat.id,
@@ -472,6 +521,9 @@ function registerIpc() {
         activeContext: payload?.activeContext || null,
         piiShieldOverride: payload?.piiShield,
         toolOverrides: payload?.toolOverrides || {},
+        stdExecTarget,
+        autoAcceptEdits: preAutoAcceptEdits,
+        autoRunCode: preAutoRunCode,
         think,
         signal: controller.signal,
         onEvent: emit,
@@ -493,9 +545,11 @@ function registerIpc() {
         if (added.length) emit('tasks_saved', added);
       }
 
+      const curCfg = storage.getSettings();
       const activeProj = storage.getActiveProject();
-      const autoAcceptEdits = activeProj ? Boolean(activeProj.autoAcceptEdits) : Boolean(storage.getSettings().autoApproveFileActions);
-      const autoRunContainer = activeProj ? Boolean(activeProj.autoRunContainer) : Boolean(storage.getSettings().autoApproveContainerRuns);
+      const autoAcceptEdits = activeProj ? Boolean(activeProj.autoAcceptEdits) : Boolean(curCfg.autoApproveFileActions);
+      const autoRunContainer = activeProj ? Boolean(activeProj.autoRunContainer) : Boolean(curCfg.autoApproveContainerRuns);
+      const finalExecTarget = (payload?.execTarget || activeProj?.codeExecutionTarget || curCfg.codeExecutionTarget || 'container') === 'host' ? 'host' : 'container';
 
       if (result.fileActions?.length && autoAcceptEdits) {
         for (const act of result.fileActions) {
@@ -538,9 +592,16 @@ function registerIpc() {
         emit('table_edits', result.tableEdits);
       }
 
+      const autoRound = Math.max(0, Number(payload?.autoRound) || 0);
+      const MAX_AUTO_ROUNDS = 4;
+      let autoContinuePrompt = '';
+
       if (result.codeRuns?.length && autoRunContainer) {
+        let anyStopped = false;
         for (const cr of result.codeRuns) {
+          if (controller.signal.aborted) { anyStopped = true; break; }
           try {
+            cr.execTarget = cr.execTarget || finalExecTarget;
             cr.status = 'running';
             emit('code_runs', result.codeRuns);
             const r = await containerRunner.runInContainer({
@@ -552,7 +613,8 @@ function registerIpc() {
               image: cr.image,
               network: cr.network,
               mountMode: cr.mountMode,
-              execTarget: cr.execTarget || storage.getSettings().codeExecutionTarget || 'container',
+              execTarget: cr.execTarget,
+              workspace: activeProj?.path || localFiles.getWorkspace(),
               onOutput: (o) => {
                 if (!event.sender.isDestroyed()) event.sender.send('container:output', o);
               },
@@ -560,13 +622,29 @@ function registerIpc() {
             cr.status = r.ok ? 'done' : 'error';
             cr.exitCode = r.exitCode;
             cr.elapsedMs = r.elapsedMs;
-            cr.output = [r.stdout, r.stderr].filter(Boolean).join('\n').trim();
+            cr.stopped = Boolean(r.stopped);
+            if (r.stopped) anyStopped = true;
+            cr.output = [r.stdout, r.stderr].filter(Boolean).join('\n').trim() || '(no output)';
           } catch (e) {
             cr.status = 'error';
             cr.output = e.message;
+            cr.infraError = true;
           }
         }
         emit('code_runs', result.codeRuns);
+
+        const ranProcesses = result.codeRuns.filter((cr) => !cr.infraError);
+        if (ranProcesses.length && !anyStopped && !controller.signal.aborted && autoRound < MAX_AUTO_ROUNDS) {
+          const summaryBlocks = ranProcesses.map((cr) => {
+            const tgt = (cr.execTarget || finalExecTarget) === 'host' ? 'Host (On-Machine)' : 'Container';
+            const out = String(cr.output || '(no output)').slice(0, 4000);
+            return `[${cr.title || cr.language} · ${tgt} · exit ${cr.exitCode ?? '?'}]\n\`\`\`\n${out}\n\`\`\``;
+          }).join('\n\n');
+          const anyFailed = ranProcesses.some((cr) => cr.status === 'error');
+          autoContinuePrompt = anyFailed
+            ? `Code execution finished with an error:\n\n${summaryBlocks}\n\nDiagnose the error, fix the issue, and continue.`
+            : `Code execution finished successfully:\n\n${summaryBlocks}\n\nContinue from this output — present the final result clearly or perform the next needed step (do not re-run the same script if the task is complete).`;
+        }
       }
 
       const assistantMsg = {
@@ -592,6 +670,8 @@ function registerIpc() {
       emit('done', {
         chat: { id: chat.id, title: chat.title, mode: chat.mode, updated: chat.updated },
         message: assistantMsg,
+        autoContinuePrompt: autoContinuePrompt || null,
+        nextAutoRound: autoContinuePrompt ? autoRound + 1 : 0,
       });
       return { ok: true, chatId: chat.id };
     } catch (err) {
@@ -1025,6 +1105,8 @@ app.whenReady().then(() => {
               hasGraphApi: typeof window.cowork.mapGraphFast === 'function' && Boolean(document.querySelector('#graphCanvas')),
               hasProjectsApi: typeof window.cowork.listProjects === 'function' && Boolean(document.querySelector('#projectsList')),
               hasAutoEditPill: Boolean(document.querySelector('#autoAcceptTopPill')),
+              hasAutoModeBtn: typeof window.cowork.setAutoMode === 'function' && Boolean(document.querySelector('#autoModeToggleBtn')),
+              hasExecEnvControl: typeof window.cowork.setExecTarget === 'function' && Boolean(document.querySelector('#execEnvSeg')),
               hasArtifactCanvas: Boolean(document.querySelector('[data-pane="artifact"]')),
               hasUsageApi: typeof window.cowork.getUsage === 'function',
               hasDiffApi: typeof window.cowork.compareFiles === 'function' && Boolean(document.querySelector('#compareModal')),

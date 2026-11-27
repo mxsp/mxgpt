@@ -128,6 +128,7 @@ function saveSettings(patch = {}) {
   }
   if (next.endpointUrl) next.endpointUrl = String(next.endpointUrl).trim().replace(/\/+$/, '');
   if (next.workspace) next.workspace = normalizeLocalPath(next.workspace);
+  if (next.codeExecutionTarget !== 'host') next.codeExecutionTarget = 'container';
   writeJson(SETTINGS_FILE, next);
   return next;
 }
@@ -445,6 +446,7 @@ function saveProject(proj) {
     autoMapGraph: proj.autoMapGraph !== undefined ? Boolean(proj.autoMapGraph) : (existing?.autoMapGraph !== false),
     autoAcceptEdits: proj.autoAcceptEdits !== undefined ? Boolean(proj.autoAcceptEdits) : Boolean(existing?.autoAcceptEdits),
     autoRunContainer: proj.autoRunContainer !== undefined ? Boolean(proj.autoRunContainer) : Boolean(existing?.autoRunContainer),
+    codeExecutionTarget: (proj.codeExecutionTarget ?? existing?.codeExecutionTarget ?? getSettings().codeExecutionTarget) === 'host' ? 'host' : 'container',
     containerImage: String(proj.containerImage ?? existing?.containerImage ?? getSettings().containerImage ?? 'python:3.12-slim').trim(),
     containerNetwork: (proj.containerNetwork ?? existing?.containerNetwork ?? getSettings().containerNetwork) === 'bridge' ? 'bridge' : 'none',
     containerMountMode: (proj.containerMountMode ?? existing?.containerMountMode ?? getSettings().containerMountMode) === 'ro' ? 'ro' : 'rw',
@@ -481,6 +483,7 @@ function setActiveProject(id) {
     workspace: p.path,
     autoApproveFileActions: Boolean(p.autoAcceptEdits),
     autoApproveContainerRuns: Boolean(p.autoRunContainer),
+    codeExecutionTarget: p.codeExecutionTarget === 'host' ? 'host' : (p.codeExecutionTarget === 'container' ? 'container' : (getSettings().codeExecutionTarget || 'container')),
     containerImage: p.containerImage || 'python:3.12-slim',
     containerNetwork: p.containerNetwork || 'none',
     containerMountMode: p.containerMountMode || 'rw',

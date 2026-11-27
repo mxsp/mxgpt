@@ -158,7 +158,7 @@
         <span class="upd-dot" id="updDot" hidden></span>
         <svg><use href="#i-download"/></svg>
         <span id="updBtnLabel">Updates</span>
-        <span class="upd-ver" id="appVersionBadge">v1.7.2</span>
+        <span class="upd-ver" id="appVersionBadge">v1.7.3</span>
       </button>
       <div class="user-row">
         <button class="user-chip" id="openSettingsBtn" title="Endpoint, providers &amp; account settings">
@@ -184,7 +184,8 @@
           <svg><use href="#i-folder"/></svg>
           <span id="wsTopLabel">Documents</span>
         </button>
-        <button class="auto-edit-pill" id="autoAcceptTopPill" title="Toggle Auto-Accept File Edits for this project (every edit stays undoable)">Auto-Edit: Off</button>
+        <button class="auto-edit-pill" id="autoAcceptTopPill" title="Toggle Auto Mode — auto-run code execution (in preselected Env), file edits &amp; spreadsheet edits (edits stay 1-click undoable)">Auto: Off</button>
+        <button class="auto-edit-pill env-pill" id="execEnvTopPill" title="Preselected standard code execution environment — click to switch between Container and Host">Env: Container</button>
         <span class="mapping-pill" id="graphMappingPill" hidden><span class="mini-spin"></span><span id="graphMappingTxt">Mapping…</span></span>
       </div>
       <div class="top-actions">
@@ -248,7 +249,15 @@
               <button class="tool-toggle" id="workflowsBtn" title="Open reusable /workflows &amp; prompt templates"><span>/</span></button>
               <button class="tool-toggle on" id="webToggleBtn" title="Toggle Web Search &amp; URL Page Reader"><svg><use href="#i-globe"/></svg><span>Web</span></button>
               <button class="tool-toggle on" id="filesToggleBtn" title="Toggle Local OS File Access"><svg><use href="#i-folder"/></svg><span>Files</span></button>
-              <button class="tool-toggle on" id="containerToggleBtn" title="Toggle Container Code Execution"><svg><use href="#i-box"/></svg><span>Container</span></button>
+              <button class="tool-toggle on" id="containerToggleBtn" title="Toggle Code Execution (Container / Host)"><svg><use href="#i-box"/></svg><span>Code</span></button>
+              <div class="env-control" id="execEnvControl" title="Preselect standard code execution environment: Isolated Container or On-Machine Host">
+                <span class="env-label">Env</span>
+                <div class="env-seg" id="execEnvSeg" role="radiogroup" aria-label="Standard code execution environment">
+                  <button type="button" data-env="container" class="on" title="Standard env: Isolated Docker/Podman Container">Container</button>
+                  <button type="button" data-env="host" title="Standard env: On-Machine Local Host">Host</button>
+                </div>
+              </div>
+              <button class="tool-toggle auto-btn" id="autoModeToggleBtn" title="Auto Mode — auto-run code executions (in preselected Env), file edits &amp; spreadsheet edits"><svg><use href="#i-spark"/></svg><span>Auto</span></button>
               <button class="tool-toggle shield-btn" id="shieldToggleBtn" title="Privacy / PII Shield — mask emails, IBANs, phones, secrets &amp; custom client names locally before sending"><svg><use href="#i-shield"/></svg><span>Shield</span></button>
               <div class="think-control" id="thinkControl" title="Smart / Copilot reasoning depth">
                 <span class="think-label">Think</span>
@@ -840,7 +849,7 @@
       <!-- Tab 5: Code Execution (Container & On-Machine Host) -->
       <div class="stab-pane" data-spane="container">
         <label class="field">
-          <span>Default Code Execution Target</span>
+          <span>Standard Code Execution Environment</span>
           <select id="setCodeExecTarget">
             <option value="container">Isolated Container (Docker / Podman — safest)</option>
             <option value="host">On-Machine (Run directly on local host in project workspace)</option>
@@ -889,7 +898,7 @@
         </div>
         <label class="check-field">
           <input type="checkbox" id="setAutoApproveContainer" />
-          <span>Auto-execute Copilot container code runs without confirmation</span>
+          <span>Auto-execute Copilot code runs automatically (uses selected standard env: Container or Host)</span>
         </label>
       </div>
     </div>
@@ -999,7 +1008,15 @@
 
       <label class="check-field">
         <input type="checkbox" id="projAutoContainerChk" />
-        <span>Auto-run Copilot container code executions for this project</span>
+        <span>Auto-run Copilot code executions for this project (uses project standard env)</span>
+      </label>
+
+      <label class="field">
+        <span>Standard Code Execution Environment</span>
+        <select id="projCodeExecTarget">
+          <option value="container">Isolated Container (Docker / Podman)</option>
+          <option value="host">On-Machine (Local Host)</option>
+        </select>
       </label>
 
       <div class="field-row">

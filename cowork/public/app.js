@@ -692,7 +692,7 @@ async function boot() {
   S.projects = projData?.projects || [];
   S.activeProject = projData?.activeProject || null;
 
-  $('#appVersionBadge').textContent = `v${info.version || '1.7.2'}`;
+  $('#appVersionBadge').textContent = `v${info.version || '1.7.3'}`;
   applyThemeUI(S.settings.theme || 'light');
   setMode(S.settings.defaultMode || 'copilot');
   setThink(S.settings.think || 'low');
@@ -733,8 +733,10 @@ async function boot() {
     const el = $('#kbStatus');
     if (el) el.textContent = `Indexing ${p.current}/${p.total}: ${p.file}`;
   });
-  $('#ctExecTarget').value = S.settings.codeExecutionTarget || 'container';
+  $('#ctExecTarget').value = getEffectiveExecTarget();
   syncCodeExecTargetUI();
+  renderExecEnvUI();
+  renderAutoAcceptPill();
 
   CW.onUpdateProgress((p) => renderUpdateProgress(p));
   CW.onContainerOutput((ev) => handleContainerOutputChunk(ev));
@@ -800,14 +802,112 @@ async function boot() {
   });
 }
 
-// ---- First-Class Projects & Per-Project Workspace Controls
-function renderAutoAcceptPill() {
-  const on = S.activeProject
+// ---- First-Class Projects, Auto Mode & Standard Execution Environment Controls
+function getEffectiveAutoState() {
+  const autoEdits = S.activeProject
     ? Boolean(S.activeProject.autoAcceptEdits)
     : Boolean(S.settings?.autoApproveFileActions);
+  const autoCode = S.activeProject
+    ? Boolean(S.activeProject.autoRunContainer)
+    : Boolean(S.settings?.autoApproveContainerRuns);
+  return { autoEdits, autoCode, allOn: autoEdits && autoCode, anyOn: autoEdits || autoCode };
+}
+
+function getEffectiveExecTarget() {
+  const raw = S.activeProject?.codeExecutionTarget || S.settings?.codeExecutionTarget || 'container';
+  return raw === 'host' ? 'host' : 'container';
+}
+
+function renderAutoAcceptPill() {
+  const { autoEdits, autoCode, allOn, anyOn } = getEffectiveAutoState();
+  const env = getEffectiveExecTarget();
   const pill = $('#autoAcceptTopPill');
-  pill.classList.toggle('on', on);
-  pill.textContent = on ? 'Auto-Edit: ON' : 'Auto-Edit: Off';
+  if (pill) {
+    pill.classList.toggle('on', anyOn);
+    if (allOn) pill.textContent = 'Auto: ON';
+    else if (autoCode) pill.textContent = 'Auto-Run: ON';
+    else if (autoEdits) pill.textContent = 'Auto-Edit: ON';
+    else pill.textContent = 'Auto: Off';
+    pill.title = allOn
+      ? `Auto Mode ON — auto-runs code (${env.toUpperCase()}), file edits & spreadsheet edits (1-click Undo)`
+      : 'Click to turn ON Auto Mode (auto-run code execution in preselected Env + auto-apply file & spreadsheet edits)';
+  }
+  const cBtn = $('#autoModeToggleBtn');
+  if (cBtn) {
+    cBtn.classList.toggle('on', anyOn);
+    const sp = cBtn.querySelector('span');
+    if (sp) sp.textContent = allOn ? 'Auto ON' : (autoCode ? 'Auto Run' : (autoEdits ? 'Auto Edit' : 'Auto'));
+    cBtn.title = allOn
+      ? `Auto Mode ON (${env.toUpperCase()}) — code runs, file edits & table edits execute automatically`
+      : 'Toggle Auto Mode — auto-execute code runs (in preselected Env), file edits & spreadsheet edits';
+  }
+}
+
+function renderExecEnvUI() {
+  const env = getEffectiveExecTarget();
+  const isHost = env === 'host';
+  const pill = $('#execEnvTopPill');
+  if (pill) {
+    pill.textContent = isHost ? 'Env: Host' : 'Env: Container';
+    pill.classList.toggle('host', isHost);
+    pill.classList.toggle('on', !isHost);
+    pill.title = isHost
+      ? 'Standard execution env: On-Machine Local Host (click to switch to Container)'
+      : 'Standard execution env: Isolated Container (click to switch to Host)';
+  }
+  $$('#execEnvSeg button').forEach((b) => {
+    const active = b.dataset.env === env;
+    b.classList.toggle('on', active);
+    b.setAttribute('aria-checked', String(active));
+  });
+  const sel = $('#ctExecTarget');
+  if (sel && sel.value !== env) sel.value = env;
+  syncCodeExecTargetUI();
+  renderAutoAcceptPill();
+}
+
+async function setStandardExecEnv(target, silent = false) {
+  const clean = target === 'host' ? 'host' : 'container';
+  try {
+    const r = await CW.setExecTarget(clean);
+    S.settings = r.settings || S.settings;
+    if (r.activeProject) {
+      S.activeProject = r.activeProject;
+      const idx = S.projects.findIndex((x) => x.id === r.activeProject.id);
+      if (idx >= 0) S.projects[idx] = r.activeProject;
+    }
+    renderExecEnvUI();
+    renderProjectsList();
+    if (!silent) {
+      toast(clean === 'host'
+        ? 'Standard Env → On-Machine Host (local python3 / node / shell)'
+        : 'Standard Env → Isolated Container (Docker / Podman)');
+    }
+  } catch (e) {
+    toast(e.message, 4000);
+  }
+}
+
+async function toggleUnifiedAutoMode() {
+  const { allOn } = getEffectiveAutoState();
+  const next = !allOn;
+  try {
+    const r = await CW.setAutoMode(next);
+    S.activeProject = r.activeProject || S.activeProject;
+    S.settings = r.settings || S.settings;
+    if (S.activeProject) {
+      const idx = S.projects.findIndex((x) => x.id === S.activeProject.id);
+      if (idx >= 0) S.projects[idx] = S.activeProject;
+    }
+    renderProjectsList();
+    renderAutoAcceptPill();
+    const envLabel = getEffectiveExecTarget() === 'host' ? 'Host' : 'Container';
+    toast(next
+      ? `Auto Mode ON — code runs (${envLabel}), file & table edits run automatically`
+      : 'Auto Mode OFF — manual confirmation before running code or edits');
+  } catch (e) {
+    toast(e.message, 4000);
+  }
 }
 
 function isChatStreaming(chatId) {
@@ -986,7 +1086,8 @@ function renderProjectsList() {
     row.className = 'proj-item' + (active ? ' active' : '');
     const badges = [
       p.graphStats?.fileCount ? `${p.graphStats.fileCount} files` : p.path.split(/[\\/]/).slice(-1)[0],
-      p.autoAcceptEdits ? 'auto-edit' : '',
+      (p.autoAcceptEdits && p.autoRunContainer) ? 'auto' : (p.autoAcceptEdits ? 'auto-edit' : (p.autoRunContainer ? 'auto-run' : '')),
+      p.codeExecutionTarget === 'host' ? 'host' : '',
     ].filter(Boolean).join(' · ');
 
     row.innerHTML = `
@@ -1093,12 +1194,14 @@ async function selectProjectById(id, quiet = false) {
     S.cwd = '';
     S.pinnedFiles = [];
     closeFileEditor(true);
+    $('#ctExecTarget').value = getEffectiveExecTarget();
     $('#ctImage').value = S.settings.containerImage || 'python:3.12-slim';
     $('#ctNet').value = S.settings.containerNetwork || 'none';
     $('#ctMount').value = S.settings.containerMountMode || 'rw';
     S.expandedProjects.add(id);
     renderSidebarTree();
     renderWorkspaceUI();
+    renderExecEnvUI();
     renderAutoAcceptPill();
     renderPinned();
     loadFiles('');
@@ -1143,8 +1246,9 @@ function openProjectModal(proj = null) {
   $('#projColorInput').value = proj?.color || '#c96442';
   $('#projPathInput').value = proj?.path || S.settings?.workspace || '';
   $('#projAutoMapChk').checked = proj ? proj.autoMapGraph !== false : true;
-  $('#projAutoAcceptChk').checked = proj ? Boolean(proj.autoAcceptEdits) : false;
-  $('#projAutoContainerChk').checked = proj ? Boolean(proj.autoRunContainer) : false;
+  $('#projAutoAcceptChk').checked = proj ? Boolean(proj.autoAcceptEdits) : Boolean(S.settings?.autoApproveFileActions);
+  $('#projAutoContainerChk').checked = proj ? Boolean(proj.autoRunContainer) : Boolean(S.settings?.autoApproveContainerRuns);
+  $('#projCodeExecTarget').value = proj?.codeExecutionTarget || S.settings?.codeExecutionTarget || 'container';
   $('#projContainerImgInput').value = proj?.containerImage || S.settings?.containerImage || 'python:3.12-slim';
   $('#projContainerNetInput').value = proj?.containerNetwork || S.settings?.containerNetwork || 'none';
   $('#projContainerMountInput').value = proj?.containerMountMode || S.settings?.containerMountMode || 'rw';
@@ -1191,6 +1295,7 @@ async function navigateOsTo(targetPath) {
     closeFileEditor(true);
     renderSidebarTree();
     renderWorkspaceUI();
+    renderExecEnvUI();
     renderAutoAcceptPill();
     renderPinned();
     await loadFiles('');
@@ -1574,7 +1679,8 @@ function renderCodeRunsCard(runs) {
     const liveOut = S.containerRunOutputs[run.id] ?? run.output ?? '';
     const isRunning = run.status === 'running';
 
-    const isHost = (run.execTarget || S.settings?.codeExecutionTarget) === 'host';
+    const isHost = (run.execTarget || getEffectiveExecTarget()) === 'host';
+    if (S.autoContinueAfterCode === undefined) S.autoContinueAfterCode = true;
     box.innerHTML = `
       <div class="ac-head">
         <div class="cr-badges">
@@ -1584,6 +1690,10 @@ function renderCodeRunsCard(runs) {
           ${isHost ? '' : `<span class="cr-badge">${esc(run.image || 'python:3.12-slim')}</span><span class="cr-badge">net:${esc(run.network || 'none')}</span>`}
         </div>
         <div class="row-gap">
+          <label class="cr-autocont" title="Automatically continue the AI conversation with the code execution output">
+            <input type="checkbox" data-cr-autocont ${S.autoContinueAfterCode ? 'checked' : ''} />
+            <span>Auto-continue</span>
+          </label>
           ${isRunning
             ? `<button class="btn tiny danger" data-cr-stop>Stop</button>`
             : `<button class="btn tiny primary" data-cr-run>${run.status === 'done' || run.status === 'error' ? 'Re-run' : (isHost ? 'Run on Host' : 'Run in Container')}</button>
@@ -1595,7 +1705,14 @@ function renderCodeRunsCard(runs) {
       <pre class="cr-code">${esc(script)}</pre>
       ${run.status === 'done' ? `<span class="ac-stat">✓ Exit 0 (${run.elapsedMs ? (run.elapsedMs / 1000).toFixed(1) + 's' : 'done'})</span>` : ''}
       ${run.status === 'error' ? `<span class="ac-stat err">✗ Exit ${run.exitCode ?? 1}</span>` : ''}
-      ${liveOut ? `<pre class="cr-term" data-term-id="${esc(run.id)}">${esc(liveOut)}</pre>` : ''}`;
+      ${(liveOut || isRunning) ? `<pre class="cr-term" data-term-id="${esc(run.id)}">${esc(liveOut || (isHost ? 'Running on local host…' : 'Starting container…'))}</pre>` : ''}`;
+
+    const autoContChk = box.querySelector('[data-cr-autocont]');
+    if (autoContChk) {
+      autoContChk.onchange = () => {
+        S.autoContinueAfterCode = autoContChk.checked;
+      };
+    }
 
     const togTargetBtn = box.querySelector('[data-cr-toggle-target]');
     if (togTargetBtn) {
@@ -1608,6 +1725,8 @@ function renderCodeRunsCard(runs) {
     const runBtn = box.querySelector('[data-cr-run]');
     if (runBtn) {
       runBtn.onclick = async () => {
+        const chosenTarget = run.execTarget || getEffectiveExecTarget();
+        run.execTarget = chosenTarget;
         run.status = 'running';
         S.containerRunOutputs[run.id] = '';
         renderMessages(false);
@@ -1621,7 +1740,7 @@ function renderCodeRunsCard(runs) {
             image: run.image,
             network: run.network,
             mountMode: run.mountMode,
-            execTarget: run.execTarget || S.settings?.codeExecutionTarget || 'container',
+            execTarget: chosenTarget,
           });
           run.status = r.ok ? 'done' : 'error';
           run.exitCode = r.exitCode;
@@ -1630,7 +1749,20 @@ function renderCodeRunsCard(runs) {
           S.containerRunOutputs[run.id] = run.output;
           loadContainerHistory();
           loadFiles(S.cwd);
+          loadOfficeQuickStrip();
           renderMessages();
+
+          // Automatically continue AI turn with execution output unless stopped or toggled off
+          if (!r.stopped && S.autoContinueAfterCode && !isChatStreaming(S.chat?.id)) {
+            const tgtLabel = chosenTarget === 'host' ? 'Host (On-Machine)' : 'Container';
+            const out = (run.output || '(no output)').slice(0, 6000);
+            const follow = r.ok
+              ? `Code executed on ${tgtLabel} for "${run.title || run.language}" (exit 0, ${(r.elapsedMs / 1000).toFixed(1)}s):\n\`\`\`\n${out}\n\`\`\`\nContinue from this result — present the outcome or take the next step (do not re-run the same script if done).`
+              : `Code execution failed on ${tgtLabel} for "${run.title || run.language}" (exit ${r.exitCode ?? 1}):\n\`\`\`\n${out}\n\`\`\`\nDiagnose the error, fix it, and continue.`;
+            setTimeout(() => {
+              sendPrompt(follow, { forceChatId: S.chat?.id || null, forceProjectId: S.chat?.projectId });
+            }, 120);
+          }
         } catch (e) {
           run.status = 'error';
           run.output = e.message;
@@ -2062,6 +2194,19 @@ function handleGlobalCoworkEvent({ streamId: sid, event: ev, data: d }) {
     }
   } else if (ev === 'code_runs') {
     st.assistant.codeRuns = d;
+    if (isViewingStream(st) && st.live?.cardsSlot?.isConnected) {
+      const running = (d || []).find((r) => r.status === 'running');
+      if (running && st.live.phaseTxt) {
+        const tgt = (running.execTarget || getEffectiveExecTarget()) === 'host' ? 'Host' : 'Container';
+        st.live.phaseEl.hidden = false;
+        st.live.phaseTxt.textContent = `Auto-running ${running.language || 'code'} on ${tgt}…`;
+      }
+      st.live.cardsSlot.innerHTML = '';
+      if (d?.length) {
+        st.live.cardsSlot.appendChild(renderCodeRunsCard(d));
+        scrollFeedIfNearBottom(true);
+      }
+    }
   } else if (ev === 'graph_ready') {
     st.assistant.graphReady = d;
   } else if (ev === 'notes_saved') {
@@ -2090,6 +2235,26 @@ function handleGlobalCoworkEvent({ streamId: sid, event: ev, data: d }) {
       toast(`Finished: ${d.chat?.title || 'Background chat'}`);
     }
     loadChats();
+    if (d.message?.codeRuns?.some((r) => r.status === 'done' || r.status === 'error')) {
+      loadContainerHistory();
+      loadFiles(S.cwd);
+      loadOfficeQuickStrip();
+    } else if (d.message?.fileActions?.some((a) => a.status === 'applied') || d.message?.tableEdits?.some((t) => t.status === 'applied')) {
+      loadFiles(S.cwd);
+      loadOfficeQuickStrip();
+      loadUndoList();
+    }
+    // Closed-loop Auto-Continue when Auto Mode executed code blocks in this turn
+    if (d.autoContinuePrompt) {
+      setTimeout(() => {
+        sendPrompt(d.autoContinuePrompt, {
+          forceChatId: st.chatId,
+          forceProjectId: st.projectId,
+          autoRound: d.nextAutoRound || 1,
+        });
+      }, 150);
+      return;
+    }
     // Auto-dispatch next pre-sent queued follow-up message for this chat!
     const qKey = st.chatId || sid;
     const qList = S.queuedPrompts.get(qKey);
@@ -2232,6 +2397,8 @@ async function sendPrompt(overrideText = null, opts = {}) {
     images: imagesToSend,
     activeContext,
     piiShield: shieldOn,
+    execTarget: getEffectiveExecTarget(),
+    autoRound: opts.autoRound || 0,
     toolOverrides: {
       toolWebSearch: S.toolWebSearch,
       toolOsFiles: S.toolOsFiles,
@@ -4147,6 +4314,7 @@ $('#saveProjectBtn').onclick = async () => {
       autoMapGraph: $('#projAutoMapChk').checked,
       autoAcceptEdits: $('#projAutoAcceptChk').checked,
       autoRunContainer: $('#projAutoContainerChk').checked,
+      codeExecutionTarget: $('#projCodeExecTarget').value || 'container',
       containerImage: $('#projContainerImgInput').value.trim() || 'python:3.12-slim',
       containerNetwork: $('#projContainerNetInput').value,
       containerMountMode: $('#projContainerMountInput').value,
@@ -4161,6 +4329,7 @@ $('#saveProjectBtn').onclick = async () => {
     $('#projectModal').hidden = true;
     renderSidebarTree();
     renderWorkspaceUI();
+    renderExecEnvUI();
     renderAutoAcceptPill();
     loadFiles('');
     loadOfficeQuickStrip();
@@ -4182,20 +4351,13 @@ $('#deleteProjectBtn').onclick = async () => {
   renderAutoAcceptPill();
   toast('Project removed from sidebar (local files untouched)');
 };
-$('#autoAcceptTopPill').onclick = async () => {
-  const cur = S.activeProject
-    ? Boolean(S.activeProject.autoAcceptEdits)
-    : Boolean(S.settings?.autoApproveFileActions);
-  const r = await CW.toggleAutoAcceptEdits(!cur);
-  S.activeProject = r.activeProject || S.activeProject;
-  S.settings = r.settings;
-  if (S.activeProject) {
-    const idx = S.projects.findIndex((x) => x.id === S.activeProject.id);
-    if (idx >= 0) S.projects[idx] = S.activeProject;
-  }
-  renderProjectsList();
-  renderAutoAcceptPill();
-  toast(r.autoAcceptEdits ? 'Auto-Accept Edits enabled (with 1-click Undo)' : 'Auto-Accept Edits turned off');
+$('#autoAcceptTopPill').onclick = toggleUnifiedAutoMode;
+$('#autoModeToggleBtn').onclick = toggleUnifiedAutoMode;
+$('#execEnvTopPill').onclick = () => setStandardExecEnv(getEffectiveExecTarget() === 'host' ? 'container' : 'host');
+$('#execEnvSeg').onclick = (e) => {
+  const b = e.target.closest('button[data-env]');
+  if (!b) return;
+  setStandardExecEnv(b.dataset.env);
 };
 
 // Knowledge Graph Controls
@@ -4561,6 +4723,11 @@ $('#saveSettingsBtn').onclick = async () => {
   try {
     const d = await CW.saveSettings(collectSettingsForm());
     S.settings = d.settings;
+    if (d.activeProject) {
+      S.activeProject = d.activeProject;
+      const idx = S.projects.findIndex((x) => x.id === d.activeProject.id);
+      if (idx >= 0) S.projects[idx] = d.activeProject;
+    }
     S.cwd = '';
     S.toolWebSearch = S.settings.toolWebSearch !== false;
     S.toolOsFiles = S.settings.toolOsFiles !== false;
@@ -4570,8 +4737,9 @@ $('#saveSettingsBtn').onclick = async () => {
     $('#filesToggleBtn').classList.toggle('on', S.toolOsFiles);
     $('#containerToggleBtn').classList.toggle('on', S.containerEnabled);
     $('#shieldToggleBtn').classList.toggle('on', S.piiShield);
-    $('#ctExecTarget').value = S.settings.codeExecutionTarget || 'container';
-    syncCodeExecTargetUI();
+    $('#ctExecTarget').value = getEffectiveExecTarget();
+    renderExecEnvUI();
+    renderProjectsList();
     $('#ctImage').value = S.settings.containerImage || 'python:3.12-slim';
     $('#ctNet').value = S.settings.containerNetwork || 'none';
     $('#ctMount').value = S.settings.containerMountMode || 'rw';
@@ -4610,8 +4778,8 @@ $('#shieldToggleBtn').onclick = async () => {
   toast(S.piiShield ? 'Privacy Shield ON — emails, IBANs, phones, secrets & custom terms masked locally' : 'Privacy Shield OFF');
 };
 
-// 2. Host vs Container Target Selector & Artifact PDF Export
-$('#ctExecTarget').onchange = () => syncCodeExecTargetUI();
+// 2. Host vs Container Target Selector (persists immediately as Standard Env) & Artifact PDF Export
+$('#ctExecTarget').onchange = () => setStandardExecEnv($('#ctExecTarget').value);
 $('#artPdfBtn').onclick = async () => {
   const art = S.activeArtifactId ? S.artifacts.get(S.activeArtifactId) : null;
   if (!art) { toast('Open an artifact first'); return; }
