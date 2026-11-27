@@ -572,6 +572,7 @@ function registerIpc() {
         stdExecTarget,
         autoAcceptEdits: preAutoAcceptEdits,
         autoRunCode: preAutoRunCode,
+        isHarness,
         think,
         signal: controller.signal,
         onEvent: emit,
@@ -641,7 +642,7 @@ function registerIpc() {
       }
 
       const autoRound = Math.max(0, Number(payload?.autoRound) || 0);
-      const MAX_AUTO_ROUNDS = 4;
+      const MAX_AUTO_ROUNDS = 8;
       let autoContinuePrompt = '';
       let autoContinueHarnessMeta = null;
 
@@ -704,6 +705,22 @@ function registerIpc() {
             ? `Code execution finished with an error:\n\n${summaryBlocks}\n\nDiagnose the error, fix the issue, and continue.`
             : `Code execution finished successfully:\n\n${summaryBlocks}\n\nContinue from this output — present the final result clearly or perform the next needed step (do not re-run the same script if the task is complete).`;
         }
+      } else if (
+        autoAcceptEdits && autoRunContainer &&
+        result.fileActions?.length &&
+        result.wasAutoSynthesized &&
+        !controller.signal.aborted &&
+        autoRound < MAX_AUTO_ROUNDS
+      ) {
+        const appliedList = result.fileActions.map((a) => `${a.status === 'applied' ? '✓' : '✗'} ${a.type} ${a.path || a.to || a.from}${a.result ? ` (${a.result})` : ''}`).join('\n');
+        const anyFail = result.fileActions.some((a) => a.status === 'error');
+        autoContinueHarnessMeta = {
+          status: anyFail ? 'error' : 'ok',
+          label: anyFail ? 'File Actions Had Errors' : 'File Actions Applied',
+          title: `${result.fileActions.length} file action${result.fileActions.length > 1 ? 's' : ''}`,
+          output: appliedList,
+        };
+        autoContinuePrompt = `File actions applied automatically:\n\`\`\`\n${appliedList}\n\`\`\`\nContinue with the next step (e.g. launch, run, or verify via run_code if requested), or present the final summary if everything requested is complete.`;
       }
 
       const assistantMsg = {

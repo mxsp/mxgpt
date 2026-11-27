@@ -371,6 +371,18 @@ function summarizeBlocksMarkdown(blocks) {
   return parts.join('\n\n');
 }
 
+function isPrematureIntentStop(content, toolCalls = []) {
+  if (Array.isArray(toolCalls) && toolCalls.length > 0) return false;
+  const txt = String(content || '').trim();
+  if (!txt) return true;
+  if (/```(?:file-actions|code-run|table-edits)\b/i.test(txt)) return false;
+  if (txt.length > 360) return false;
+  // Detect short narration-only stops like "Ich baue jetzt eine Flask-App und starte sie im Hintergrund." or "Let me create app.py and run it."
+  const announcesAction = /\b(ich (baue|erstelle|starte|führe|fuehre|schreibe|lege|mache|prüfe|pruefe|installiere|öffne|oeffne)|erstelle jetzt|baue jetzt|starte jetzt|lass mich|let me|i['’]ll|i will|now i['’]?ll|now i will|going to (create|build|write|run|start|launch|install|inspect)|creating|building|starting|launching|running)\b/i.test(txt);
+  const looksComplete = /\b(http:\/\/|https:\/\/|localhost:\d+|fertig|erfolgreich gestartet|läuft auf|laeuft auf|is now running|successfully started|completed)\b/i.test(txt);
+  return announcesAction && !looksComplete;
+}
+
 function resolveEnabledTools(cfg, overrides = {}) {
   return {
     webSearch: overrides.toolWebSearch !== undefined ? Boolean(overrides.toolWebSearch) : cfg.toolWebSearch !== false,
@@ -686,6 +698,7 @@ async function runCoworkTurn({
   stdExecTarget = '',
   autoAcceptEdits = undefined,
   autoRunCode = undefined,
+  isHarness = false,
   think = 'low',
   signal,
   onEvent,
@@ -915,24 +928,27 @@ async function runCoworkTurn({
       },
     });
 
-    // Guard against reasoning-only cutoffs (empty content AND no native tool calls)
-    if (!String(res.content || '').trim() && !(res.toolCalls?.length) && !signal?.aborted) {
-      onEvent('phase', { phase: 'synthesizing', label: 'Completing response…' });
+    // Guard against reasoning-only cutoffs OR premature narration-only stops ("Ich baue jetzt..." without calling any tool!)
+    if (isPrematureIntentStop(res.content, res.toolCalls) && !signal?.aborted) {
+      onEvent('phase', { phase: 'synthesizing', label: 'Executing planned action…' });
       const thoughtHint = String(res.thinking || '').trim().slice(0, 1200);
+      const partialTxt = String(res.content || '').trim();
       const recoverRes = await endpoint.chatCompletion({
         tier: mode,
         model: chosenModel,
         systemPrompt: maskedSys,
         messages: [
           ...msgs,
+          ...(partialTxt ? [{ role: 'assistant', content: mask(partialTxt) }] : []),
           {
             role: 'user',
             content: mask(
-              `${thoughtHint ? `Your internal plan was:\n${thoughtHint}\n\n` : ''}You stopped after thinking without writing a visible answer or tool call. Now immediately output the complete Markdown answer and call write_file / run_code (or emit fenced \`\`\`file-actions / \`\`\`code-run blocks).`
+              `${thoughtHint ? `Your internal plan was:\n${thoughtHint}\n\n` : ''}${partialTxt ? `You wrote "${partialTxt}" but stopped without calling any tool.` : 'You stopped after thinking without writing a visible answer or tool call.'} Execute the step RIGHT NOW using write_file / file_action / run_code (or emit fenced \`\`\`file-actions / \`\`\`code-run blocks). Do not stop with just a promise.`
             ),
           },
         ],
         tools: nativeTools,
+        toolChoice: nativeTools.length ? 'required' : 'auto',
         think: 'off',
         priority: mode,
         signal,
@@ -942,7 +958,9 @@ async function runCoworkTurn({
       });
       res = {
         ...recoverRes,
+        content: [partialTxt, recoverRes.content].filter(Boolean).join('\n\n'),
         thinking: [res.thinking, recoverRes.thinking].filter(Boolean).join('\n'),
+        toolCalls: [...(res.toolCalls || []), ...(recoverRes.toolCalls || [])],
         elapsedMs: (res.elapsedMs || 0) + (recoverRes.elapsedMs || 0),
       };
     }
@@ -965,8 +983,10 @@ async function runCoworkTurn({
     const blocks = await extractSpecialBlocks(finalContent, toolsCfg, resolvedExecTarget);
     await mergeNativeToolCalls(res.toolCalls, blocks, toolsCfg, resolvedExecTarget);
     const { fileActions, tableEdits, codeRuns, savedNotes, savedTasks } = blocks;
+    let wasAutoSynthesized = false;
     if (!finalContent.trim() && (fileActions.length || codeRuns.length || tableEdits.length)) {
       finalContent = summarizeBlocksMarkdown(blocks);
+      wasAutoSynthesized = true;
       onEvent('text', { delta: finalContent });
     }
     if (fileActions.length) onEvent('file_actions', fileActions);
@@ -988,6 +1008,7 @@ async function runCoworkTurn({
       codeRuns,
       savedNotes,
       savedTasks,
+      wasAutoSynthesized,
     };
   }
 
@@ -1014,8 +1035,8 @@ async function runCoworkTurn({
   const trivial = /^(hi|hey|hello|hallo|moin|thanks|thank you|danke|ok|test)\b[\s!?.]*$/i.test(prompt.trim());
   let plan = null;
 
-  if (trivial || !allowedTypes.length) {
-    plan = { goal: 'Direct response', direct: true, outputType: 'answer', tasks: [] };
+  if (isHarness || trivial || !allowedTypes.length) {
+    plan = { goal: isHarness ? 'Continue from execution result' : 'Direct response', direct: true, outputType: 'answer', tasks: [] };
   } else {
     const plannerSys = `You are the Orchestrator of mx-Cowork (${orchestratorLabel}). Decide which local tools & fast workers to invoke before synthesizing your final answer.
 Enabled task types ONLY: ${allowedTypes.join(', ')}
@@ -1181,24 +1202,27 @@ Rules:
     },
   });
 
-  // Guard against reasoning-only cutoffs in Copilot synthesis
-  if (!String(finalRes.content || '').trim() && !(finalRes.toolCalls?.length) && !signal?.aborted) {
-    onEvent('phase', { phase: 'synthesizing', label: 'Completing response…' });
+  // Guard against reasoning-only cutoffs OR premature narration-only stops in Copilot synthesis
+  if (isPrematureIntentStop(finalRes.content, finalRes.toolCalls) && !signal?.aborted) {
+    onEvent('phase', { phase: 'synthesizing', label: 'Executing planned action…' });
     const thoughtHint = String(finalRes.thinking || '').trim().slice(0, 1200);
+    const partialTxt = String(finalRes.content || '').trim();
     const recoverRes = await endpoint.chatCompletion({
       tier: 'smart',
       model: orchestratorModel,
       systemPrompt: maskedSynthSys,
       messages: [
         ...synthMessages,
+        ...(partialTxt ? [{ role: 'assistant', content: mask(partialTxt) }] : []),
         {
           role: 'user',
           content: mask(
-            `${thoughtHint ? `Your internal plan was:\n${thoughtHint}\n\n` : ''}You stopped after thinking without writing a visible answer or tool call. Now immediately output the complete Markdown answer and call write_file / run_code (or emit fenced \`\`\`file-actions / \`\`\`code-run blocks).`
+            `${thoughtHint ? `Your internal plan was:\n${thoughtHint}\n\n` : ''}${partialTxt ? `You wrote "${partialTxt}" but stopped without calling any tool.` : 'You stopped after thinking without writing a visible answer or tool call.'} Execute the step RIGHT NOW using write_file / file_action / run_code (or emit fenced \`\`\`file-actions / \`\`\`code-run blocks). Do not stop with just a promise.`
           ),
         },
       ],
       tools: nativeTools,
+      toolChoice: nativeTools.length ? 'required' : 'auto',
       think: 'off',
       priority: 'smart',
       signal,
@@ -1208,7 +1232,9 @@ Rules:
     });
     finalRes = {
       ...recoverRes,
+      content: [partialTxt, recoverRes.content].filter(Boolean).join('\n\n'),
       thinking: [finalRes.thinking, recoverRes.thinking].filter(Boolean).join('\n'),
+      toolCalls: [...(finalRes.toolCalls || []), ...(recoverRes.toolCalls || [])],
       elapsedMs: (finalRes.elapsedMs || 0) + (recoverRes.elapsedMs || 0),
     };
   }
@@ -1231,8 +1257,10 @@ Rules:
   const blocks = await extractSpecialBlocks(finalContent, toolsCfg, resolvedExecTarget);
   await mergeNativeToolCalls(finalRes.toolCalls, blocks, toolsCfg, resolvedExecTarget);
   const { fileActions, tableEdits, codeRuns, savedNotes, savedTasks } = blocks;
+  let wasAutoSynthesized = false;
   if (!finalContent.trim() && (fileActions.length || codeRuns.length || tableEdits.length)) {
     finalContent = summarizeBlocksMarkdown(blocks);
+    wasAutoSynthesized = true;
     onEvent('text', { delta: finalContent });
   }
   if (fileActions.length) onEvent('file_actions', fileActions);
@@ -1255,6 +1283,7 @@ Rules:
     codeRuns,
     savedNotes,
     savedTasks,
+    wasAutoSynthesized,
   };
 }
 

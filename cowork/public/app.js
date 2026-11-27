@@ -787,7 +787,7 @@ async function boot() {
   S.projects = projData?.projects || [];
   S.activeProject = projData?.activeProject || null;
 
-  $('#appVersionBadge').textContent = `v${info.version || '1.8.3'}`;
+  $('#appVersionBadge').textContent = `v${info.version || '1.8.4'}`;
   applyThemeUI(S.settings.theme || 'light');
   setMode(S.settings.defaultMode || 'copilot');
   setThink(S.settings.think || 'low');
@@ -1953,7 +1953,7 @@ function scrollFeedIfNearBottom(force = false) {
 function isHarnessMessage(m) {
   if (!m || m.role !== 'user') return false;
   if (m.isHarness) return true;
-  return /^(Code execution (finished|failed)|Code executed on |Here is the (container |host )?execution output)/i.test(String(m.content || '').trim());
+  return /^(Code execution (finished|failed)|Code executed on |File actions applied automatically|Here is the (container |host )?execution output)/i.test(String(m.content || '').trim());
 }
 
 function renderHarnessMessage(m) {

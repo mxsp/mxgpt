@@ -397,6 +397,7 @@ async function chatCompletion({
   messages = [],
   images = [],
   tools = [],
+  toolChoice = 'auto',
   think = 'off',
   priority = '',
   signal,
@@ -442,6 +443,7 @@ async function chatCompletion({
       messages,
       images: cleanImages,
       tools,
+      toolChoice,
       think,
       signal,
       onEvent,
@@ -466,6 +468,7 @@ async function chatCompletion({
       messages,
       images: cleanImages,
       tools,
+      toolChoice,
       think,
       signal,
       onEvent,
@@ -482,7 +485,7 @@ async function chatCompletion({
   });
 }
 
-async function chatViaOpenAI(cfg, { model, systemPrompt, messages, images = [], tools = [], think = 'off', signal, onEvent }) {
+async function chatViaOpenAI(cfg, { model, systemPrompt, messages, images = [], tools = [], toolChoice = 'auto', think = 'off', signal, onEvent }) {
   const base = normalizeOpenAIBase(cfg.endpointUrl);
   const fullMsgs = [];
   if (systemPrompt) fullMsgs.push({ role: 'system', content: systemPrompt });
@@ -513,7 +516,7 @@ async function chatViaOpenAI(cfg, { model, systemPrompt, messages, images = [], 
   };
   if (Array.isArray(tools) && tools.length) {
     body.tools = tools;
-    body.tool_choice = 'auto';
+    body.tool_choice = toolChoice || 'auto';
   }
   if (think && think !== 'off') {
     body.reasoning_effort = think === 'max' ? 'high' : think;
@@ -851,7 +854,7 @@ async function chatViaOllama(cfg, { model, systemPrompt, messages, images = [], 
   };
 }
 
-async function chatViaMxgptOpencodeProxy(cfg, { model, systemPrompt, messages, images = [], tools = [], think, signal, onEvent }) {
+async function chatViaMxgptOpencodeProxy(cfg, { model, systemPrompt, messages, images = [], tools = [], toolChoice = 'auto', think, signal, onEvent }) {
   const t0 = Date.now();
   const fullMsgs = [];
   if (systemPrompt) fullMsgs.push({ role: 'system', content: systemPrompt });
@@ -882,7 +885,7 @@ async function chatViaMxgptOpencodeProxy(cfg, { model, systemPrompt, messages, i
   };
   if (Array.isArray(tools) && tools.length) {
     body.tools = tools;
-    body.tool_choice = 'auto';
+    body.tool_choice = toolChoice || 'auto';
   }
   if (think && think !== 'off') {
     body.reasoning_effort = think === 'max' ? 'high' : think;
