@@ -1,0 +1,17 @@
+{
+  "name": "mxgpt",
+  "version": "1.0.0",
+  "private": true,
+  "description": "A private local AI workspace backed by Ollama: chat, artifacts, web browser, file browser.",
+  "main": "server/server.js",
+  "scripts": {
+    "start": "node server/server.js",
+    "dev": "node --watch server/server.js"
+  },
+  "engines": {
+    "node": ">=20"
+  },
+  "optionalDependencies": {
+    "playwright": "^1.65.1"
+  }
+}

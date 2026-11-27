@@ -1,0 +1,15 @@
+[Unit]
+Description=mx-GPT Self-Hosted AI Workspace
+After=network-online.target mxgpt-queue.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=/opt/mxgpt
+EnvironmentFile=-/opt/mxgpt/.env
+ExecStart=/usr/bin/node /opt/mxgpt/server/server.js
+Restart=always
+RestartSec=2
+
+[Install]
+WantedBy=multi-user.target

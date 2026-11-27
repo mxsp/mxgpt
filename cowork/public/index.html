@@ -1,0 +1,263 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>mx-Cowork — Local AI Coworker</title>
+  <link rel="stylesheet" href="/styles.css" />
+</head>
+<body>
+  <div class="app" id="app">
+    <!-- Left Rail -->
+    <aside class="sidebar">
+      <div class="sb-brand">
+        <div class="brand-mark">✦</div>
+        <div class="brand-info">
+          <div class="brand-name">mx-Cowork</div>
+          <button class="conn-pill" id="connPill" title="Endpoint settings">
+            <span class="dot" id="connDot"></span>
+            <span id="connLabel">Configure endpoint</span>
+          </button>
+        </div>
+        <button class="icon-btn" id="themeBtn" title="Toggle theme">◐</button>
+      </div>
+
+      <button class="new-btn" id="newChatBtn"><span>+</span> New coworker task</button>
+
+      <div class="ws-box">
+        <div class="ws-head">
+          <span class="sb-sec">Workspace</span>
+          <button class="link-btn" id="wsEditBtn">Change</button>
+        </div>
+        <div class="ws-path" id="wsPath" title="">—</div>
+        <div class="ws-quick" id="wsQuick"></div>
+      </div>
+
+      <div class="sb-sec" style="padding:10px 14px 4px">Sessions</div>
+      <div class="chat-list" id="chatList"></div>
+
+      <div class="sb-foot">
+        <button class="foot-btn" id="openSettingsBtn">⚙ Endpoint &amp; Models</button>
+      </div>
+    </aside>
+
+    <!-- Center Cowork Chat -->
+    <main class="main">
+      <header class="topbar">
+        <div class="mode-seg" id="modeSeg" role="radiogroup" aria-label="Execution Mode">
+          <button type="button" data-mode="fast" title="Direct Fast model (LFM3 1.7B · ~27 t/s)">⚡ Fast</button>
+          <button type="button" data-mode="smart" title="Direct Smart model (Inkling 26B · deep reasoning)">◆ Smart</button>
+          <button type="button" data-mode="copilot" class="on" title="Smart Orchestrator delegates retrieval/file/web work to Fast model">✦ Copilot</button>
+        </div>
+
+        <div class="think-seg" id="thinkSeg" title="Smart model reasoning effort">
+          <span class="seg-lbl">Think</span>
+          <button type="button" data-think="off">Off</button>
+          <button type="button" data-think="low" class="on">Low</button>
+          <button type="button" data-think="medium">Med</button>
+          <button type="button" data-think="high">High</button>
+        </div>
+
+        <div class="top-right">
+          <div class="drawer-tabs" id="drawerTabs">
+            <button type="button" data-tab="files" class="on">Files</button>
+            <button type="button" data-tab="email">Email Studio</button>
+            <button type="button" data-tab="research">Research</button>
+            <button type="button" data-tab="undo">Undo <span class="badge-cnt" id="undoCount" hidden>0</span></button>
+          </div>
+          <button class="icon-btn" id="toggleDrawerBtn" title="Toggle right studio panel">◫</button>
+        </div>
+      </header>
+
+      <div class="feed" id="feed">
+        <div class="welcome" id="welcome">
+          <div class="w-badge">✦ Copilot Orchestration · Smart Plans · Fast Retrieves</div>
+          <h1>Your local AI coworker.</h1>
+          <p>Research the web, search &amp; organize local files (including PDF &amp; DOCX), and draft ready-to-send emails — powered by your private endpoint.</p>
+          <div class="starters">
+            <button class="starter" data-prompt="Search my current workspace folder, summarize the key files and topics here, and highlight what looks most important.">
+              <b>📂 Search &amp; Summarize Files</b>
+              <span>Fast model scans &amp; distills local docs; Smart synthesizes</span>
+            </button>
+            <button class="starter" data-prompt="Audit my current workspace folder and propose a clean subfolder organization plan using file-actions so I can approve and apply it safely.">
+              <b>🗂 Organize Workspace Folder</b>
+              <span>Audits folder &amp; generates undoable Move/Rename approval cards</span>
+            </button>
+            <button class="starter" data-prompt="Research the latest open-source local LLM trends in 2026 and create a concise executive brief with sources.">
+              <b>🔎 Deep Web Research Brief</b>
+              <span>Fast workers search &amp; read pages; Smart writes cited brief</span>
+            </button>
+            <button class="starter" data-prompt="Draft a polished, friendly follow-up email to a project partner summarizing our progress and proposing two 30-minute call slots next week.">
+              <b>✉️ Draft &amp; Polish Email</b>
+              <span>Auto-loads into Email Studio with .eml export &amp; tone tools</span>
+            </button>
+          </div>
+        </div>
+        <div class="messages" id="messages"></div>
+      </div>
+
+      <div class="composer-wrap">
+        <div class="pinned-bar" id="pinnedBar" hidden></div>
+        <div class="composer">
+          <textarea id="promptInput" rows="1" placeholder="Ask mx-Cowork to research, draft an email, search files, or organize a folder…"></textarea>
+          <div class="comp-actions">
+            <span class="mode-hint" id="modeHint">Copilot: Smart plans &amp; synthesizes · Fast handles retrieval</span>
+            <button class="send-btn" id="sendBtn" title="Send (Enter)">Send ↑</button>
+          </div>
+        </div>
+      </div>
+    </main>
+
+    <!-- Right Coworker Studio Drawer -->
+    <aside class="drawer" id="drawer">
+      <!-- Files Tab -->
+      <section class="tab-pane active" data-pane="files">
+        <div class="pane-head">
+          <div class="pane-title">Local Files</div>
+          <div class="pane-btns">
+            <button class="mini-btn" id="auditWsBtn" title="Ask Copilot to audit and organize this folder">Audit</button>
+            <button class="mini-btn" id="refreshFilesBtn">↻</button>
+          </div>
+        </div>
+        <div class="search-row">
+          <input type="text" id="fileSearchInput" placeholder="Search filenames &amp; content (.pdf, .docx, .md, code)…" />
+          <button class="mini-btn" id="fileSearchBtn">Search</button>
+        </div>
+        <div class="crumb" id="fileCrumb">/</div>
+        <div class="file-list" id="fileList"></div>
+        <div class="file-preview" id="filePreview" hidden>
+          <div class="fp-head">
+            <b id="fpName"></b>
+            <div class="fp-btns">
+              <button class="mini-btn" id="fpPinBtn">Pin to Chat</button>
+              <button class="mini-btn" id="fpCloseBtn">✕</button>
+            </div>
+          </div>
+          <pre class="fp-body" id="fpBody"></pre>
+        </div>
+      </section>
+
+      <!-- Email Studio Tab -->
+      <section class="tab-pane" data-pane="email">
+        <div class="pane-head">
+          <div class="pane-title">Email Studio</div>
+          <div class="pane-btns">
+            <button class="mini-btn" id="newDraftBtn">+ New</button>
+            <button class="mini-btn primary" id="saveDraftBtn">Save</button>
+          </div>
+        </div>
+        <div class="email-form">
+          <input type="text" id="mailTo" placeholder="To: recipient@example.com" />
+          <input type="text" id="mailCc" placeholder="Cc: (optional)" />
+          <input type="text" id="mailSubject" placeholder="Subject" />
+          <textarea id="mailBody" rows="10" placeholder="Email body… Copilot drafts appear here automatically."></textarea>
+          <div class="refine-row">
+            <span class="ref-lbl">AI Refine:</span>
+            <button class="chip-btn" data-refine="shorter">Shorter</button>
+            <button class="chip-btn" data-refine="formal">Formal</button>
+            <button class="chip-btn" data-refine="friendly">Friendly</button>
+            <button class="chip-btn" data-refine="direct">Direct</button>
+            <button class="chip-btn" data-refine="fix_grammar">Fix Grammar</button>
+            <button class="chip-btn" data-refine="translate_de">→ DE</button>
+            <button class="chip-btn" data-refine="translate_en">→ EN</button>
+          </div>
+          <div class="email-export">
+            <button class="mini-btn" id="copyMailBtn">Copy</button>
+            <button class="mini-btn" id="mailtoBtn">Open in Mail App</button>
+            <button class="mini-btn primary" id="exportEmlBtn">Export .eml</button>
+          </div>
+        </div>
+        <div class="sub-sec">Saved Drafts</div>
+        <div class="saved-list" id="draftsList"></div>
+      </section>
+
+      <!-- Research Tab -->
+      <section class="tab-pane" data-pane="research">
+        <div class="pane-head">
+          <div class="pane-title">Research Desk</div>
+        </div>
+        <div class="search-row">
+          <input type="text" id="resSearchInput" placeholder="Quick web + Wikipedia lookup…" />
+          <button class="mini-btn" id="resSearchBtn">Go</button>
+        </div>
+        <div class="res-live" id="resLive"></div>
+        <div class="sub-sec">Saved Research Briefs</div>
+        <div class="saved-list" id="briefsList"></div>
+      </section>
+
+      <!-- Undo History Tab -->
+      <section class="tab-pane" data-pane="undo">
+        <div class="pane-head">
+          <div class="pane-title">File Action Undo Log</div>
+          <button class="mini-btn" id="refreshUndoBtn">↻</button>
+        </div>
+        <p class="muted-note">All file creations, renames, moves, and deletions (soft-trashed into <code>.mx-cowork-trash</code>) can be reversed in one click.</p>
+        <div class="saved-list" id="undoList"></div>
+      </section>
+    </aside>
+  </div>
+
+  <!-- Settings Modal -->
+  <div class="modal-backdrop" id="settingsModal" hidden>
+    <div class="modal">
+      <div class="modal-head">
+        <h3>Endpoint &amp; Coworker Settings</h3>
+        <button class="icon-btn" id="closeSettingsBtn">✕</button>
+      </div>
+      <div class="modal-body">
+        <label class="field">
+          <span>Endpoint Mode</span>
+          <select id="setEndpointType">
+            <option value="mxgpt">mx-GPT Remote Endpoint (https://max.fyreflysystems.de)</option>
+            <option value="ollama">Direct Ollama Endpoint (LAN / Localhost)</option>
+          </select>
+        </label>
+        <label class="field">
+          <span>Endpoint URL</span>
+          <input type="text" id="setEndpointUrl" placeholder="https://max.fyreflysystems.de" />
+        </label>
+        <div class="field-row" id="authFields">
+          <label class="field">
+            <span>Username / Account ID</span>
+            <input type="text" id="setUsername" placeholder="e.g. 1001" />
+          </label>
+          <label class="field">
+            <span>Password</span>
+            <input type="password" id="setPassword" placeholder="Leave blank to keep saved" />
+          </label>
+        </div>
+        <div class="field-row">
+          <label class="field">
+            <span>Fast Model (Workers &amp; Fast Mode)</span>
+            <input type="text" id="setFastModel" placeholder="lfm3:latest" />
+          </label>
+          <label class="field">
+            <span>Smart Model (Orchestrator &amp; Smart Mode)</span>
+            <input type="text" id="setSmartModel" placeholder="inkling-2-mini:latest" />
+          </label>
+        </div>
+        <label class="field">
+          <span>Local Workspace Folder</span>
+          <input type="text" id="setWorkspace" placeholder="/home/user/Documents or C:\Users\...\Documents" />
+        </label>
+        <label class="field">
+          <span>Default Email Signature (optional)</span>
+          <textarea id="setSignature" rows="2" placeholder="Best regards,&#10;Max"></textarea>
+        </label>
+        <label class="check-field">
+          <input type="checkbox" id="setAutoApprove" />
+          <span>Auto-apply proposed file actions without confirmation (not recommended)</span>
+        </label>
+        <div class="test-out" id="testOut" hidden></div>
+      </div>
+      <div class="modal-foot">
+        <button class="mini-btn" id="testConnBtn">Test Connection</button>
+        <button class="mini-btn primary" id="saveSettingsBtn">Save Settings</button>
+      </div>
+    </div>
+  </div>
+
+  <div class="toast" id="toast" hidden></div>
+  <script src="/app.js"></script>
+</body>
+</html>

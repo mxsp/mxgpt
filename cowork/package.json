@@ -1,0 +1,21 @@
+{
+  "name": "mx-cowork",
+  "version": "1.0.0",
+  "description": "Local AI Coworker desktop app (Linux + Windows) with Fast/Smart/Copilot orchestration",
+  "main": "src/main.js",
+  "bin": "src/main.js",
+  "scripts": {
+    "start": "node src/main.js",
+    "build:linux": "pkg . --target node22-linux-x64 --output dist/mx-cowork-linux-x64",
+    "build:win": "pkg . --target node22-win-x64 --output dist/mx-cowork-win-x64.exe",
+    "build:all": "npm run build:linux && npm run build:win"
+  },
+  "pkg": {
+    "assets": [
+      "public/**/*"
+    ]
+  },
+  "devDependencies": {
+    "@yao-pkg/pkg": "^6.6.0"
+  }
+}

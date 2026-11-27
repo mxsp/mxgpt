@@ -1,0 +1,10 @@
+{
+  "name": "mx-GPT",
+  "short_name": "mx-GPT",
+  "description": "Private mx-GPT-style AI workspace with artifacts, browser and files.",
+  "start_url": "/",
+  "display": "standalone",
+  "background_color": "#faf9f5",
+  "theme_color": "#faf9f5",
+  "icons": [{ "src": "/favicon.svg", "sizes": "any", "type": "image/svg+xml", "purpose": "any" }]
+}

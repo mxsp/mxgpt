@@ -1,0 +1,67 @@
+<!doctype html>
+<html lang="en" data-theme="light">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="theme-color" content="#faf9f5">
+<title>Sign in · mx-GPT</title>
+<link rel="icon" href="/favicon.svg" type="image/svg+xml">
+<link rel="stylesheet" href="/fonts/fonts.css">
+<link rel="stylesheet" href="/styles.css">
+</head>
+<body class="login-page">
+<main class="login-card">
+  <div class="login-star"><svg viewBox="0 0 24 24" style="width:42px;height:42px;stroke:currentColor;fill:none;stroke-width:2.2;stroke-linecap:round"><path d="M4 19V6l8 7 8-7v13"/></svg></div>
+  <h1>Welcome to mx-GPT</h1>
+  <p>Sign in to your private AI workspace.</p>
+  <form id="form">
+    <label for="user">User number</label>
+    <div class="login-input">
+      <input id="user" type="text" inputmode="numeric" autocomplete="username" placeholder="e.g. 1001" autofocus>
+    </div>
+    <label for="pw">Password</label>
+    <div class="login-input">
+      <input id="pw" type="password" autocomplete="current-password" required>
+      <button type="button" id="eye" title="Show password" aria-label="Show password">
+        <svg viewBox="0 0 24 24" style="width:18px;height:18px;stroke:currentColor;fill:none;stroke-width:1.7;stroke-linecap:round"><path d="M2 12s3.5-7 10-7 10 7 10 7-3.5 7-10 7S2 12 2 12z"/><circle cx="12" cy="12" r="3"/></svg>
+      </button>
+    </div>
+    <button class="login-submit" id="submit" type="submit">Continue</button>
+    <div class="login-err" id="err" role="alert"></div>
+  </form>
+  <div class="login-foot">mx-GPT · running locally · your conversations never leave this machine</div>
+</main>
+<script>
+(() => {
+  const form = document.getElementById('form');
+  const user = document.getElementById('user');
+  const pw = document.getElementById('pw');
+  const err = document.getElementById('err');
+  const btn = document.getElementById('submit');
+  document.getElementById('eye').addEventListener('click', () => {
+    pw.type = pw.type === 'password' ? 'text' : 'password';
+    pw.focus();
+  });
+  form.addEventListener('submit', async (e) => {
+    e.preventDefault();
+    err.textContent = '';
+    btn.disabled = true;
+    try {
+      const res = await fetch('/api/login', {
+        method: 'POST', headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ username: user.value.trim(), password: pw.value }),
+      });
+      const data = await res.json().catch(() => ({}));
+      if (!res.ok) throw new Error(data.error || 'Sign in failed');
+      location.href = '/';
+    } catch (ex) {
+      err.textContent = ex.message;
+      btn.disabled = false;
+      pw.select();
+      pw.focus();
+    }
+  });
+})();
+</script>
+</body>
+</html>

@@ -1,0 +1,9 @@
+node_modules
+cowork
+data
+docs
+scripts
+.git
+.env
+*.log
+dist

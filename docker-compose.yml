@@ -1,0 +1,42 @@
+services:
+  ollama-queue:
+    image: node:22-bookworm-slim
+    container_name: mxgpt-queue
+    restart: unless-stopped
+    working_dir: /app
+    volumes:
+      - ./deploy/ollama-queue.cjs:/app/ollama-queue.cjs:ro
+    environment:
+      QUEUE_HOST: "0.0.0.0"
+      QUEUE_PORT: "11435"
+      UPSTREAM_HOST: "${OLLAMA_HOST_IP:-host.docker.internal}"
+      UPSTREAM_PORT: "${OLLAMA_PORT:-11434}"
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    command: ["node", "/app/ollama-queue.cjs"]
+
+  mxgpt:
+    build: .
+    container_name: mxgpt
+    restart: unless-stopped
+    depends_on:
+      - ollama-queue
+    ports:
+      - "${PORT:-8088}:8088"
+    environment:
+      HOST: "0.0.0.0"
+      PORT: "8088"
+      OLLAMA_URL: "http://ollama-queue:11435"
+      DEFAULT_MODEL: "${DEFAULT_MODEL:-lfm3:latest}"
+      MXGPT_FAST_MODEL: "${MXGPT_FAST_MODEL:-lfm3:latest}"
+      MXGPT_SMART_MODEL: "${MXGPT_SMART_MODEL:-inkling-2-mini:latest}"
+      MXGPT_NUM_THREAD: "${MXGPT_NUM_THREAD:-20}"
+      MXGPT_SANDBOX: "${MXGPT_SANDBOX:-0}"
+      AUTH_REQUIRED: "${AUTH_REQUIRED:-1}"
+      DATA_DIR: "/data/state"
+      FILES_ROOT: "/data/projects"
+    volumes:
+      - mxgpt_data:/data
+
+volumes:
+  mxgpt_data:

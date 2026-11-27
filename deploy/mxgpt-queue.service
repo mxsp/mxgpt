@@ -1,0 +1,16 @@
+[Unit]
+Description=mx-GPT CPU-Aware Ollama Inference Queue Scheduler
+After=network.target
+
+[Service]
+Type=simple
+Environment=QUEUE_HOST=127.0.0.1
+Environment=QUEUE_PORT=11435
+Environment=UPSTREAM_HOST=127.0.0.1
+Environment=UPSTREAM_PORT=11434
+ExecStart=/usr/bin/node /opt/mxgpt/deploy/ollama-queue.cjs
+Restart=always
+RestartSec=2
+
+[Install]
+WantedBy=multi-user.target
