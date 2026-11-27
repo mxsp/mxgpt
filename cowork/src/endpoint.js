@@ -27,9 +27,9 @@ const PROVIDER_PRESETS = [
     endpointUrl: 'https://max.fyreflysystems.de',
     fastModel: 'lfm3:latest',
     smartModel: 'inkling-2-mini:latest',
-    copilotBModel: 'gpt-oss:20b',
+    copilotBModel: 'nemotron-3.5-lightning',
     authMode: 'login',
-    hint: 'Default hosted mx-GPT server at https://max.fyreflysystems.de (LFM3 Fast · Inkling Smart · gpt-oss:20b Copilot B).',
+    hint: 'Default hosted mx-GPT server at https://max.fyreflysystems.de (LFM3 Fast · Inkling Smart · nemotron-3.5-lightning Copilot B).',
   },
   {
     id: 'openai',

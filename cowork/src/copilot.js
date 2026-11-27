@@ -5,7 +5,7 @@
  *   - fast:      Direct Fast model (lfm3:latest)
  *   - smart:     Direct Smart model (inkling-2-mini:latest)
  *   - copilot:   Smart model orchestrates & synthesizes; delegates retrieval/tools to Fast workers
- *   - copilot_b: Copilot (B) using gpt-oss:20b (configurable) as orchestrator + Fast workers
+ *   - copilot_b: Copilot (B) using nemotron-3.5-lightning (configurable) as orchestrator + Fast workers
  *
  * Strictly obeys per-tool Settings (Web Search, OS Files, Container, Knowledge Graph,
  * Git Inspector, System Info, JS Calculator, Persistent Memory Notes).
@@ -492,10 +492,10 @@ async function runCoworkTurn({
     };
   }
 
-  // ---- COPILOT (Smart) or COPILOT (B) (gpt-oss:20b) Orchestrator -> Fast Workers -> Synthesis
+  // ---- COPILOT (Smart) or COPILOT (B) (nemotron-3.5-lightning) Orchestrator -> Fast Workers -> Synthesis
   const isCopilotB = mode === 'copilot_b';
   const orchestratorModel = isCopilotB
-    ? (cfg.copilotBModel || 'gpt-oss:20b')
+    ? (cfg.copilotBModel || 'nemotron-3.5-lightning')
     : (cfg.smartModel || 'inkling-2-mini:latest');
   const orchestratorLabel = isCopilotB
     ? `Copilot (B) · ${orchestratorModel.replace(/:latest$/, '')}`

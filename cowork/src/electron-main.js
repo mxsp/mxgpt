@@ -80,7 +80,7 @@ function buildAppMenu() {
         { label: 'Fast (LFM3 1.7B)', accelerator: 'CmdOrCtrl+1', click: () => sendMenuAction('set-mode', 'fast') },
         { label: 'Smart (Inkling 26B)', accelerator: 'CmdOrCtrl+2', click: () => sendMenuAction('set-mode', 'smart') },
         { label: 'Copilot (Smart + Fast Workers)', accelerator: 'CmdOrCtrl+3', click: () => sendMenuAction('set-mode', 'copilot') },
-        { label: 'Copilot (B) — gpt-oss:20b', accelerator: 'CmdOrCtrl+4', click: () => sendMenuAction('set-mode', 'copilot_b') },
+        { label: 'Copilot (B) — nemotron-3.5-lightning', accelerator: 'CmdOrCtrl+4', click: () => sendMenuAction('set-mode', 'copilot_b') },
         { type: 'separator' },
         { label: 'Toggle Studio Drawer', accelerator: 'CmdOrCtrl+B', click: () => sendMenuAction('toggle-drawer') },
         { label: 'Toggle Light / Dark Theme', accelerator: 'CmdOrCtrl+Shift+T', click: () => sendMenuAction('toggle-theme') },

@@ -165,7 +165,7 @@ function updateGreeting() {
 function modeHintText(m) {
   const fast = (S.settings?.fastModel || 'lfm3:latest').replace(/:latest$/, '');
   const smart = (S.settings?.smartModel || 'inkling-2-mini:latest').replace(/:latest$/, '');
-  const copB = (S.settings?.copilotBModel || 'gpt-oss:20b').replace(/:latest$/, '');
+  const copB = (S.settings?.copilotBModel || 'nemotron-3.5-lightning').replace(/:latest$/, '');
   if (m === 'fast') return `Fast: ${fast} direct`;
   if (m === 'smart') return `Smart: ${smart} direct`;
   if (m === 'copilot_b') return `Copilot (B): ${copB} orchestrates · ${fast} & local tools`;
@@ -1868,7 +1868,7 @@ function openSettings(initialTab = 'providers') {
   $('#setApiKey').placeholder = s.hasApiKey ? '•••••••• (saved — leave blank to keep)' : 'sk-... (stored locally)';
   $('#setFastModel').value = s.fastModel || 'lfm3:latest';
   $('#setSmartModel').value = s.smartModel || 'inkling-2-mini:latest';
-  $('#setCopilotBModel').value = s.copilotBModel || 'gpt-oss:20b';
+  $('#setCopilotBModel').value = s.copilotBModel || 'nemotron-3.5-lightning';
   // Tools tab
   $('#setToolWeb').checked = s.toolWebSearch !== false;
   $('#setToolOsFiles').checked = s.toolOsFiles !== false;
@@ -1912,7 +1912,7 @@ function collectSettingsForm() {
     apiKey: key ? key : '__KEEP__',
     fastModel: $('#setFastModel').value.trim() || 'lfm3:latest',
     smartModel: $('#setSmartModel').value.trim() || 'inkling-2-mini:latest',
-    copilotBModel: $('#setCopilotBModel').value.trim() || 'gpt-oss:20b',
+    copilotBModel: $('#setCopilotBModel').value.trim() || 'nemotron-3.5-lightning',
     toolWebSearch: $('#setToolWeb').checked,
     toolWebFetchPages: $('#setWebFetchPages').checked,
     toolWebMaxResults: Math.max(2, Math.min(10, Number($('#setWebMaxResults').value) || 5)),
@@ -1947,10 +1947,10 @@ function fmtBytes(n) {
 }
 
 function installKindLabel(kind) {
-  if (kind === 'appimage') return 'Linux AppImage (auto-update)';
-  if (kind === 'win-portable') return 'Windows App (auto-update)';
-  if (kind === 'deb') return 'Linux .deb Package';
-  if (kind === 'git') return 'Git Dev Checkout';
+  if (kind === 'appimage') return 'Linux AppImage (auto-install & restart)';
+  if (kind === 'win-portable') return 'Windows App (auto-install & restart)';
+  if (kind === 'deb') return 'Linux .deb (pkexec install & restart)';
+  if (kind === 'git') return 'Git Checkout (pull & restart)';
   return 'GitHub Release';
 }
 
@@ -1968,7 +1968,7 @@ function updateSidebarUpdateBadge(info) {
     btn.classList.remove('has-update');
     dot.hidden = true;
     $('#updBtnLabel').textContent = 'Updates';
-    ver.textContent = `v${info.currentVersion || S.appInfo?.version || '1.2.0'}`;
+    ver.textContent = `v${info.currentVersion || S.appInfo?.version || '1.3.1'}`;
   }
 }
 
@@ -1977,6 +1977,16 @@ async function checkUpdatesQuiet() {
     const info = await CW.checkUpdate({ force: false });
     S.updateInfo = info;
     updateSidebarUpdateBadge(info);
+    // Auto-install & restart on packaged releases when user enabled autoInstallUpdates
+    const autoOn = S.settings?.autoInstallUpdates !== false;
+    const isPackagedKind = info?.installKind === 'appimage' || info?.installKind === 'win-portable' || info?.installKind === 'deb';
+    if (autoOn && info?.ok && info?.updateAvailable && info?.canAutoApply && isPackagedKind && !S.updating) {
+      toast(`Update v${info.latestVersion} found — installing & restarting automatically…`, 4500);
+      $('#updAutoInstallChk').checked = true;
+      renderUpdateModal(info);
+      $('#updatesModal').hidden = false;
+      triggerInstallUpdate();
+    }
   } catch {}
 }
 
@@ -2010,9 +2020,7 @@ function renderUpdateModal(info) {
 
   const installBtn = $('#updInstallBtn');
   installBtn.disabled = S.updating || !info?.ok || !info?.updateAvailable;
-  if (info?.installKind === 'deb') installBtn.textContent = 'Download .deb & Verify';
-  else if (info?.installKind === 'git') installBtn.textContent = 'Pull Latest Changes';
-  else installBtn.textContent = 'Download & Install Update';
+  installBtn.textContent = S.updating ? 'Installing & Restarting…' : 'Install & Restart';
 }
 
 function renderUpdateProgress(p) {
@@ -2050,9 +2058,40 @@ async function runUpdateCheck(force = true) {
 function openUpdatesModal() {
   $('#updProgressWrap').hidden = true;
   $('#updCmdHint').hidden = true;
+  $('#updAutoInstallChk').checked = S.settings?.autoInstallUpdates !== false;
   $('#updatesModal').hidden = false;
   if (S.updateInfo) renderUpdateModal(S.updateInfo);
   runUpdateCheck(true);
+}
+
+async function triggerInstallUpdate() {
+  if (S.updating) return;
+  S.updating = true;
+  $('#updInstallBtn').disabled = true;
+  $('#updInstallBtn').textContent = 'Installing & Restarting…';
+  $('#updCheckBtn').disabled = true;
+  $('#updCmdHint').hidden = true;
+  try {
+    const res = await CW.applyUpdate();
+    const banner = $('#updBanner');
+    banner.className = 'upd-banner ok';
+    banner.textContent = res.message || 'Update installed — restarting…';
+    toast(res.message || 'Update installed — restarting…', 4500);
+    if (res.commandHint) {
+      $('#updCmdHint').hidden = false;
+      $('#updCmdText').textContent = res.commandHint;
+    }
+  } catch (e) {
+    const banner = $('#updBanner');
+    banner.className = 'upd-banner err';
+    banner.textContent = `Update failed: ${e.message}`;
+    toast(e.message, 5000);
+  } finally {
+    S.updating = false;
+    $('#updCheckBtn').disabled = false;
+    $('#updInstallBtn').textContent = 'Install & Restart';
+    $('#updInstallBtn').disabled = !S.updateInfo?.updateAvailable;
+  }
 }
 
 async function doLogout() {
@@ -2456,32 +2495,12 @@ $('#saveSettingsBtn').onclick = async () => {
 $('#updCheckBtn').onclick = () => runUpdateCheck(true);
 $('#updOpenGithubBtn').onclick = () => CW.openExternal(S.updateInfo?.releaseUrl || 'https://github.com/mxsp/mxgpt/releases');
 $('#updCopyCmdBtn').onclick = () => { navigator.clipboard?.writeText($('#updCmdText').textContent || ''); toast('Command copied'); };
-$('#updInstallBtn').onclick = async () => {
-  if (S.updating) return;
-  S.updating = true;
-  $('#updInstallBtn').disabled = true;
-  $('#updCheckBtn').disabled = true;
-  $('#updCmdHint').hidden = true;
-  try {
-    const res = await CW.applyUpdate();
-    const banner = $('#updBanner');
-    banner.className = 'upd-banner ok';
-    banner.textContent = res.message || 'Update applied!';
-    toast(res.message || 'Update complete', 4500);
-    if (res.commandHint) {
-      $('#updCmdHint').hidden = false;
-      $('#updCmdText').textContent = res.commandHint;
-    }
-  } catch (e) {
-    const banner = $('#updBanner');
-    banner.className = 'upd-banner err';
-    banner.textContent = `Update failed: ${e.message}`;
-    toast(e.message, 5000);
-  } finally {
-    S.updating = false;
-    $('#updCheckBtn').disabled = false;
-    $('#updInstallBtn').disabled = !S.updateInfo?.updateAvailable;
-  }
+$('#updAutoInstallChk').onchange = async () => {
+  const on = $('#updAutoInstallChk').checked;
+  const r = await CW.saveSettings({ autoInstallUpdates: on });
+  S.settings = r.settings;
+  toast(on ? 'Auto-install & restart enabled' : 'Manual update install selected');
 };
+$('#updInstallBtn').onclick = () => triggerInstallUpdate();
 
 boot().catch((e) => toast(`Startup error: ${e.message}`, 5000));

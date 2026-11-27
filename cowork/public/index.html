@@ -226,13 +226,13 @@
               </div>
             </div>
             <div class="c-right">
-              <div class="mode-control" id="modeControl" data-mode="copilot" title="Fast · Smart · Copilot (Smart + Fast) · Copilot (B) (gpt-oss:20b + Fast)">
+              <div class="mode-control" id="modeControl" data-mode="copilot" title="Fast · Smart · Copilot (Smart + Fast) · Copilot (B) (nemotron-3.5-lightning + Fast)">
                 <div class="mode-seg" id="modeSeg" role="radiogroup" aria-label="Execution mode">
                   <span class="mode-thumb" aria-hidden="true"></span>
                   <button type="button" data-mode="fast" role="radio" aria-checked="false" title="Fast model direct"><svg><use href="#i-cpu"/></svg><span>Fast</span></button>
                   <button type="button" data-mode="smart" role="radio" aria-checked="false" title="Smart model direct"><svg><use href="#i-spark"/></svg><span>Smart</span></button>
                   <button type="button" data-mode="copilot" class="on" role="radio" aria-checked="true" title="Copilot — Smart orchestrates Fast workers &amp; local tools"><svg><use href="#i-agents"/></svg><span>Copilot</span></button>
-                  <button type="button" data-mode="copilot_b" role="radio" aria-checked="false" title="Copilot (B) — gpt-oss:20b orchestrates Fast workers &amp; local tools"><svg><use href="#i-agents"/></svg><span>Copilot (B)</span></button>
+                  <button type="button" data-mode="copilot_b" role="radio" aria-checked="false" title="Copilot (B) — nemotron-3.5-lightning orchestrates Fast workers &amp; local tools"><svg><use href="#i-agents"/></svg><span>Copilot (B)</span></button>
                 </div>
               </div>
               <button class="send-btn" id="sendBtn" title="Send (Enter)"><svg id="sendIcon"><use href="#i-send"/></svg></button>
@@ -466,7 +466,7 @@
     <div class="modal-head">
       <div>
         <h2>Settings</h2>
-        <p class="sub">Configure AI providers, models (including Copilot B <code>gpt-oss:20b</code>), local tools, and container sandbox.</p>
+        <p class="sub">Configure AI providers, models (including Copilot B <code>nemotron-3.5-lightning</code>), local tools, and container sandbox.</p>
       </div>
       <button class="icon-btn" id="closeSettingsBtn"><svg><use href="#i-x"/></svg></button>
     </div>
@@ -531,7 +531,7 @@
         </div>
         <label class="field">
           <span>Copilot (B) Orchestrator Model</span>
-          <input type="text" id="setCopilotBModel" placeholder="gpt-oss:20b" />
+          <input type="text" id="setCopilotBModel" placeholder="nemotron-3.5-lightning" />
         </label>
 
         <div class="fetched-models" id="fetchedModelsWrap" hidden>
@@ -702,17 +702,21 @@
         <div class="upd-bar"><div class="upd-bar-fill" id="updBarFill" style="width:0%"></div></div>
       </div>
       <div class="upd-hint" id="updCmdHint" hidden>
-        <div class="sb-label" style="padding:0 0 4px">Install Command</div>
+        <div class="sb-label" style="padding:0 0 4px">Manual Install Fallback</div>
         <div class="upd-cmd-row">
           <code id="updCmdText"></code>
           <button type="button" class="btn tiny" id="updCopyCmdBtn">Copy</button>
         </div>
       </div>
+      <label class="check-field" style="margin-top:2px">
+        <input type="checkbox" id="updAutoInstallChk" />
+        <span>Automatically download, install &amp; restart when a new release is found</span>
+      </label>
     </div>
     <div class="modal-foot">
       <button class="btn" id="updOpenGithubBtn">GitHub Releases ↗</button>
       <button class="btn" id="updCheckBtn">Check Again</button>
-      <button class="btn primary" id="updInstallBtn" disabled>Install Update</button>
+      <button class="btn primary" id="updInstallBtn" disabled>Install &amp; Restart</button>
     </div>
   </div>
 </div>

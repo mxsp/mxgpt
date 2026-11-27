@@ -1,14 +1,16 @@
 'use strict';
 
 /**
- * GitHub Release Updater for mx-Cowork (inspired by mxsp/gimel updater.py).
+ * GitHub Release Auto-Updater for mx-Cowork (inspired by mxsp/gimel updater.py).
  *
  * - Queries GitHub Releases API (default: mxsp/mxgpt) with a 5-minute TTL cache
  * - Compares semantic versions cleanly (handles v-prefix & prereleases)
- * - Detects install type: Linux AppImage, Linux .deb, Windows portable zip, or git checkout
  * - Verifies downloaded binaries against SHA256SUMS.txt before applying
- * - Supports 1-click self-update & relaunch for Linux AppImage and Windows zip installs,
- *   download + reveal + apt hint for .deb installs, and git pull --ff-only in dev checkouts
+ * - Full Auto-Install & Auto-Restart on every platform:
+ *     * Linux AppImage: atomic swap + clean-env detached relaunch
+ *     * Linux .deb:     native pkexec apt-get install + detached relaunch
+ *     * Windows zip:    robocopy/PowerShell swap (with UAC elevation fallback) + auto-relaunch
+ *     * Git checkout:   git pull --ff-only + Electron app relaunch
  */
 
 const fs = require('fs');
@@ -47,7 +49,6 @@ function isNewerVersion(current, candidate) {
   if (b.major !== a.major) return b.major > a.major;
   if (b.minor !== a.minor) return b.minor > a.minor;
   if (b.patch !== a.patch) return b.patch > a.patch;
-  // Release (no pre) > prerelease
   if (a.pre && !b.pre) return true;
   if (!a.pre && b.pre) return false;
   return b.pre > a.pre;
@@ -79,32 +80,61 @@ function selectPlatformAsset(assets, installKind) {
   const list = Array.isArray(assets) ? assets : [];
   const byName = (re) => list.find((a) => re.test(String(a.name || '')));
 
-  if (installKind === 'appimage') {
-    return byName(/\.AppImage$/i) || null;
-  }
-  if (installKind === 'deb') {
-    return byName(/\.deb$/i) || byName(/\.AppImage$/i) || null;
-  }
+  if (installKind === 'appimage') return byName(/\.AppImage$/i) || null;
+  if (installKind === 'deb') return byName(/\.deb$/i) || byName(/\.AppImage$/i) || null;
   if (installKind === 'win-portable') {
-    return (
-      byName(/win[-_]?x64\.zip$/i) ||
-      byName(/win\.zip$/i) ||
-      byName(/\.exe$/i) ||
-      null
-    );
+    return byName(/win[-_]?x64\.zip$/i) || byName(/win\.zip$/i) || byName(/\.exe$/i) || null;
   }
-  // Dev/generic fallback: show best matching binary for current OS
-  if (process.platform === 'win32') {
-    return byName(/win[-_]?x64\.zip$/i) || byName(/\.exe$/i) || null;
-  }
-  if (process.platform === 'linux') {
-    return byName(/\.AppImage$/i) || byName(/\.deb$/i) || null;
-  }
+  if (process.platform === 'win32') return byName(/win[-_]?x64\.zip$/i) || byName(/\.exe$/i) || null;
+  if (process.platform === 'linux') return byName(/\.AppImage$/i) || byName(/\.deb$/i) || null;
   return null;
 }
 
 function findChecksumsAsset(assets) {
   return (assets || []).find((a) => /^SHA256SUMS(\.txt)?$/i.test(String(a.name || ''))) || null;
+}
+
+function spawnDetachedLinuxRestart(execPath) {
+  const cleanEnv = { ...process.env };
+  // Clear AppImage FUSE mount variables so the new binary mounts cleanly
+  delete cleanEnv.APPIMAGE;
+  delete cleanEnv.APPDIR;
+  delete cleanEnv.ARGV0;
+  delete cleanEnv.OWD;
+
+  const child = spawn(
+    '/bin/sh',
+    ['-c', 'sleep 1.2; nohup "$1" >/dev/null 2>&1 &', '_', execPath],
+    {
+      detached: true,
+      stdio: 'ignore',
+      env: cleanEnv,
+    }
+  );
+  child.unref();
+}
+
+function runCommandAsync(bin, args) {
+  return new Promise((resolve) => {
+    const child = spawn(bin, args, { stdio: ['ignore', 'pipe', 'pipe'] });
+    let out = '';
+    let err = '';
+    child.stdout.on('data', (b) => { out += b.toString('utf8'); });
+    child.stderr.on('data', (b) => { err += b.toString('utf8'); });
+    child.on('error', (e) => resolve({ code: -1, stdout: out, stderr: e.message }));
+    child.on('close', (code) => resolve({ code: typeof code === 'number' ? code : -1, stdout: out, stderr: err }));
+  });
+}
+
+function isDirWritable(dir) {
+  try {
+    const probe = path.join(dir, `.mx-upd-probe-${Date.now()}`);
+    fs.writeFileSync(probe, 'ok');
+    fs.unlinkSync(probe);
+    return true;
+  } catch {
+    return false;
+  }
 }
 
 async function checkForUpdate({
@@ -290,22 +320,26 @@ async function applyUpdate({
     return { ok: true, updated: false, message: `Already up to date (v${currentVersion}).` };
   }
 
-  // 1. Git dev checkout -> git pull --ff-only
+  // 1. Git dev checkout -> git pull --ff-only + auto-relaunch
   if (info.installKind === 'git') {
     const gitRoot = findGitRoot(__dirname);
     if (!gitRoot) throw new Error('Git repository root not found');
-    onProgress?.({ phase: 'applying', message: 'Pulling latest changes via git…', percent: 50 });
+    onProgress?.({ phase: 'applying', message: 'Pulling latest changes via git…', percent: 60 });
     const out = execFileSync('git', ['pull', '--ff-only'], {
       cwd: gitRoot,
       encoding: 'utf8',
       timeout: 30000,
     }).trim();
-    onProgress?.({ phase: 'done', message: 'Git pull complete. Restart to apply.', percent: 100 });
+    onProgress?.({ phase: 'relaunching', message: 'Restarting mx-Cowork…', percent: 100 });
+    if (relaunchFn) {
+      setTimeout(() => relaunchFn(null, false), 800);
+    }
     return {
       ok: true,
       updated: true,
-      restartRequired: true,
-      message: out || 'Updated git checkout. Restart mx-Cowork to load the new version.',
+      relaunching: true,
+      version: info.latestVersion,
+      message: `${out || 'Git updated'} — restarting mx-Cowork…`,
     };
   }
 
@@ -333,19 +367,20 @@ async function applyUpdate({
   onProgress?.({ phase: 'verifying', percent: 100, message: 'Verifying SHA-256 checksum…' });
   const check = await verifyAgainstChecksums(info.checksumsUrl, info.asset.name, actualSha, currentVersion);
 
-  // 2. Linux AppImage -> atomic swap + relaunch
+  // 2. Linux AppImage -> atomic swap + clean-env detached auto-restart
   if (info.installKind === 'appimage' && process.env.APPIMAGE) {
     const targetAppImage = process.env.APPIMAGE;
     const stagedPath = `${targetAppImage}.new`;
-    onProgress?.({ phase: 'applying', percent: 100, message: 'Replacing AppImage…' });
+    onProgress?.({ phase: 'applying', percent: 100, message: 'Installing AppImage update…' });
     fs.copyFileSync(tmpFile, stagedPath);
     fs.chmodSync(stagedPath, 0o755);
     fs.renameSync(stagedPath, targetAppImage);
     try { fs.rmSync(tmpDir, { recursive: true, force: true }); } catch {}
 
-    onProgress?.({ phase: 'relaunching', percent: 100, message: 'Relaunching updated mx-Cowork…' });
+    onProgress?.({ phase: 'relaunching', percent: 100, message: 'Restarting updated mx-Cowork…' });
+    spawnDetachedLinuxRestart(targetAppImage);
     if (relaunchFn) {
-      setTimeout(() => relaunchFn(targetAppImage), 700);
+      setTimeout(() => relaunchFn(null, true), 650);
     }
     return {
       ok: true,
@@ -353,17 +388,17 @@ async function applyUpdate({
       relaunching: true,
       verified: check.verified,
       version: info.latestVersion,
-      message: `Updated to v${info.latestVersion}${check.verified ? ' (SHA-256 verified)' : ''}. Relaunching…`,
+      message: `Installed v${info.latestVersion}${check.verified ? ' (SHA-256 verified)' : ''}. Restarting automatically…`,
     };
   }
 
-  // 3. Windows portable zip -> extract & launch detached PowerShell swap+relaunch script
+  // 3. Windows portable zip -> extract, robocopy swap (with UAC fallback), and auto-restart
   if (info.installKind === 'win-portable' && process.platform === 'win32') {
     const appDir = path.dirname(process.execPath);
     const exeName = path.basename(process.execPath);
     const stageDir = path.join(tmpDir, 'staged');
     fs.mkdirSync(stageDir, { recursive: true });
-    onProgress?.({ phase: 'applying', percent: 100, message: 'Extracting Windows package…' });
+    onProgress?.({ phase: 'applying', percent: 100, message: 'Extracting Windows update…' });
 
     execFileSync(
       'powershell.exe',
@@ -376,32 +411,57 @@ async function applyUpdate({
       { timeout: 120000 }
     );
 
+    const needsElevation = !isDirWritable(appDir);
     const psScript = path.join(tmpDir, 'apply-update.ps1');
     const escPs = (p) => String(p).replace(/'/g, "''");
     const scriptBody = [
       `$pidToWait = ${process.pid}`,
-      `for ($i = 0; $i -lt 60; $i++) {`,
+      `for ($i = 0; $i -lt 80; $i++) {`,
       `  if (-not (Get-Process -Id $pidToWait -ErrorAction SilentlyContinue)) { break }`,
       `  Start-Sleep -Milliseconds 500`,
       `}`,
+      `Start-Sleep -Milliseconds 700`,
       `$src = '${escPs(stageDir)}'`,
       `$dst = '${escPs(appDir)}'`,
-      `Copy-Item -Path (Join-Path $src '*') -Destination $dst -Recurse -Force`,
-      `Start-Process -FilePath (Join-Path $dst '${escPs(exeName)}')`,
+      `$exe = '${escPs(exeName)}'`,
+      `if (-not (Test-Path (Join-Path $src $exe))) {`,
+      `  $sub = Get-ChildItem -LiteralPath $src -Directory | Select-Object -First 1`,
+      `  if ($sub -and (Test-Path (Join-Path $sub.FullName $exe))) { $src = $sub.FullName }`,
+      `}`,
+      `$rc = Start-Process -FilePath 'robocopy.exe' -ArgumentList @($src, $dst, '/E', '/IS', '/IT', '/R:12', '/W:1', '/NFL', '/NDL', '/NJH', '/NJS') -Wait -PassThru -WindowStyle Hidden`,
+      `if ($rc.ExitCode -ge 8) {`,
+      `  Copy-Item -Path (Join-Path $src '*') -Destination $dst -Recurse -Force`,
+      `}`,
+      `Start-Process -FilePath (Join-Path $dst $exe) -WorkingDirectory $dst`,
+      `Start-Sleep -Seconds 2`,
       `Remove-Item -LiteralPath '${escPs(tmpDir)}' -Recurse -Force -ErrorAction SilentlyContinue`,
     ].join('\r\n');
     fs.writeFileSync(psScript, scriptBody, 'utf8');
 
-    onProgress?.({ phase: 'relaunching', percent: 100, message: 'Applying update and restarting…' });
-    const child = spawn(
-      'powershell.exe',
-      ['-NoProfile', '-ExecutionPolicy', 'Bypass', '-WindowStyle', 'Hidden', '-File', psScript],
-      { detached: true, stdio: 'ignore' }
-    );
-    child.unref();
+    onProgress?.({ phase: 'relaunching', percent: 100, message: 'Installing update & restarting mx-Cowork…' });
+    if (needsElevation) {
+      const child = spawn(
+        'powershell.exe',
+        [
+          '-NoProfile',
+          '-WindowStyle', 'Hidden',
+          '-Command',
+          `Start-Process powershell.exe -Verb RunAs -WindowStyle Hidden -ArgumentList '-NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File "${psScript.replace(/"/g, '""')}"'`,
+        ],
+        { detached: true, stdio: 'ignore' }
+      );
+      child.unref();
+    } else {
+      const child = spawn(
+        'powershell.exe',
+        ['-NoProfile', '-ExecutionPolicy', 'Bypass', '-WindowStyle', 'Hidden', '-File', psScript],
+        { detached: true, stdio: 'ignore' }
+      );
+      child.unref();
+    }
 
     if (relaunchFn) {
-      setTimeout(() => relaunchFn(null, true), 600);
+      setTimeout(() => relaunchFn(null, true), 650);
     }
     return {
       ok: true,
@@ -409,11 +469,41 @@ async function applyUpdate({
       relaunching: true,
       verified: check.verified,
       version: info.latestVersion,
-      message: `Update v${info.latestVersion} staged${check.verified ? ' (SHA-256 verified)' : ''}. Restarting…`,
+      message: `Installing v${info.latestVersion}${check.verified ? ' (SHA-256 verified)' : ''} and restarting automatically…`,
     };
   }
 
-  // 4. Linux .deb (or fallback package) -> move to ~/Downloads and reveal
+  // 4. Linux .deb -> automatic graphical pkexec install + detached auto-restart (with Downloads fallback)
+  if (info.installKind === 'deb' && info.asset.name.endsWith('.deb')) {
+    const hasPkexec = fs.existsSync('/usr/bin/pkexec');
+    if (hasPkexec) {
+      onProgress?.({ phase: 'applying', percent: 100, message: 'Installing .deb package (confirm OS password prompt)…' });
+      const res = await runCommandAsync('/usr/bin/pkexec', [
+        'apt-get', 'install', '-y', '--allow-downgrades', tmpFile,
+      ]);
+      if (res.code === 0) {
+        try { fs.rmSync(tmpDir, { recursive: true, force: true }); } catch {}
+        const targetBin = fs.existsSync('/opt/mx-Cowork/mx-cowork')
+          ? '/opt/mx-Cowork/mx-cowork'
+          : process.execPath;
+        onProgress?.({ phase: 'relaunching', percent: 100, message: 'Installed! Restarting mx-Cowork…' });
+        spawnDetachedLinuxRestart(targetBin);
+        if (relaunchFn) {
+          setTimeout(() => relaunchFn(null, true), 650);
+        }
+        return {
+          ok: true,
+          updated: true,
+          relaunching: true,
+          verified: check.verified,
+          version: info.latestVersion,
+          message: `Installed v${info.latestVersion}${check.verified ? ' (SHA-256 verified)' : ''}. Restarting automatically…`,
+        };
+      }
+    }
+  }
+
+  // Fallback: move verified package to ~/Downloads, reveal in file manager, show command hint
   const downloadsDir = path.join(os.homedir(), 'Downloads');
   fs.mkdirSync(downloadsDir, { recursive: true });
   const finalPath = path.join(downloadsDir, info.asset.name);
@@ -437,7 +527,7 @@ async function applyUpdate({
     version: info.latestVersion,
     downloadedPath: finalPath,
     commandHint,
-    message: `Downloaded v${info.latestVersion}${check.verified ? ' (SHA-256 verified)' : ''} to Downloads.`,
+    message: `Downloaded v${info.latestVersion}${check.verified ? ' (SHA-256 verified)' : ''} to Downloads (install cancelled or requires manual sudo).`,
   };
 }
 

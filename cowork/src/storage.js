@@ -43,13 +43,14 @@ const DEFAULT_SETTINGS = {
   apiKey: '',
   fastModel: 'lfm3:latest',
   smartModel: 'inkling-2-mini:latest',
-  copilotBModel: 'gpt-oss:20b',
+  copilotBModel: 'nemotron-3.5-lightning',
   defaultMode: 'copilot', // 'fast' | 'smart' | 'copilot' | 'copilot_b'
   think: 'low', // 'off' | 'low' | 'medium' | 'high'
   workspace: defaultWorkspace(),
   theme: 'light',
   autoApproveFileActions: false,
   updateRepo: 'mxsp/mxgpt',
+  autoInstallUpdates: true,
   signedIn: false,
   // Granular Tool & Capability Settings
   toolWebSearch: true,
@@ -92,7 +93,11 @@ function writeJson(file, data) {
 
 function getSettings() {
   const saved = readJson(SETTINGS_FILE, {});
-  return { ...DEFAULT_SETTINGS, ...saved };
+  const merged = { ...DEFAULT_SETTINGS, ...saved };
+  if (merged.copilotBModel === 'gpt-oss:20b') {
+    merged.copilotBModel = 'nemotron-3.5-lightning';
+  }
+  return merged;
 }
 
 function saveSettings(patch = {}) {
