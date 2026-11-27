@@ -517,7 +517,9 @@ function registerIpc() {
         projectId: payload?.projectId !== undefined ? String(payload.projectId || '') : (storage.getSettings().activeProjectId || ''),
       });
     }
-    if (chat.messages.length === 0) {
+    const isHarness = Boolean(payload?.isHarness);
+    const harnessMeta = payload?.harnessMeta && typeof payload.harnessMeta === 'object' ? payload.harnessMeta : null;
+    if (chat.messages.length === 0 && !isHarness) {
       chat.title = prompt.slice(0, 56) + (prompt.length > 56 ? '…' : '');
     }
     chat.mode = mode;
@@ -528,7 +530,13 @@ function registerIpc() {
       }
     }
 
-    const userMsg = { id: storage.newId('u'), role: 'user', content: prompt, ts: Date.now() };
+    const userMsg = {
+      id: storage.newId('u'),
+      role: 'user',
+      content: prompt,
+      ...(isHarness ? { isHarness: true, harnessMeta } : {}),
+      ts: Date.now(),
+    };
     const priorHistory = chat.messages.filter((m) => m.role === 'user' || m.role === 'assistant');
     chat.messages.push(userMsg);
     storage.saveChat(chat);
@@ -635,6 +643,7 @@ function registerIpc() {
       const autoRound = Math.max(0, Number(payload?.autoRound) || 0);
       const MAX_AUTO_ROUNDS = 4;
       let autoContinuePrompt = '';
+      let autoContinueHarnessMeta = null;
 
       if (result.codeRuns?.length && autoRunContainer) {
         let anyStopped = false;
@@ -681,6 +690,16 @@ function registerIpc() {
             return `[${cr.title || cr.language} · ${tgt} · exit ${cr.exitCode ?? '?'}]\n\`\`\`\n${out}\n\`\`\``;
           }).join('\n\n');
           const anyFailed = ranProcesses.some((cr) => cr.status === 'error');
+          const firstRun = ranProcesses[0];
+          const firstTgt = (firstRun.execTarget || finalExecTarget) === 'host' ? 'Host' : 'Container';
+          autoContinueHarnessMeta = {
+            status: anyFailed ? 'error' : 'ok',
+            label: anyFailed ? 'Execution Failed' : 'Execution Succeeded',
+            title: ranProcesses.length === 1
+              ? `${firstRun.title || firstRun.language} · ${firstTgt} · Exit ${firstRun.exitCode ?? (anyFailed ? 1 : 0)}`
+              : `${ranProcesses.length} code runs · ${firstTgt}`,
+            output: ranProcesses.map((cr) => String(cr.output || '(no output)')).join('\n---\n').slice(0, 8000),
+          };
           autoContinuePrompt = anyFailed
             ? `Code execution finished with an error:\n\n${summaryBlocks}\n\nDiagnose the error, fix the issue, and continue.`
             : `Code execution finished successfully:\n\n${summaryBlocks}\n\nContinue from this output — present the final result clearly or perform the next needed step (do not re-run the same script if the task is complete).`;
@@ -711,6 +730,7 @@ function registerIpc() {
         chat: { id: chat.id, title: chat.title, mode: chat.mode, updated: chat.updated },
         message: assistantMsg,
         autoContinuePrompt: autoContinuePrompt || null,
+        autoContinueHarnessMeta,
         nextAutoRound: autoContinuePrompt ? autoRound + 1 : 0,
       });
       return { ok: true, chatId: chat.id };

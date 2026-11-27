@@ -787,7 +787,7 @@ async function boot() {
   S.projects = projData?.projects || [];
   S.activeProject = projData?.activeProject || null;
 
-  $('#appVersionBadge').textContent = `v${info.version || '1.8.1'}`;
+  $('#appVersionBadge').textContent = `v${info.version || '1.8.2'}`;
   applyThemeUI(S.settings.theme || 'light');
   setMode(S.settings.defaultMode || 'copilot');
   setThink(S.settings.think || 'low');
@@ -1870,15 +1870,21 @@ function renderCodeRunsCard(runs) {
           loadOfficeQuickStrip();
           renderMessages();
 
-          // Automatically continue AI turn with execution output unless stopped or toggled off
+          // Automatically continue AI turn with execution output (rendered as Harness message, not user bubble)
           if (!r.stopped && S.autoContinueAfterCode && !isChatStreaming(S.chat?.id)) {
             const tgtLabel = chosenTarget === 'host' ? 'Host (On-Machine)' : 'Container';
             const out = (run.output || '(no output)').slice(0, 6000);
             const follow = r.ok
               ? `Code executed on ${tgtLabel} for "${run.title || run.language}" (exit 0, ${(r.elapsedMs / 1000).toFixed(1)}s):\n\`\`\`\n${out}\n\`\`\`\nContinue from this result — present the outcome or take the next step (do not re-run the same script if done).`
               : `Code execution failed on ${tgtLabel} for "${run.title || run.language}" (exit ${r.exitCode ?? 1}):\n\`\`\`\n${out}\n\`\`\`\nDiagnose the error, fix it, and continue.`;
+            const harnessMeta = {
+              status: r.ok ? 'ok' : 'error',
+              label: r.ok ? 'Execution Succeeded' : 'Execution Failed',
+              title: `${run.title || run.language} · ${chosenTarget === 'host' ? 'Host' : 'Container'} · Exit ${r.exitCode ?? (r.ok ? 0 : 1)}`,
+              output: out,
+            };
             setTimeout(() => {
-              sendPrompt(follow, { forceChatId: S.chat?.id || null, forceProjectId: S.chat?.projectId });
+              sendPrompt(follow, { forceChatId: S.chat?.id || null, forceProjectId: S.chat?.projectId, isHarness: true, harnessMeta });
             }, 120);
           }
         } catch (e) {
@@ -1900,7 +1906,19 @@ function renderCodeRunsCard(runs) {
     if (sendBtn) {
       sendBtn.onclick = () => {
         const out = (S.containerRunOutputs[run.id] || run.output || '').slice(0, 6000);
-        sendPrompt(`Here is the container execution output for "${run.title}" (exit ${run.exitCode ?? '?'}):\n\`\`\`\n${out}\n\`\`\`\nPlease analyze the result and suggest or take the next step.`);
+        const ok = (run.exitCode ?? 0) === 0 && run.status !== 'error';
+        sendPrompt(
+          `Here is the execution output for "${run.title}" (exit ${run.exitCode ?? '?'}):\n\`\`\`\n${out}\n\`\`\`\nPlease analyze the result and suggest or take the next step.`,
+          {
+            isHarness: true,
+            harnessMeta: {
+              status: ok ? 'ok' : 'error',
+              label: ok ? 'Execution Output' : 'Execution Error',
+              title: `${run.title || run.language} · Exit ${run.exitCode ?? '?'}`,
+              output: out,
+            },
+          }
+        );
       };
     }
 
@@ -1920,6 +1938,45 @@ function scrollFeedIfNearBottom(force = false) {
   }
 }
 
+function isHarnessMessage(m) {
+  if (!m || m.role !== 'user') return false;
+  if (m.isHarness) return true;
+  return /^(Code execution (finished|failed)|Code executed on |Here is the (container |host )?execution output)/i.test(String(m.content || '').trim());
+}
+
+function renderHarnessMessage(m) {
+  const raw = String(m.content || '');
+  const meta = m.harnessMeta || {};
+  const isErr = meta.status === 'error'
+    || /failed|with an error|exit [1-9]/i.test(meta.title || raw.slice(0, 220));
+  const statusLabel = meta.label || (isErr ? 'Execution Failed' : 'Execution Succeeded');
+  let title = meta.title || '';
+  if (!title) {
+    const bracket = raw.match(/\[([^\]]+)\]/);
+    if (bracket) title = bracket[1];
+    else title = raw.split('\n')[0].replace(/:$/, '').slice(0, 96);
+  }
+  let output = meta.output || '';
+  if (!output) {
+    const fenced = raw.match(/```(?:\w*)\n([\s\S]*?)```/);
+    output = fenced ? fenced[1].trim() : raw;
+  }
+
+  const el = document.createElement('div');
+  el.className = 'msg harness';
+  el.innerHTML = `
+    <details class="harness-card ${isErr ? 'err' : 'ok'}">
+      <summary class="harness-head">
+        <span class="harness-badge">HARNESS</span>
+        <span class="harness-status ${isErr ? 'err' : 'ok'}">${isErr ? '✗' : '✓'} ${esc(statusLabel)}</span>
+        <span class="harness-title">${esc(title)}</span>
+        <span class="harness-toggle">Output ▾</span>
+      </summary>
+      <pre class="harness-pre">${esc(output || '(no output)')}</pre>
+    </details>`;
+  return el;
+}
+
 function renderMessages(forceScroll = true) {
   const wrap = $('#messages');
   $('#welcome').classList.toggle('hidden', S.messages.length > 0);
@@ -1928,6 +1985,10 @@ function renderMessages(forceScroll = true) {
   for (let mi = 0; mi < S.messages.length; mi++) {
     const m = S.messages[mi];
     const msgKey = m.id || `m_${mi}`;
+    if (isHarnessMessage(m)) {
+      wrap.appendChild(renderHarnessMessage(m));
+      continue;
+    }
     const el = document.createElement('div');
     el.className = `msg ${m.role}`;
     if (m.role === 'user') {
@@ -2374,13 +2435,15 @@ function handleGlobalCoworkEvent({ streamId: sid, event: ev, data: d }) {
       loadOfficeQuickStrip();
       loadUndoList();
     }
-    // Closed-loop Auto-Continue when Auto Mode executed code blocks in this turn
+    // Closed-loop Auto-Continue when Auto Mode executed code blocks in this turn (rendered as Harness message)
     if (d.autoContinuePrompt) {
       setTimeout(() => {
         sendPrompt(d.autoContinuePrompt, {
           forceChatId: st.chatId,
           forceProjectId: st.projectId,
           autoRound: d.nextAutoRound || 1,
+          isHarness: true,
+          harnessMeta: d.autoContinueHarnessMeta || null,
         });
       }, 150);
       return;
@@ -2459,7 +2522,12 @@ async function sendPrompt(overrideText = null, opts = {}) {
     renderPinned();
   }
 
-  const userMsg = { id: 'tmp-u-' + streamId, role: 'user', content: prompt };
+  const userMsg = {
+    id: 'tmp-u-' + streamId,
+    role: 'user',
+    content: prompt,
+    ...(opts.isHarness ? { isHarness: true, harnessMeta: opts.harnessMeta || null } : {}),
+  };
   const initialPhase = chosenMode === 'copilot_b'
     ? 'Copilot (B) planning…'
     : chosenMode === 'copilot'
@@ -2529,6 +2597,8 @@ async function sendPrompt(overrideText = null, opts = {}) {
     piiShield: shieldOn,
     execTarget: getEffectiveExecTarget(),
     autoRound: opts.autoRound || 0,
+    isHarness: Boolean(opts.isHarness),
+    harnessMeta: opts.harnessMeta || null,
     toolOverrides: {
       toolWebSearch: S.toolWebSearch,
       toolOsFiles: S.toolOsFiles,
@@ -4651,7 +4721,20 @@ $('#ctSendOutBtn').onclick = () => {
     toast('Run something in the container first');
     return;
   }
-  sendPrompt(`Analyze this container execution output from my workspace:\n\`\`\`\n${out.slice(0, 6000)}\n\`\`\``);
+  const meta = ($('#ctRunMeta')?.textContent || '').trim();
+  const isErr = /fail|exit [1-9]/i.test(meta);
+  sendPrompt(
+    `Analyze this execution output from my workspace:\n\`\`\`\n${out.slice(0, 6000)}\n\`\`\``,
+    {
+      isHarness: true,
+      harnessMeta: {
+        status: isErr ? 'error' : 'ok',
+        label: isErr ? 'Execution Failed' : 'Execution Output',
+        title: `${$('#ctExecTarget')?.value === 'host' ? 'Host' : 'Container'} · ${$('#ctLang')?.value || 'code'}${meta ? ' · ' + meta : ''}`,
+        output: out.slice(0, 6000),
+      },
+    }
+  );
 };
 $('#attachFileBtn').onclick = async () => {
   const res = await CW.pickFiles();
