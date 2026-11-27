@@ -46,6 +46,7 @@
   <symbol id="i-graph" viewBox="0 0 24 24"><circle cx="6" cy="6" r="2.5"/><circle cx="18" cy="7" r="2.5"/><circle cx="7" cy="18" r="2.5"/><circle cx="17" cy="17" r="2.5"/><path d="M8.3 6.5l7.2.4M7.2 8.2l8.1 7.1M6.4 8.5l.5 7M9.5 17.6l5-.4"/></symbol>
   <symbol id="i-play" viewBox="0 0 24 24"><polygon points="6 4 20 12 6 20 6 4" fill="currentColor" stroke="none"/></symbol>
   <symbol id="i-expand" viewBox="0 0 24 24"><path d="M15 3h6v6M9 21H3v-6M21 3l-7 7M3 21l7-7"/></symbol>
+  <symbol id="i-code" viewBox="0 0 24 24"><path d="M16 18l6-6-6-6M8 6l-6 6 6 6"/></symbol>
 </svg>
 
 <!-- Native Login Screen (identical visual style to mx-GPT login.html) -->
@@ -151,7 +152,7 @@
         <span class="upd-dot" id="updDot" hidden></span>
         <svg><use href="#i-download"/></svg>
         <span id="updBtnLabel">Updates</span>
-        <span class="upd-ver" id="appVersionBadge">v1.2.0</span>
+        <span class="upd-ver" id="appVersionBadge">v1.5.0</span>
       </button>
       <div class="user-row">
         <button class="user-chip" id="openSettingsBtn" title="Endpoint, providers &amp; account settings">
@@ -181,6 +182,7 @@
         <span class="mapping-pill" id="graphMappingPill" hidden><span class="mini-spin"></span><span id="graphMappingTxt">Mapping…</span></span>
       </div>
       <div class="top-actions">
+        <button class="ghost-btn" data-panel="artifact" title="Live Artifact Preview Canvas (HTML, SVG, React, Mermaid)"><svg><use href="#i-code"/></svg><span>Artifact</span></button>
         <button class="ghost-btn" data-panel="files" title="Navigate OS folders, find &amp; edit local files"><svg><use href="#i-folder"/></svg><span>Files</span></button>
         <button class="ghost-btn" data-panel="graph" title="Interactive Project Knowledge Graph"><svg><use href="#i-graph"/></svg><span>Graph</span></button>
         <button class="ghost-btn" data-panel="container" title="Isolated Docker/Podman Container Code Execution"><svg><use href="#i-box"/></svg><span>Container</span></button>
@@ -272,6 +274,28 @@
     </header>
 
     <div class="panel-body">
+      <!-- Live Artifact Display Canvas (identical to mx-GPT webapp) -->
+      <section class="pane" data-pane="artifact">
+        <div class="art-panel-bar" id="artPanelBar">
+          <div class="art-tabs" id="artTabs">
+            <button type="button" class="panel-tab active" data-arttab="preview">Preview</button>
+            <button type="button" class="panel-tab" data-arttab="code">Code</button>
+          </div>
+          <span class="art-meta-right" id="artMetaRight"></span>
+          <div class="row-gap">
+            <button class="icon-btn sm" id="artCopyBtn" title="Copy artifact code"><svg><use href="#i-copy"/></svg></button>
+            <button class="icon-btn sm" id="artSaveBtn" title="Save artifact to disk…"><svg><use href="#i-download"/></svg></button>
+            <button class="icon-btn sm" id="artOpenExtBtn" title="Open in OS browser"><svg><use href="#i-external"/></svg></button>
+            <button class="icon-btn sm" id="artRefreshBtn" title="Refresh preview"><svg><use href="#i-refresh"/></svg></button>
+          </div>
+        </div>
+        <div class="art-stage" id="artStage">
+          <div class="artifact-empty" id="artEmpty">No artifact open yet. Ask Copilot to build a dashboard, chart, UI, SVG, or Mermaid diagram — it will open here automatically.</div>
+          <iframe class="artifact-frame" id="artFrame" sandbox="allow-scripts allow-forms allow-modals allow-popups allow-downloads" hidden></iframe>
+          <div class="artifact-code" id="artCodeWrap" hidden><pre><code id="artCodeEl"></code></pre></div>
+        </div>
+      </section>
+
       <!-- OS Files & Live File Editor Pane -->
       <section class="pane active" data-pane="files">
         <!-- Directory Browser View -->
@@ -480,27 +504,97 @@
   </aside>
 </div>
 
-<!-- Settings, Providers & Tools Modal -->
+<!-- Settings, Models, Providers, Usage & Tools Modal (WebUI-aligned) -->
 <div class="modal-backdrop" id="settingsModal" hidden>
-  <div class="modal modal-lg">
+  <div class="modal modal-xl">
     <div class="modal-head">
       <div>
         <h2>Settings</h2>
-        <p class="sub">Configure AI providers, models (including Copilot B <code>nemotron-3.5-lightning</code>), local tools, and container sandbox.</p>
+        <p class="sub">Models &amp; agent roles, connected providers, token usage statistics, local tools, and container sandbox.</p>
       </div>
       <button class="icon-btn" id="closeSettingsBtn"><svg><use href="#i-x"/></svg></button>
     </div>
     <div class="settings-tabs" id="settingsTabs">
-      <button type="button" data-stab="providers" class="active">Providers &amp; Models</button>
-      <button type="button" data-stab="tools">Tools &amp; Capabilities</button>
-      <button type="button" data-stab="container">Container Sandbox</button>
+      <button type="button" data-stab="models" class="active">Models &amp; Agents</button>
+      <button type="button" data-stab="providers">Providers &amp; API Keys</button>
+      <button type="button" data-stab="usage">Usage</button>
+      <button type="button" data-stab="tools">Tools</button>
+      <button type="button" data-stab="container">Container</button>
     </div>
     <div class="modal-body">
-      <!-- Tab 1: Providers & Models -->
-      <div class="stab-pane active" data-spane="providers">
+      <!-- Tab 1: Models & Agent Role Routing -->
+      <div class="stab-pane active" data-spane="models">
+        <div class="field-row">
+          <label class="field">
+            <span>Fast Model (Direct Fast Mode)</span>
+            <input type="text" id="setFastModel" placeholder="lfm3:latest" />
+          </label>
+          <label class="field">
+            <span>Smart / Copilot Orchestrator Model</span>
+            <input type="text" id="setSmartModel" placeholder="inkling-2-mini:latest" />
+          </label>
+        </div>
+        <div class="field-row">
+          <label class="field">
+            <span>Copilot (B) Orchestrator Model</span>
+            <input type="text" id="setCopilotBModel" placeholder="nemotron-3.5-lightning" />
+          </label>
+          <label class="field">
+            <span>Subagent / Worker Model</span>
+            <input type="text" id="setAgentModel" placeholder="lfm3:latest" />
+          </label>
+        </div>
+        <div class="field-row">
+          <label class="field">
+            <span>Knowledge Graph Mapper Model</span>
+            <input type="text" id="setGraphMapperModel" placeholder="lfm3:latest" />
+          </label>
+          <label class="field" style="flex:0.7">
+            <span>Default Mode</span>
+            <select id="setDefaultMode">
+              <option value="copilot">Copilot</option>
+              <option value="copilot_b">Copilot (B)</option>
+              <option value="smart">Smart</option>
+              <option value="fast">Fast</option>
+            </select>
+          </label>
+          <label class="field" style="flex:0.6">
+            <span>Default Think</span>
+            <select id="setDefaultThink">
+              <option value="off">Off</option>
+              <option value="low">Low</option>
+              <option value="medium">Med</option>
+              <option value="high">High</option>
+            </select>
+          </label>
+        </div>
+
+        <div class="fetched-models" id="fetchedModelsWrap" hidden>
+          <div class="fm-head">
+            <span>Available Models (click to assign to selected role)</span>
+            <div class="fm-target" id="fmTarget">
+              <button type="button" data-target="fast" class="on">Fast</button>
+              <button type="button" data-target="smart">Smart</button>
+              <button type="button" data-target="copilot_b">Copilot B</button>
+              <button type="button" data-target="agent">Agent</button>
+              <button type="button" data-target="graph">Graph</button>
+            </div>
+          </div>
+          <div class="fm-list" id="fetchedModelsList"></div>
+        </div>
+
+        <label class="field">
+          <span>Global Custom Instructions</span>
+          <textarea id="setCustomInstr" rows="3" placeholder="How should mx-Cowork respond across all chats? Tone, language, coding style…"></textarea>
+        </label>
+        <div class="test-out" id="testOut" hidden></div>
+      </div>
+
+      <!-- Tab 2: Providers & API Keys (WebUI-style) -->
+      <div class="stab-pane" data-spane="providers">
         <div class="field">
           <div class="field-label-row">
-            <span>Provider Preset</span>
+            <span>Active Endpoint Preset</span>
             <button type="button" class="link-btn" id="resetDefaultProviderBtn">Reset to Default (max.fyreflysystems.de)</button>
           </div>
           <div class="provider-chips" id="providerChips"></div>
@@ -508,7 +602,7 @@
         </div>
 
         <div class="field-row">
-          <label class="field" style="flex:0.85">
+          <label class="field" style="flex:0.8">
             <span>Protocol</span>
             <select id="setEndpointType">
               <option value="mxgpt">mx-GPT (Default)</option>
@@ -539,36 +633,25 @@
           <input type="password" id="setApiKey" placeholder="sk-... (stored locally on this machine)" />
         </div>
 
-        <div class="field-row">
-          <label class="field">
-            <span>Fast Model (Workers)</span>
-            <input type="text" id="setFastModel" placeholder="lfm3:latest" />
-          </label>
-          <label class="field">
-            <span>Smart / Copilot Model</span>
-            <input type="text" id="setSmartModel" placeholder="inkling-2-mini:latest" />
-          </label>
+        <div class="row-gap">
+          <button type="button" class="btn tiny" id="saveAsProfileBtn">+ Save as Reusable Provider Profile</button>
         </div>
-        <label class="field">
-          <span>Copilot (B) Orchestrator Model</span>
-          <input type="text" id="setCopilotBModel" placeholder="nemotron-3.5-lightning" />
-        </label>
 
-        <div class="fetched-models" id="fetchedModelsWrap" hidden>
-          <div class="fm-head">
-            <span>Available Models (click to assign)</span>
-            <div class="fm-target" id="fmTarget">
-              <button type="button" data-target="fast" class="on">Fast</button>
-              <button type="button" data-target="smart">Smart</button>
-              <button type="button" data-target="copilot_b">Copilot (B)</button>
-            </div>
-          </div>
-          <div class="fm-list" id="fetchedModelsList"></div>
+        <div class="settings-sep"></div>
+        <div class="pane-head-row">
+          <span class="sb-label" style="padding:0">Saved Provider Profiles</span>
         </div>
-        <div class="test-out" id="testOut" hidden></div>
+        <div id="savedProvidersList"></div>
       </div>
 
-      <!-- Tab 2: Tools & Capabilities -->
+      <!-- Tab 3: Token Usage Statistics (identical to WebUI Usage tab) -->
+      <div class="stab-pane" data-spane="usage">
+        <div id="usagePanelRoot">
+          <div class="muted-note">Loading token usage statistics…</div>
+        </div>
+      </div>
+
+      <!-- Tab 4: Tools & Capabilities -->
       <div class="stab-pane" data-spane="tools">
         <div class="tool-settings-grid">
           <label class="tool-setting-card">
@@ -635,7 +718,7 @@
         </label>
       </div>
 
-      <!-- Tab 3: Container Sandbox -->
+      <!-- Tab 5: Container Sandbox -->
       <div class="stab-pane" data-spane="container">
         <p class="muted-note">Containers run with <code>--cap-drop=ALL</code>, <code>--security-opt=no-new-privileges</code>, PID/RAM/CPU limits, and auto-cleanup (<code>--rm</code>).</p>
         <div class="field-row">

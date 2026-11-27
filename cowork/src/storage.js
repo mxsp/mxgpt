@@ -25,6 +25,8 @@ const RESEARCH_FILE = path.join(DATA_DIR, 'research-briefs.json');
 const UNDO_FILE = path.join(DATA_DIR, 'file-undo.json');
 const CONTAINER_RUNS_FILE = path.join(DATA_DIR, 'container-runs.json');
 const NOTES_FILE = path.join(DATA_DIR, 'memory-notes.json');
+const USAGE_FILE = path.join(DATA_DIR, 'usage-log.json');
+const PROVIDERS_FILE = path.join(DATA_DIR, 'providers.json');
 
 fs.mkdirSync(CHATS_DIR, { recursive: true });
 fs.mkdirSync(GRAPHS_DIR, { recursive: true });
@@ -47,6 +49,9 @@ const DEFAULT_SETTINGS = {
   fastModel: 'lfm3:latest',
   smartModel: 'inkling-2-mini:latest',
   copilotBModel: 'nemotron-3.5-lightning',
+  agentModel: 'lfm3:latest',
+  graphMapperModel: 'lfm3:latest',
+  customInstructions: '',
   defaultMode: 'copilot', // 'fast' | 'smart' | 'copilot' | 'copilot_b'
   think: 'low', // 'off' | 'low' | 'medium' | 'high'
   workspace: defaultWorkspace(),
@@ -444,6 +449,226 @@ function saveProjectGraphCache(projectId, graph) {
   writeJson(path.join(GRAPHS_DIR, `${projectId}.json`), graph);
 }
 
+// ---- Saved Multi-Provider Profiles (WebUI-style Providers & API Keys)
+function listSavedProviders() {
+  const arr = readJson(PROVIDERS_FILE, []);
+  return Array.isArray(arr) ? arr : [];
+}
+
+function publicProviders() {
+  return listSavedProviders().map((p) => ({
+    ...p,
+    hasApiKey: Boolean(p.apiKey),
+    keyHint: p.apiKey ? `••••${String(p.apiKey).slice(-4)}` : '',
+    apiKey: '',
+    hasPassword: Boolean(p.password),
+    password: '',
+  }));
+}
+
+function saveProviderProfile(prof) {
+  const all = listSavedProviders();
+  const id = prof.id || newId('prov');
+  const existing = all.find((x) => x.id === id);
+  const cur = getSettings();
+  const normUrl = String(prof.endpointUrl || '').trim().replace(/\/+$/, '');
+  const sameActive = !existing && normUrl && normUrl === String(cur.endpointUrl || '').replace(/\/+$/, '') && (prof.endpointType || 'openai') === cur.endpointType;
+  const item = {
+    id,
+    name: String(prof.name || 'Custom Provider').trim(),
+    presetId: String(prof.presetId || 'custom_openai'),
+    endpointType: String(prof.endpointType || 'openai'),
+    endpointUrl: normUrl,
+    username: String(prof.username ?? existing?.username ?? '').trim(),
+    password: prof.password === '__KEEP__' ? (existing?.password || (sameActive ? cur.password : '')) : String(prof.password || ''),
+    apiKey: prof.apiKey === '__KEEP__' ? (existing?.apiKey || (sameActive ? cur.apiKey : '')) : String(prof.apiKey || '').trim(),
+    fastModel: String(prof.fastModel || existing?.fastModel || '').trim(),
+    smartModel: String(prof.smartModel || existing?.smartModel || '').trim(),
+    models: Array.isArray(prof.models) ? prof.models.slice(0, 120) : (existing?.models || []),
+    updatedAt: Date.now(),
+  };
+  const idx = all.findIndex((x) => x.id === id);
+  if (idx >= 0) all[idx] = item;
+  else all.unshift(item);
+  writeJson(PROVIDERS_FILE, all.slice(0, 30));
+  return item;
+}
+
+function deleteProviderProfile(id) {
+  const all = listSavedProviders();
+  const next = all.filter((x) => x.id !== id);
+  writeJson(PROVIDERS_FILE, next);
+  return next.length !== all.length;
+}
+
+function activateProviderProfile(id) {
+  const p = listSavedProviders().find((x) => x.id === id);
+  if (!p) throw new Error('Provider profile not found');
+  const patch = {
+    endpointType: p.endpointType,
+    providerPreset: p.presetId || p.endpointType,
+    endpointUrl: p.endpointUrl,
+    username: p.username || '',
+    password: p.password || '',
+    apiKey: p.apiKey || '',
+    signedIn: true,
+  };
+  if (p.fastModel) {
+    patch.fastModel = p.fastModel;
+    patch.agentModel = p.fastModel;
+    patch.graphMapperModel = p.fastModel;
+  }
+  if (p.smartModel) patch.smartModel = p.smartModel;
+  return saveSettings(patch);
+}
+
+// ---- Token Usage Statistics (exact WebUI analytics model)
+function recordUsage({
+  chatId = '',
+  chatTitle = '',
+  model = '',
+  role = 'main', // 'main' | 'worker' | 'planner' | 'graph'
+  promptTokens = 0,
+  evalTokens = 0,
+  elapsedMs = 0,
+  tokensPerSec = 0,
+} = {}) {
+  const pTok = Math.max(0, Math.round(Number(promptTokens) || 0));
+  const eTok = Math.max(0, Math.round(Number(evalTokens) || 0));
+  const ms = Math.max(0, Math.round(Number(elapsedMs) || 0));
+  const tps = Number(tokensPerSec) || (eTok > 0 && ms > 0 ? Number((eTok / (ms / 1000)).toFixed(1)) : 0);
+  if (!pTok && !eTok && !ms) return null;
+
+  const log = readJson(USAGE_FILE, []);
+  const arr = Array.isArray(log) ? log : [];
+  const now = Date.now();
+  const d = new Date(now);
+  const day = `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`;
+  const entry = {
+    ts: now,
+    day,
+    chatId: String(chatId || ''),
+    chatTitle: String(chatTitle || '').slice(0, 80),
+    model: String(model || 'unknown'),
+    role: String(role || 'main'),
+    promptTokens: pTok,
+    evalTokens: eTok,
+    totalTokens: pTok + eTok,
+    elapsedMs: ms,
+    tokensPerSec: tps,
+  };
+  arr.push(entry);
+  writeJson(USAGE_FILE, arr.slice(-2500));
+  return entry;
+}
+
+function getUsageStats() {
+  const log = readJson(USAGE_FILE, []);
+  const arr = Array.isArray(log) ? log : [];
+  const totals = {
+    requests: 0,
+    promptTokens: 0,
+    evalTokens: 0,
+    subagentTokens: 0,
+    totalTokens: 0,
+    totalMs: 0,
+    avgTokensPerSec: 0,
+  };
+  let tpsSum = 0;
+  let tpsCnt = 0;
+
+  const byDayMap = new Map();
+  const byModelMap = new Map();
+  const byRoleMap = new Map();
+  const byChatMap = new Map();
+
+  for (const e of arr) {
+    const p = Number(e.promptTokens) || 0;
+    const ev = Number(e.evalTokens) || 0;
+    const tot = p + ev;
+    const ms = Number(e.elapsedMs) || 0;
+    const isSub = e.role === 'worker' || e.role === 'graph';
+
+    totals.requests++;
+    totals.promptTokens += p;
+    if (isSub) totals.subagentTokens += ev;
+    else totals.evalTokens += ev;
+    totals.totalTokens += tot;
+    totals.totalMs += ms;
+    if (e.tokensPerSec > 0) { tpsSum += e.tokensPerSec; tpsCnt++; }
+
+    // By day
+    const dk = e.day || 'unknown';
+    const dObj = byDayMap.get(dk) || { day: dk, requests: 0, promptTokens: 0, evalTokens: 0, totalTokens: 0 };
+    dObj.requests++; dObj.promptTokens += p; dObj.evalTokens += ev; dObj.totalTokens += tot;
+    byDayMap.set(dk, dObj);
+
+    // By model
+    const mk = e.model || 'unknown';
+    const mObj = byModelMap.get(mk) || { model: mk, requests: 0, promptTokens: 0, evalTokens: 0, totalTokens: 0, tpsSum: 0, tpsCnt: 0 };
+    mObj.requests++; mObj.promptTokens += p; mObj.evalTokens += ev; mObj.totalTokens += tot;
+    if (e.tokensPerSec > 0) { mObj.tpsSum += e.tokensPerSec; mObj.tpsCnt++; }
+    byModelMap.set(mk, mObj);
+
+    // By role
+    const rk = e.role || 'main';
+    const rObj = byRoleMap.get(rk) || { role: rk, requests: 0, promptTokens: 0, evalTokens: 0, totalTokens: 0, tpsSum: 0, tpsCnt: 0 };
+    rObj.requests++; rObj.promptTokens += p; rObj.evalTokens += ev; rObj.totalTokens += tot;
+    if (e.tokensPerSec > 0) { rObj.tpsSum += e.tokensPerSec; rObj.tpsCnt++; }
+    byRoleMap.set(rk, rObj);
+
+    // By chat
+    if (e.chatId) {
+      const cObj = byChatMap.get(e.chatId) || {
+        id: e.chatId,
+        title: e.chatTitle || 'Chat',
+        model: mk,
+        requests: 0,
+        promptTokens: 0,
+        evalTokens: 0,
+        totalTokens: 0,
+        lastTs: 0,
+      };
+      cObj.requests++; cObj.promptTokens += p; cObj.evalTokens += ev; cObj.totalTokens += tot;
+      if (e.ts >= cObj.lastTs) { cObj.lastTs = e.ts; if (e.chatTitle) cObj.title = e.chatTitle; cObj.model = mk; }
+      byChatMap.set(e.chatId, cObj);
+    }
+  }
+
+  totals.avgTokensPerSec = tpsCnt ? Number((tpsSum / tpsCnt).toFixed(1)) : 0;
+
+  return {
+    totals,
+    byDay: [...byDayMap.values()].sort((a, b) => a.day.localeCompare(b.day)),
+    byModel: [...byModelMap.values()]
+      .map((m) => ({
+        model: m.model,
+        requests: m.requests,
+        promptTokens: m.promptTokens,
+        evalTokens: m.evalTokens,
+        totalTokens: m.totalTokens,
+        avgTokensPerSec: m.tpsCnt ? Number((m.tpsSum / m.tpsCnt).toFixed(1)) : 0,
+      }))
+      .sort((a, b) => b.totalTokens - a.totalTokens),
+    byRole: [...byRoleMap.values()]
+      .map((r) => ({
+        role: r.role,
+        requests: r.requests,
+        promptTokens: r.promptTokens,
+        evalTokens: r.evalTokens,
+        totalTokens: r.totalTokens,
+        avgTokensPerSec: r.tpsCnt ? Number((r.tpsSum / r.tpsCnt).toFixed(1)) : 0,
+      }))
+      .sort((a, b) => b.totalTokens - a.totalTokens),
+    byChat: [...byChatMap.values()].sort((a, b) => b.lastTs - a.lastTs).slice(0, 25),
+  };
+}
+
+function resetUsageStats() {
+  writeJson(USAGE_FILE, []);
+  return { ok: true };
+}
+
 module.exports = {
   DATA_DIR,
   getSettings,
@@ -478,4 +703,12 @@ module.exports = {
   setActiveProject,
   getProjectGraphCache,
   saveProjectGraphCache,
+  listSavedProviders,
+  publicProviders,
+  saveProviderProfile,
+  deleteProviderProfile,
+  activateProviderProfile,
+  recordUsage,
+  getUsageStats,
+  resetUsageStats,
 };

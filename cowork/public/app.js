@@ -45,6 +45,11 @@ const S = {
   projects: [],
   activeProject: null,
   editingProjectId: null,
+  artifacts: new Map(),
+  activeArtifactId: null,
+  artifactTab: 'preview',
+  artifactUserPickedTab: false,
+  savedProviders: [],
 };
 
 function esc(s) {
@@ -93,8 +98,297 @@ function askText({ title, label, value = '', placeholder = '' }) {
   });
 }
 
-// Lightweight safe Markdown renderer (hides raw file-actions / code-run / memory-save JSON blocks)
-function renderMd(raw) {
+// ---- Artifact Extraction & Display Canvas (identical to mx-GPT browser app)
+const ARTIFACT_LANGS = new Set(['html', 'htm', 'svg', 'jsx', 'tsx', 'react', 'mermaid']);
+
+function artifactKindLabel(lang) {
+  const l = String(lang || '').toLowerCase();
+  if (l === 'svg') return 'SVG Graphic';
+  if (l === 'mermaid') return 'Mermaid Diagram';
+  if (l === 'jsx' || l === 'tsx' || l === 'react') return 'React Component';
+  return 'Interactive HTML';
+}
+
+function deriveArtifactTitle(lang, code, explicitTitle = '') {
+  if (explicitTitle && explicitTitle.trim()) return explicitTitle.trim().slice(0, 72);
+  const src = String(code || '');
+  const l = String(lang || '').toLowerCase();
+  const commentTitle = src.match(/(?:<!--\s*title:\s*([^-\n]+?)-->|\/\/\s*title:\s*([^\n]+))/i);
+  if (commentTitle) return (commentTitle[1] || commentTitle[2] || '').trim().slice(0, 72);
+  if (l === 'html' || l === 'htm') {
+    const tm = src.match(/<title[^>]*>([^<]{2,80})<\/title>/i);
+    if (tm) return tm[1].trim();
+    const hm = src.match(/<h[12][^>]*>([^<]{2,80})<\/h[12]>/i);
+    if (hm) return hm[1].trim();
+  }
+  if (l === 'jsx' || l === 'tsx' || l === 'react') {
+    const fm = src.match(/(?:export\s+default\s+)?(?:function|const|class)\s+([A-Z][A-Za-z0-9_]{1,40})/);
+    if (fm) return fm[1];
+  }
+  if (l === 'mermaid') {
+    const mm = src.match(/^\s*(flowchart|graph|sequenceDiagram|classDiagram|stateDiagram(?:-v2)?|erDiagram|gantt|pie|mindmap|timeline)/im);
+    if (mm) return `Diagram (${mm[1]})`;
+  }
+  return artifactKindLabel(l);
+}
+
+function isArtifactCandidate(lang, code, streaming) {
+  const l = String(lang || '').toLowerCase();
+  if (!ARTIFACT_LANGS.has(l)) return false;
+  const trimmed = String(code || '').trim();
+  if (l === 'html' || l === 'htm') {
+    if (!trimmed.includes('<')) return false;
+    return streaming ? trimmed.length >= 20 : trimmed.length >= 40;
+  }
+  return streaming ? trimmed.length >= 12 : trimmed.length >= 20;
+}
+
+function extractArtifactsFromText(raw, keyPrefix = 'msg', isStreaming = false) {
+  const src = String(raw || '');
+  const list = [];
+  const closedRe = /```([a-z0-9_-]+)([^\n]*)\r?\n([\s\S]*?)```/gi;
+  let m;
+  let idx = 0;
+  let lastIndex = 0;
+
+  while ((m = closedRe.exec(src)) !== null) {
+    lastIndex = closedRe.lastIndex;
+    const lang = (m[1] || '').toLowerCase();
+    const info = (m[2] || '').trim();
+    const code = (m[3] || '').trimEnd();
+    if (!isArtifactCandidate(lang, code, false)) continue;
+    const titleMatch = info.match(/title=["']([^"']+)["']/i);
+    const id = `${keyPrefix}_art_${idx++}`;
+    list.push({
+      id,
+      lang,
+      title: deriveArtifactTitle(lang, code, titleMatch?.[1] || ''),
+      code,
+      streaming: false,
+      start: m.index,
+      end: closedRe.lastIndex,
+    });
+  }
+
+  // Also detect an in-progress (unclosed) artifact fence while streaming
+  if (isStreaming) {
+    const tail = src.slice(lastIndex);
+    const openRe = /```([a-z0-9_-]+)([^\n]*)\r?\n([\s\S]*)$/i;
+    const om = tail.match(openRe);
+    if (om) {
+      const lang = (om[1] || '').toLowerCase();
+      const info = (om[2] || '').trim();
+      const code = om[3] || '';
+      if (ARTIFACT_LANGS.has(lang) && isArtifactCandidate(lang, code, true)) {
+        const titleMatch = info.match(/title=["']([^"']+)["']/i);
+        const id = `${keyPrefix}_art_${idx++}`;
+        list.push({
+          id,
+          lang,
+          title: deriveArtifactTitle(lang, code, titleMatch?.[1] || ''),
+          code,
+          streaming: true,
+          start: lastIndex + om.index,
+          end: src.length,
+        });
+      }
+    }
+  }
+  return list;
+}
+
+function renderArtifactCardHtml(art) {
+  const lines = (art.code || '').split('\n').length;
+  const active = S.panelOpen && S.panelTab === 'artifact' && S.activeArtifactId === art.id;
+  const meta = art.streaming
+    ? `Building ${artifactKindLabel(art.lang)} · ${lines} lines…`
+    : `${artifactKindLabel(art.lang)} · ${lines} lines · click to open`;
+  const cta = art.streaming ? 'Live' : (active ? 'Open' : 'Preview');
+  return `<button type="button" class="art-card${art.streaming ? ' building' : ''}" data-art-id="${esc(art.id)}">
+    <span class="art-icon"><svg><use href="#i-code"/></svg></span>
+    <span class="art-info">
+      <span class="art-title">${esc(art.title)}</span>
+      <span class="art-meta">${esc(meta)}</span>
+    </span>
+    <span class="art-open">${esc(cta)}</span>
+  </button>`;
+}
+
+function buildArtifactHtml(art) {
+  if (!art) return '';
+  const lang = String(art.lang || 'html').toLowerCase();
+  const code = String(art.code || '');
+  const dark = document.documentElement.dataset.theme === 'dark';
+
+  if (lang === 'html' || lang === 'htm') {
+    if (/<!doctype|<html[\s>]/i.test(code)) return code;
+    return `<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<style>
+  *, *::before, *::after { box-sizing: border-box; }
+  body { margin: 0; padding: 20px; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; color: #1a1917; background: #ffffff; line-height: 1.5; }
+</style>
+</head>
+<body>${code}</body>
+</html>`;
+  }
+
+  if (lang === 'svg') {
+    return `<!doctype html>
+<html>
+<head><meta charset="utf-8" /><style>
+  html, body { margin: 0; width: 100%; height: 100%; display: grid; place-items: center; background: ${dark ? '#1c1b19' : '#faf9f5'}; overflow: auto; padding: 16px; box-sizing: border-box; }
+  svg { max-width: 100%; max-height: 100%; height: auto; }
+</style></head>
+<body>${code}</body>
+</html>`;
+  }
+
+  if (lang === 'mermaid') {
+    const safeSrc = code.replace(/<\/script>/gi, '<\\/script>');
+    return `<!doctype html>
+<html>
+<head><meta charset="utf-8" /><style>
+  html, body { margin: 0; min-height: 100%; display: grid; place-items: center; background: ${dark ? '#1c1b19' : '#ffffff'}; color: ${dark ? '#f2f0e9' : '#1c1b19'}; font-family: system-ui, sans-serif; padding: 20px; box-sizing: border-box; }
+  #diagram { max-width: 100%; }
+  #fallback { display: none; white-space: pre-wrap; font-family: monospace; font-size: 12px; padding: 14px; border-radius: 10px; background: rgba(128,128,128,.12); max-width: 92vw; overflow: auto; }
+</style></head>
+<body>
+<div id="diagram"></div>
+<pre id="fallback"></pre>
+<script type="module">
+  const src = ${JSON.stringify(safeSrc)};
+  const fb = document.getElementById('fallback');
+  try {
+    const mod = await import('https://cdn.jsdelivr.net/npm/mermaid@11/dist/mermaid.esm.min.mjs');
+    const mermaid = mod.default;
+    mermaid.initialize({ startOnLoad: false, theme: ${JSON.stringify(dark ? 'dark' : 'default')}, securityLevel: 'loose' });
+    const { svg } = await mermaid.render('mxgpt_mmd', src);
+    document.getElementById('diagram').innerHTML = svg;
+  } catch (err) {
+    fb.style.display = 'block';
+    fb.textContent = 'Mermaid preview note: ' + (err?.message || err) + '\\n\\n' + src;
+  }
+</script>
+</body>
+</html>`;
+  }
+
+  // React / JSX / TSX
+  const transformed = code
+    .replace(/import\s+[\s\S]*?from\s+['"][^'"]+['"]\s*;?/g, '')
+    .replace(/export\s+default\s+function\s+([A-Za-z0-9_]+)/, 'function $1')
+    .replace(/export\s+default\s+class\s+([A-Za-z0-9_]+)/, 'class $1')
+    .replace(/export\s+default\s+/, 'const __DefaultExport = ');
+  const fnMatch = code.match(/export\s+default\s+(?:function|class)\s+([A-Za-z0-9_]+)/)
+    || code.match(/(?:function|const|class)\s+(App|Component|Dashboard|Chart|Demo|Main)\b/);
+  const mountName = fnMatch ? fnMatch[1] : '__DefaultExport';
+  const safeJsx = transformed.replace(/<\/script>/gi, '<\\/script>');
+  return `<!doctype html>
+<html>
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<script src="https://unpkg.com/react@18/umd/react.production.min.js" crossorigin></script>
+<script src="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js" crossorigin></script>
+<script src="https://unpkg.com/@babel/standalone/babel.min.js" crossorigin></script>
+<style>
+  *, *::before, *::after { box-sizing: border-box; }
+  body { margin: 0; padding: 18px; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; background: #ffffff; color: #1a1917; }
+  #err { display: none; margin: 12px; padding: 12px; border-radius: 8px; background: #fef2f2; color: #b91c1c; font-family: monospace; font-size: 12px; white-space: pre-wrap; }
+</style>
+</head>
+<body>
+<div id="root"></div>
+<pre id="err"></pre>
+<script>
+  window.onerror = function(msg) {
+    var e = document.getElementById('err');
+    e.style.display = 'block';
+    e.textContent = String(msg);
+  };
+</script>
+<script type="text/babel" data-presets="react,typescript">
+  const { useState, useEffect, useMemo, useRef, useCallback, useReducer, Fragment } = React;
+  try {
+    ${safeJsx}
+    const Target = typeof ${mountName} !== 'undefined' ? ${mountName} : (typeof App !== 'undefined' ? App : null);
+    if (Target) {
+      ReactDOM.createRoot(document.getElementById('root')).render(React.createElement(Target));
+    } else {
+      throw new Error('Could not find default React component (export default function App() { ... })');
+    }
+  } catch (err) {
+    const e = document.getElementById('err');
+    e.style.display = 'block';
+    e.textContent = err && err.stack ? err.stack : String(err);
+  }
+</script>
+</body>
+</html>`;
+}
+
+function renderArtifactPane() {
+  const art = S.activeArtifactId ? S.artifacts.get(S.activeArtifactId) : null;
+  const empty = $('#artEmpty');
+  const frame = $('#artFrame');
+  const codeWrap = $('#artCodeWrap');
+  const codeEl = $('#artCodeEl');
+  const metaRight = $('#artMetaRight');
+
+  $$('#artTabs button').forEach((b) => b.classList.toggle('active', b.dataset.arttab === S.artifactTab));
+
+  if (!art) {
+    empty.hidden = false;
+    frame.hidden = true;
+    codeWrap.hidden = true;
+    metaRight.innerHTML = '';
+    if (S.panelTab === 'artifact') $('#panelTitle').textContent = 'Artifact';
+    return;
+  }
+
+  empty.hidden = true;
+  if (S.panelTab === 'artifact') $('#panelTitle').textContent = art.title || 'Artifact';
+  const lineCount = (art.code || '').split('\n').length;
+  metaRight.innerHTML = art.streaming
+    ? `<span class="art-live-pill"><i></i>Building · ${lineCount} lines</span>`
+    : `<span>${esc(art.lang.toUpperCase())} · ${lineCount} lines</span>`;
+
+  if (S.artifactTab === 'code' || art.streaming) {
+    frame.hidden = true;
+    codeWrap.hidden = false;
+    const stick = isNearBottom(codeWrap, 90);
+    codeEl.textContent = art.code || '';
+    if (art.streaming && stick) codeWrap.scrollTop = codeWrap.scrollHeight;
+  } else {
+    codeWrap.hidden = true;
+    frame.hidden = false;
+    const doc = buildArtifactHtml(art);
+    if (frame.dataset.renderedId !== art.id || frame.dataset.renderedLen !== String(art.code.length)) {
+      frame.dataset.renderedId = art.id;
+      frame.dataset.renderedLen = String(art.code.length);
+      frame.srcdoc = doc;
+    }
+  }
+}
+
+function openArtifact(art, preferredTab = null, { isAuto = false } = {}) {
+  if (!art) return;
+  S.artifacts.set(art.id, art);
+  S.activeArtifactId = art.id;
+  if (preferredTab) S.artifactTab = preferredTab;
+  else S.artifactTab = art.streaming ? 'code' : 'preview';
+  if (!isAuto) S.artifactUserPickedTab = false;
+  openPanel('artifact', false);
+  renderArtifactPane();
+}
+
+// Lightweight safe Markdown renderer (hides raw tool JSON blocks & replaces Artifact blocks with live cards)
+function renderMd(raw, opts = {}) {
+  const { msgKey = '', isStreaming = false } = opts;
   let src = String(raw || '')
     .replace(/```email-draft[\s\S]*?```/gi, '')
     .replace(/```file-actions[\s\S]*?```/gi, '')
@@ -104,7 +398,21 @@ function renderMd(raw) {
   if (!src) return '';
 
   const blocks = [];
-  src = src.replace(/```([a-z0-9_-]*)\n([\s\S]*?)```/gi, (_, lang, code) => {
+  if (msgKey) {
+    const arts = extractArtifactsFromText(src, msgKey, isStreaming);
+    if (arts.length) {
+      // Replace from back to front so offsets stay exact
+      for (let i = arts.length - 1; i >= 0; i--) {
+        const art = arts[i];
+        S.artifacts.set(art.id, art);
+        const idx = blocks.length;
+        blocks.push(renderArtifactCardHtml(art));
+        src = src.slice(0, art.start) + `\n\x00BLK${idx}\x00\n` + src.slice(art.end);
+      }
+    }
+  }
+
+  src = src.replace(/```([a-z0-9_-]*)[^\n]*\n([\s\S]*?)```/gi, (_, lang, code) => {
     const idx = blocks.length;
     blocks.push(`<pre><code class="lang-${esc(lang)}">${esc(code.trimEnd())}</code></pre>`);
     return `\x00BLK${idx}\x00`;
@@ -168,12 +476,13 @@ function updateGreeting() {
 
 function modeHintText(m) {
   const fast = (S.settings?.fastModel || 'lfm3:latest').replace(/:latest$/, '');
+  const agent = (S.settings?.agentModel || S.settings?.fastModel || 'lfm3:latest').replace(/:latest$/, '');
   const smart = (S.settings?.smartModel || 'inkling-2-mini:latest').replace(/:latest$/, '');
   const copB = (S.settings?.copilotBModel || 'nemotron-3.5-lightning').replace(/:latest$/, '');
   if (m === 'fast') return `Fast: ${fast} direct`;
   if (m === 'smart') return `Smart: ${smart} direct`;
-  if (m === 'copilot_b') return `Copilot (B): ${copB} orchestrates · ${fast} & local tools`;
-  return `Copilot: ${smart} orchestrates · ${fast} & local tools`;
+  if (m === 'copilot_b') return `Copilot (B): ${copB} orchestrates · ${agent} workers & local tools`;
+  return `Copilot: ${smart} orchestrates · ${agent} workers & local tools`;
 }
 
 function setMode(m) {
@@ -208,6 +517,7 @@ async function toggleTheme() {
 
 // ---- Right Slide-Out Panel (identical to mx-GPT webapp)
 const PANEL_META = {
+  artifact: { title: 'Artifact', icon: '#i-code' },
   files: { title: 'OS Files & Editor', icon: '#i-folder' },
   graph: { title: 'Project Knowledge Graph', icon: '#i-graph' },
   container: { title: 'Container Sandbox', icon: '#i-box' },
@@ -238,6 +548,7 @@ function openPanel(tab, toggleIfSame = false) {
   });
   $$('.pane').forEach((p) => p.classList.toggle('active', p.dataset.pane === tab));
 
+  if (tab === 'artifact') renderArtifactPane();
   if (tab === 'files' && !S.editor) loadFiles(S.cwd);
   if (tab === 'graph') ensureGraphLoaded();
   if (tab === 'container') { loadContainerStatus(false); loadContainerHistory(); }
@@ -353,7 +664,7 @@ async function boot() {
   S.projects = projData?.projects || [];
   S.activeProject = projData?.activeProject || null;
 
-  $('#appVersionBadge').textContent = `v${info.version || '1.4.0'}`;
+  $('#appVersionBadge').textContent = `v${info.version || '1.5.0'}`;
   applyThemeUI(S.settings.theme || 'light');
   setMode(S.settings.defaultMode || 'copilot');
   setThink(S.settings.think || 'low');
@@ -975,7 +1286,9 @@ function renderMessages(forceScroll = true) {
   $('#welcome').classList.toggle('hidden', S.messages.length > 0);
   wrap.innerHTML = '';
 
-  for (const m of S.messages) {
+  for (let mi = 0; mi < S.messages.length; mi++) {
+    const m = S.messages[mi];
+    const msgKey = m.id || `m_${mi}`;
     const el = document.createElement('div');
     el.className = `msg ${m.role}`;
     if (m.role === 'user') {
@@ -1012,7 +1325,7 @@ function renderMessages(forceScroll = true) {
     if (m.content) {
       const pr = document.createElement('div');
       pr.className = 'prose';
-      pr.innerHTML = renderMd(m.content);
+      pr.innerHTML = renderMd(m.content, { msgKey, isStreaming: Boolean(m.streaming) });
       body.appendChild(pr);
     }
 
@@ -1192,13 +1505,47 @@ async function sendPrompt(overrideText = null) {
   $('#sendIcon use').setAttribute('href', '#i-stop');
 
   let proseTimer = null;
+  let autoOpenedArtId = null;
+  const completedArtIds = new Set();
+
+  const syncLiveArtifacts = (isStillStreaming) => {
+    const msgKey = isStillStreaming ? streamId : (assistant.id || streamId);
+    const arts = extractArtifactsFromText(assistant.content, msgKey, isStillStreaming);
+    if (!arts.length) return;
+    for (const a of arts) S.artifacts.set(a.id, a);
+    const latest = arts[arts.length - 1];
+
+    if (latest.streaming) {
+      if (autoOpenedArtId !== latest.id) {
+        autoOpenedArtId = latest.id;
+        S.artifactUserPickedTab = false;
+        openArtifact(latest, 'code', { isAuto: true });
+      } else if (S.panelOpen && S.panelTab === 'artifact' && S.activeArtifactId === latest.id) {
+        renderArtifactPane();
+      }
+    } else if (!completedArtIds.has(latest.id)) {
+      completedArtIds.add(latest.id);
+      const wasStreamingThis = Boolean(autoOpenedArtId);
+      autoOpenedArtId = latest.id;
+      if (wasStreamingThis) {
+        S.activeArtifactId = latest.id;
+        if (!S.artifactUserPickedTab) S.artifactTab = 'preview';
+        openPanel('artifact', false);
+        renderArtifactPane();
+      } else {
+        openArtifact(latest, 'preview', { isAuto: true });
+      }
+    }
+  };
+
   const flushProse = () => {
     proseTimer = null;
     if (!assistant.content) return;
     const sc = $('#scrollArea');
     const stick = isNearBottom(sc, 110);
     live.proseEl.hidden = false;
-    live.proseEl.innerHTML = renderMd(assistant.content);
+    live.proseEl.innerHTML = renderMd(assistant.content, { msgKey: streamId, isStreaming: true });
+    syncLiveArtifacts(true);
     if (stick) sc.scrollTop = sc.scrollHeight;
   };
   const scheduleProse = () => {
@@ -1301,6 +1648,7 @@ async function sendPrompt(overrideText = null) {
       if (thinkTimer) { clearTimeout(thinkTimer); thinkTimer = null; }
       Object.assign(assistant, d.message || {}, { streaming: false, livePhase: '' });
       renderMessages(false);
+      syncLiveArtifacts(false);
       loadChats();
     } else if (ev === 'error') {
       assistant.livePhase = '';
@@ -2071,6 +2419,12 @@ function renderFetchedModels(models) {
       } else if (S.assignModelTarget === 'copilot_b') {
         $('#setCopilotBModel').value = m.name;
         toast(`Copilot (B) model → ${m.name}`);
+      } else if (S.assignModelTarget === 'agent') {
+        $('#setAgentModel').value = m.name;
+        toast(`Subagent / Worker model → ${m.name}`);
+      } else if (S.assignModelTarget === 'graph') {
+        $('#setGraphMapperModel').value = m.name;
+        toast(`Graph Mapper model → ${m.name}`);
       } else {
         $('#setFastModel').value = m.name;
         toast(`Fast model → ${m.name}`);
@@ -2080,14 +2434,283 @@ function renderFetchedModels(models) {
   }
 }
 
+// ---- Saved Provider Profiles (WebUI-aligned)
+async function loadSavedProviders() {
+  const list = $('#savedProvidersList');
+  if (!list) return;
+  try {
+    const d = await CW.listProviders();
+    S.savedProviders = d.providers || [];
+    list.innerHTML = '';
+    if (!S.savedProviders.length) {
+      list.innerHTML = '<div class="muted-note">No saved provider profiles yet. Configure an endpoint above and click "+ Save as Reusable Provider Profile" to switch between providers in 1 click.</div>';
+      return;
+    }
+    const curUrl = (S.settings?.endpointUrl || '').replace(/\/+$/, '');
+    const curType = S.settings?.endpointType || 'mxgpt';
+
+    for (const p of S.savedProviders) {
+      const isActive = curType === p.endpointType && curUrl === (p.endpointUrl || '').replace(/\/+$/, '');
+      const card = document.createElement('div');
+      card.className = 'provider-card';
+      const badges = [
+        `<span class="badge-pill">${esc(p.endpointType)}</span>`,
+        isActive ? '<span class="badge-pill hot">Active</span>' : '',
+        (p.hasApiKey || p.hasPassword) ? '<span class="badge-pill ok">Credentials saved</span>' : '',
+        p.models?.length ? `<span class="badge-pill">${p.models.length} models</span>` : '',
+      ].filter(Boolean).join(' ');
+
+      card.innerHTML = `
+        <div class="pc-top">
+          <div class="pc-name"><b>${esc(p.name)}</b> ${badges}</div>
+        </div>
+        <div class="pc-url">${esc(p.endpointUrl)}${p.fastModel || p.smartModel ? ` · ${esc([p.fastModel, p.smartModel].filter(Boolean).join(' / '))}` : ''}</div>
+        <div class="pc-actions">
+          ${isActive ? '' : '<button type="button" class="btn tiny primary" data-pact="activate">Activate</button>'}
+          <button type="button" class="btn tiny" data-pact="refresh">Fetch Models</button>
+          <button type="button" class="btn tiny" data-pact="load">Load into Form</button>
+          <button type="button" class="btn tiny danger" data-pact="delete">Remove</button>
+        </div>`;
+
+      const actBtn = card.querySelector('[data-pact="activate"]');
+      if (actBtn) {
+        actBtn.onclick = async () => {
+          actBtn.disabled = true;
+          try {
+            const r = await CW.activateProvider(p.id);
+            S.settings = r.settings;
+            openSettings('providers');
+            renderAccountUI();
+            checkConnectionQuiet();
+            toast(`Switched active provider → ${p.name}`);
+          } catch (e) { toast(e.message, 4000); }
+        };
+      }
+      card.querySelector('[data-pact="refresh"]').onclick = async (e) => {
+        const b = e.currentTarget;
+        b.disabled = true;
+        b.textContent = 'Fetching…';
+        try {
+          const r = await CW.refreshProvider(p.id);
+          renderFetchedModels(r.models);
+          toast(`${p.name}: ${r.found} models (${r.latencyMs}ms)`);
+          loadSavedProviders();
+        } catch (err) {
+          toast(`Fetch failed: ${err.message}`, 4000);
+          b.disabled = false;
+          b.textContent = 'Fetch Models';
+        }
+      };
+      card.querySelector('[data-pact="load"]').onclick = () => {
+        S.selectedPreset = p.presetId || p.endpointType;
+        $('#setEndpointType').value = p.endpointType;
+        $('#setEndpointUrl').value = p.endpointUrl;
+        $('#setUsername').value = p.username || '';
+        $('#setPassword').value = '';
+        $('#setApiKey').value = '';
+        if (p.fastModel) $('#setFastModel').value = p.fastModel;
+        if (p.smartModel) $('#setSmartModel').value = p.smartModel;
+        syncProviderAuthUI(p.endpointType);
+        renderProviderChips();
+        toast(`Loaded "${p.name}" into form`);
+      };
+      card.querySelector('[data-pact="delete"]').onclick = async () => {
+        await CW.deleteProvider(p.id);
+        loadSavedProviders();
+        toast(`Removed profile "${p.name}"`);
+      };
+      list.appendChild(card);
+    }
+  } catch (e) {
+    list.innerHTML = `<div class="muted-note">Could not load saved providers: ${esc(e.message)}</div>`;
+  }
+}
+
+// ---- Token Usage Statistics Dashboard (WebUI-identical)
+function fmtTok(n) {
+  const v = Number(n) || 0;
+  if (v >= 1_000_000) return (v / 1_000_000).toFixed(2) + 'M';
+  if (v >= 10_000) return (v / 1_000).toFixed(1) + 'k';
+  return v.toLocaleString();
+}
+
+function roleDisplayName(role) {
+  if (role === 'main') return 'Main / Copilot';
+  if (role === 'worker') return 'Subagent Worker';
+  if (role === 'graph') return 'Graph Mapper';
+  if (role === 'planner') return 'Planner';
+  return role || 'Main';
+}
+
+async function renderUsagePanel() {
+  const root = $('#usagePanelRoot');
+  if (!root) return;
+  root.innerHTML = '<div class="muted-note">Loading token usage statistics…</div>';
+  try {
+    const u = await CW.getUsage();
+    const t = u?.totals || { requests: 0, promptTokens: 0, evalTokens: 0, subagentTokens: 0, totalTokens: 0, totalMs: 0, avgTokensPerSec: 0 };
+
+    // Build last 14 calendar days
+    const dayMap = new Map((u.byDay || []).map((d) => [d.day, d]));
+    const days = [];
+    const now = new Date();
+    for (let i = 13; i >= 0; i--) {
+      const dt = new Date(now.getFullYear(), now.getMonth(), now.getDate() - i);
+      const key = `${dt.getFullYear()}-${String(dt.getMonth() + 1).padStart(2, '0')}-${String(dt.getDate()).padStart(2, '0')}`;
+      const rec = dayMap.get(key) || { day: key, requests: 0, totalTokens: 0 };
+      days.push({ ...rec, label: `${dt.getMonth() + 1}/${dt.getDate()}` });
+    }
+    const maxDay = Math.max(1, ...days.map((d) => d.totalTokens));
+
+    const barsHtml = days.map((d) => {
+      const pct = d.totalTokens > 0 ? Math.max(4, Math.round((d.totalTokens / maxDay) * 100)) : 2;
+      const tip = `${d.day}: ${d.totalTokens.toLocaleString()} tokens (${d.requests} req)`;
+      return `<div class="usage-bar" title="${esc(tip)}">
+        <div class="usage-bar-fill" style="height:${pct}%;${d.totalTokens === 0 ? 'opacity:.16' : ''}"></div>
+        <span>${esc(d.label)}</span>
+      </div>`;
+    }).join('');
+
+    const modelRows = (u.byModel || []).length
+      ? u.byModel.map((m) => `<tr>
+          <td class="m" title="${esc(m.model)}">${esc(m.model)}</td>
+          <td class="num">${m.requests}</td>
+          <td class="num">${fmtTok(m.promptTokens)}</td>
+          <td class="num">${fmtTok(m.evalTokens)}</td>
+          <td class="num"><b>${fmtTok(m.totalTokens)}</b></td>
+          <td class="num">${m.avgTokensPerSec ? m.avgTokensPerSec + ' t/s' : '—'}</td>
+        </tr>`).join('')
+      : '<tr><td colspan="6" style="color:var(--muted);text-align:center;padding:12px">No model usage recorded yet. Send a prompt to start tracking tokens.</td></tr>';
+
+    const roleRows = (u.byRole || []).length
+      ? u.byRole.map((r) => `<tr>
+          <td>${esc(roleDisplayName(r.role))}</td>
+          <td class="num">${r.requests}</td>
+          <td class="num">${fmtTok(r.promptTokens)}</td>
+          <td class="num">${fmtTok(r.evalTokens)}</td>
+          <td class="num"><b>${fmtTok(r.totalTokens)}</b></td>
+          <td class="num">${r.avgTokensPerSec ? r.avgTokensPerSec + ' t/s' : '—'}</td>
+        </tr>`).join('')
+      : '<tr><td colspan="6" style="color:var(--muted);text-align:center;padding:10px">No role breakdown yet.</td></tr>';
+
+    const chatRows = (u.byChat || []).length
+      ? u.byChat.map((c) => `<tr class="usage-chat-row" data-usage-chat="${esc(c.id)}">
+          <td class="m" title="${esc(c.title)}">${esc(c.title)}</td>
+          <td class="m">${esc((c.model || '').replace(/:latest$/, ''))}</td>
+          <td class="num">${c.requests}</td>
+          <td class="num"><b>${fmtTok(c.totalTokens)}</b></td>
+        </tr>`).join('')
+      : '<tr><td colspan="4" style="color:var(--muted);text-align:center;padding:10px">No per-chat usage recorded yet.</td></tr>';
+
+    root.innerHTML = `
+      <div class="pane-head-row" style="margin-bottom:10px">
+        <span class="muted-note" style="margin:0">Local token &amp; speed telemetry across main turns, subagent workers, and Fast graph mapping.</span>
+        <div class="row-gap">
+          <button type="button" class="btn tiny" id="usageRefreshBtn">Refresh</button>
+          <button type="button" class="btn tiny danger" id="usageResetBtn">Reset Stats</button>
+        </div>
+      </div>
+
+      <div class="usage-cards">
+        <div class="usage-card">
+          <span>Total Tokens</span>
+          <b>${fmtTok(t.totalTokens)}</b>
+          <small>${fmtTok(t.promptTokens)} in · ${fmtTok(t.evalTokens + t.subagentTokens)} out</small>
+        </div>
+        <div class="usage-card">
+          <span>Requests</span>
+          <b>${t.requests.toLocaleString()}</b>
+          <small>${t.avgTokensPerSec ? t.avgTokensPerSec + ' t/s avg' : 'No speed data yet'}</small>
+        </div>
+        <div class="usage-card">
+          <span>Main Output</span>
+          <b>${fmtTok(t.evalTokens)}</b>
+          <small>Direct &amp; Copilot answers</small>
+        </div>
+        <div class="usage-card">
+          <span>Workers &amp; Graph</span>
+          <b>${fmtTok(t.subagentTokens)}</b>
+          <small>Subagents &amp; Fast mapper</small>
+        </div>
+      </div>
+
+      <div class="usage-sec">
+        <h3><span>Last 14 Days</span><span style="font-weight:400;font-size:11px;color:var(--muted)">Tokens per day</span></h3>
+        <div class="usage-bars">${barsHtml}</div>
+      </div>
+
+      <div class="usage-sec">
+        <h3>By Model</h3>
+        <table class="usage-table">
+          <thead><tr><th>Model</th><th class="num">Reqs</th><th class="num">Prompt</th><th class="num">Output</th><th class="num">Total</th><th class="num">Speed</th></tr></thead>
+          <tbody>${modelRows}</tbody>
+        </table>
+      </div>
+
+      <div class="usage-sec">
+        <h3>By Agent Role</h3>
+        <table class="usage-table">
+          <thead><tr><th>Role</th><th class="num">Reqs</th><th class="num">Prompt</th><th class="num">Output</th><th class="num">Total</th><th class="num">Speed</th></tr></thead>
+          <tbody>${roleRows}</tbody>
+        </table>
+      </div>
+
+      <div class="usage-sec" style="margin-bottom:0">
+        <h3><span>Recent Chats</span><span style="font-weight:400;font-size:11px;color:var(--muted)">Click a chat to open</span></h3>
+        <table class="usage-table">
+          <thead><tr><th>Chat</th><th>Last Model</th><th class="num">Reqs</th><th class="num">Total Tokens</th></tr></thead>
+          <tbody>${chatRows}</tbody>
+        </table>
+      </div>`;
+
+    $('#usageRefreshBtn', root).onclick = () => renderUsagePanel();
+    const resetBtn = $('#usageResetBtn', root);
+    let armed = false;
+    resetBtn.onclick = async () => {
+      if (!armed) {
+        armed = true;
+        resetBtn.textContent = 'Confirm Reset?';
+        setTimeout(() => { if (armed) { armed = false; resetBtn.textContent = 'Reset Stats'; } }, 4000);
+        return;
+      }
+      await CW.resetUsage();
+      toast('Token usage statistics cleared');
+      renderUsagePanel();
+    };
+    $$('[data-usage-chat]', root).forEach((row) => {
+      row.onclick = () => {
+        const cid = row.dataset.usageChat;
+        if (!cid) return;
+        $('#settingsModal').hidden = true;
+        openChat(cid);
+      };
+    });
+  } catch (e) {
+    root.innerHTML = `<div class="muted-note">Failed to load usage stats: ${esc(e.message)}</div>`;
+  }
+}
+
 function setSettingsTab(tab) {
   $$('#settingsTabs button').forEach((b) => b.classList.toggle('active', b.dataset.stab === tab));
   $$('.stab-pane').forEach((p) => p.classList.toggle('active', p.dataset.spane === tab));
+  if (tab === 'providers') loadSavedProviders();
+  if (tab === 'usage') renderUsagePanel();
 }
 
-function openSettings(initialTab = 'providers') {
+function openSettings(initialTab = 'models') {
+  const tab = typeof initialTab === 'string' ? initialTab : 'models';
   const s = S.settings || {};
   S.selectedPreset = s.providerPreset || s.endpointType || 'mxgpt';
+  // Tab 1: Models & Agent Role Routing
+  $('#setFastModel').value = s.fastModel || 'lfm3:latest';
+  $('#setSmartModel').value = s.smartModel || 'inkling-2-mini:latest';
+  $('#setCopilotBModel').value = s.copilotBModel || 'nemotron-3.5-lightning';
+  $('#setAgentModel').value = s.agentModel || s.fastModel || 'lfm3:latest';
+  $('#setGraphMapperModel').value = s.graphMapperModel || s.fastModel || 'lfm3:latest';
+  $('#setDefaultMode').value = s.defaultMode || 'copilot';
+  $('#setDefaultThink').value = s.think || 'low';
+  $('#setCustomInstr').value = s.customInstructions || '';
+  // Tab 2: Providers & API Keys
   $('#setEndpointType').value = s.endpointType || 'mxgpt';
   $('#setEndpointUrl').value = s.endpointUrl || 'https://max.fyreflysystems.de';
   $('#setUsername').value = s.username || '';
@@ -2095,10 +2718,7 @@ function openSettings(initialTab = 'providers') {
   $('#setPassword').placeholder = s.hasPassword ? '•••••••• (saved — leave blank to keep)' : 'Enter password';
   $('#setApiKey').value = '';
   $('#setApiKey').placeholder = s.hasApiKey ? '•••••••• (saved — leave blank to keep)' : 'sk-... (stored locally)';
-  $('#setFastModel').value = s.fastModel || 'lfm3:latest';
-  $('#setSmartModel').value = s.smartModel || 'inkling-2-mini:latest';
-  $('#setCopilotBModel').value = s.copilotBModel || 'nemotron-3.5-lightning';
-  // Tools tab
+  // Tab 4: Tools
   $('#setToolWeb').checked = s.toolWebSearch !== false;
   $('#setToolOsFiles').checked = s.toolOsFiles !== false;
   $('#setToolContainer').checked = s.toolContainer !== false && s.containerEnabled !== false;
@@ -2112,7 +2732,7 @@ function openSettings(initialTab = 'providers') {
   $('#setWebFetchPages').checked = s.toolWebFetchPages !== false;
   $('#setWorkspace').value = s.workspace || '';
   $('#setAutoApprove').checked = !!s.autoApproveFileActions;
-  // Container tab
+  // Tab 5: Container
   $('#setContainerRuntime').value = s.containerRuntime || 'auto';
   $('#setContainerImage').value = s.containerImage || 'python:3.12-slim';
   $('#setContainerNet').value = s.containerNetwork || 'none';
@@ -2124,7 +2744,7 @@ function openSettings(initialTab = 'providers') {
   $('#fetchedModelsWrap').hidden = true;
   $('#testOut').hidden = true;
   selectProviderPreset(S.selectedPreset, false);
-  setSettingsTab(initialTab);
+  setSettingsTab(tab);
   $('#settingsModal').hidden = false;
 }
 
@@ -2132,6 +2752,7 @@ function collectSettingsForm() {
   const pw = $('#setPassword').value;
   const key = $('#setApiKey').value.trim();
   const containerOn = $('#setToolContainer').checked;
+  const fastModel = $('#setFastModel').value.trim() || 'lfm3:latest';
   return {
     endpointType: $('#setEndpointType').value,
     providerPreset: S.selectedPreset || $('#setEndpointType').value,
@@ -2139,9 +2760,14 @@ function collectSettingsForm() {
     username: $('#setUsername').value.trim(),
     password: pw ? pw : '__KEEP__',
     apiKey: key ? key : '__KEEP__',
-    fastModel: $('#setFastModel').value.trim() || 'lfm3:latest',
+    fastModel,
     smartModel: $('#setSmartModel').value.trim() || 'inkling-2-mini:latest',
     copilotBModel: $('#setCopilotBModel').value.trim() || 'nemotron-3.5-lightning',
+    agentModel: $('#setAgentModel').value.trim() || fastModel,
+    graphMapperModel: $('#setGraphMapperModel').value.trim() || fastModel,
+    defaultMode: $('#setDefaultMode').value || 'copilot',
+    think: $('#setDefaultThink').value || 'low',
+    customInstructions: $('#setCustomInstr').value.trim(),
     toolWebSearch: $('#setToolWeb').checked,
     toolWebFetchPages: $('#setWebFetchPages').checked,
     toolWebMaxResults: Math.max(2, Math.min(10, Number($('#setWebMaxResults').value) || 5)),
@@ -2338,8 +2964,8 @@ $('#expandBtn').onclick = () => { $('#sidebar').classList.remove('collapsed'); $
 $('#newChatBtn').onclick = newChat;
 $('#chatSearch').oninput = (e) => { S.chatSearch = e.target.value; renderChatList(); };
 $('#themeBtn').onclick = toggleTheme;
-$('#openSettingsBtn').onclick = openSettings;
-$('#footProviderBtn').onclick = openSettings;
+$('#openSettingsBtn').onclick = () => openSettings('models');
+$('#footProviderBtn').onclick = () => openSettings('providers');
 $('#footLoginBtn').onclick = showLoginScreen;
 $('#logoutBtn').onclick = doLogout;
 $('#settingsLogoutBtn').onclick = doLogout;
@@ -2708,15 +3334,103 @@ $('#resSearchBtn').onclick = quickResearch;
 $('#resSearchInput').addEventListener('keydown', (e) => { if (e.key === 'Enter') quickResearch(); });
 $('#refreshUndoBtn').onclick = loadUndo;
 
+// Artifact Canvas Toolbar & Inline Artifact Card Click Delegation
+$('#messages').addEventListener('click', (e) => {
+  const card = e.target.closest('.art-card[data-art-id]');
+  if (!card) return;
+  const art = S.artifacts.get(card.dataset.artId);
+  if (art) openArtifact(art, art.streaming ? 'code' : 'preview');
+});
+
+$('#artTabs').onclick = (e) => {
+  const b = e.target.closest('button[data-arttab]');
+  if (!b) return;
+  S.artifactTab = b.dataset.arttab;
+  S.artifactUserPickedTab = true;
+  renderArtifactPane();
+};
+
+$('#artCopyBtn').onclick = () => {
+  const art = S.activeArtifactId ? S.artifacts.get(S.activeArtifactId) : null;
+  if (!art) return;
+  navigator.clipboard?.writeText(art.code || '');
+  toast('Artifact code copied');
+};
+
+$('#artSaveBtn').onclick = async () => {
+  const art = S.activeArtifactId ? S.artifacts.get(S.activeArtifactId) : null;
+  if (!art) return;
+  try {
+    const r = await CW.saveArtifact(art);
+    if (!r.canceled) toast(`Saved ${r.filePath}`);
+  } catch (e) { toast(e.message); }
+};
+
+$('#artOpenExtBtn').onclick = async () => {
+  const art = S.activeArtifactId ? S.artifacts.get(S.activeArtifactId) : null;
+  if (!art) return;
+  try {
+    await CW.openArtifactInBrowser(buildArtifactHtml(art));
+    toast('Opened artifact in OS browser');
+  } catch (e) { toast(e.message); }
+};
+
+$('#artRefreshBtn').onclick = () => {
+  const art = S.activeArtifactId ? S.artifacts.get(S.activeArtifactId) : null;
+  if (!art) return;
+  const frame = $('#artFrame');
+  frame.dataset.renderedId = '';
+  frame.dataset.renderedLen = '';
+  S.artifactTab = 'preview';
+  renderArtifactPane();
+  toast('Preview refreshed');
+};
+
 // Settings Tabs & Model Focus
 $('#settingsTabs').onclick = (e) => {
   const b = e.target.closest('button[data-stab]');
   if (b) setSettingsTab(b.dataset.stab);
 };
-$('#setCopilotBModel').addEventListener('focus', () => {
-  S.assignModelTarget = 'copilot_b';
-  $$('#fmTarget button').forEach((x) => x.classList.toggle('on', x.dataset.target === 'copilot_b'));
-});
+const bindModelFocus = (sel, target) => {
+  $(sel).addEventListener('focus', () => {
+    S.assignModelTarget = target;
+    $$('#fmTarget button').forEach((x) => x.classList.toggle('on', x.dataset.target === target));
+  });
+};
+bindModelFocus('#setFastModel', 'fast');
+bindModelFocus('#setSmartModel', 'smart');
+bindModelFocus('#setCopilotBModel', 'copilot_b');
+bindModelFocus('#setAgentModel', 'agent');
+bindModelFocus('#setGraphMapperModel', 'graph');
+
+// Save current Provider form as Reusable Profile
+$('#saveAsProfileBtn').onclick = async () => {
+  const preset = S.providerPresets.find((x) => x.id === S.selectedPreset);
+  const suggested = preset?.label || $('#setEndpointType').value.toUpperCase();
+  const name = await askText({
+    title: 'Save Provider Profile',
+    label: 'Give this provider configuration a name',
+    value: suggested,
+    placeholder: 'e.g. Work OpenAI, Local Ollama, mx-GPT',
+  });
+  if (!name) return;
+  try {
+    const form = collectSettingsForm();
+    await CW.saveProvider({
+      name,
+      endpointType: form.endpointType,
+      presetId: form.providerPreset,
+      endpointUrl: form.endpointUrl,
+      username: form.username,
+      password: form.password === '__KEEP__' ? (S.settings?.hasPassword ? '__KEEP__' : '') : form.password,
+      apiKey: form.apiKey === '__KEEP__' ? (S.settings?.hasApiKey ? '__KEEP__' : '') : form.apiKey,
+      fastModel: form.fastModel,
+      smartModel: form.smartModel,
+    });
+    await loadSavedProviders();
+    toast(`Saved provider profile "${name}"`);
+  } catch (e) { toast(e.message, 4000); }
+};
 
 // Settings & Providers Modal wiring
 $('#resetDefaultProviderBtn').onclick = () => {
@@ -2729,14 +3443,6 @@ $('#fmTarget').onclick = (e) => {
   S.assignModelTarget = b.dataset.target;
   $$('#fmTarget button').forEach((x) => x.classList.toggle('on', x.dataset.target === S.assignModelTarget));
 };
-$('#setFastModel').addEventListener('focus', () => {
-  S.assignModelTarget = 'fast';
-  $$('#fmTarget button').forEach((x) => x.classList.toggle('on', x.dataset.target === 'fast'));
-});
-$('#setSmartModel').addEventListener('focus', () => {
-  S.assignModelTarget = 'smart';
-  $$('#fmTarget button').forEach((x) => x.classList.toggle('on', x.dataset.target === 'smart'));
-});
 $('#setEndpointType').onchange = () => {
   const t = $('#setEndpointType').value;
   syncProviderAuthUI(t);
@@ -2779,10 +3485,13 @@ $('#saveSettingsBtn').onclick = async () => {
     $('#ctImage').value = S.settings.containerImage || 'python:3.12-slim';
     $('#ctNet').value = S.settings.containerNetwork || 'none';
     $('#ctMount').value = S.settings.containerMountMode || 'rw';
+    if (S.settings.defaultMode) setMode(S.settings.defaultMode);
+    if (S.settings.think) setThink(S.settings.think);
     $('#settingsModal').hidden = true;
     hideLoginScreen();
     renderAccountUI();
     renderWorkspaceUI();
+    renderAutoAcceptPill();
     loadFiles('');
     checkConnectionQuiet();
     toast('Settings saved');

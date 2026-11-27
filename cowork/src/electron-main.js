@@ -198,6 +198,61 @@ function registerIpc() {
     presets: endpoint.PROVIDER_PRESETS,
     defaultUrl: 'https://max.fyreflysystems.de',
   }));
+  ipcMain.handle('providers:list', () => ({
+    providers: storage.publicProviders(),
+    presets: endpoint.PROVIDER_PRESETS,
+  }));
+  ipcMain.handle('providers:save', (_, prof) => {
+    const saved = storage.saveProviderProfile(prof || {});
+    return { ok: true, id: saved.id, providers: storage.publicProviders() };
+  });
+  ipcMain.handle('providers:delete', (_, id) => {
+    const ok = storage.deleteProviderProfile(id);
+    return { ok, providers: storage.publicProviders() };
+  });
+  ipcMain.handle('providers:activate', (_, id) => {
+    storage.activateProviderProfile(id);
+    endpoint.resetSession();
+    return { ok: true, settings: storage.publicSettings(), providers: storage.publicProviders() };
+  });
+  ipcMain.handle('providers:refresh', async (_, id) => {
+    const raw = storage.listSavedProviders().find((x) => x.id === id);
+    if (!raw) throw new Error('Provider not found');
+    const r = await endpoint.testConnection({
+      endpointType: raw.endpointType,
+      endpointUrl: raw.endpointUrl,
+      username: raw.username,
+      password: raw.password,
+      apiKey: raw.apiKey,
+    });
+    storage.saveProviderProfile({ ...raw, password: '__KEEP__', apiKey: '__KEEP__', models: r.models });
+    return { ok: true, found: r.models.length, latencyMs: r.latencyMs, models: r.models, providers: storage.publicProviders() };
+  });
+
+  // ---- Token Usage Statistics
+  ipcMain.handle('usage:get', () => storage.getUsageStats());
+  ipcMain.handle('usage:reset', () => storage.resetUsageStats());
+
+  // ---- Artifact Save & External Preview
+  ipcMain.handle('artifact:save', async (_, art) => {
+    const extMap = { html: 'html', htm: 'html', svg: 'svg', jsx: 'jsx', tsx: 'tsx', react: 'jsx', mermaid: 'mmd' };
+    const ext = extMap[String(art?.lang || '').toLowerCase()] || 'html';
+    const slug = String(art?.title || 'artifact').toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-|-$/g, '').slice(0, 48) || 'artifact';
+    const res = await dialog.showSaveDialog(mainWindow, {
+      title: 'Save Artifact',
+      defaultPath: path.join(localFiles.getWorkspace(), `${slug}.${ext}`),
+      filters: [{ name: `${ext.toUpperCase()} Artifact`, extensions: [ext] }],
+    });
+    if (res.canceled || !res.filePath) return { canceled: true };
+    fs.writeFileSync(res.filePath, String(art?.code || ''), 'utf8');
+    return { canceled: false, filePath: res.filePath };
+  });
+  ipcMain.handle('artifact:openBrowser', async (_, htmlDoc) => {
+    const tmpPath = path.join(os.tmpdir(), `mx-cowork-artifact-${Date.now()}.html`);
+    fs.writeFileSync(tmpPath, String(htmlDoc || ''), 'utf8');
+    await shell.openPath(tmpPath);
+    return { ok: true, tmpPath };
+  });
 
   // ---- Built-in GitHub Release Updater (Gimel-style)
   ipcMain.handle('updater:check', async (_, opts) => {
@@ -396,6 +451,8 @@ function registerIpc() {
     try {
       const result = await copilot.runCoworkTurn({
         mode,
+        chatId: chat.id,
+        chatTitle: chat.title,
         prompt,
         history: priorHistory,
         pinnedFiles: Array.isArray(payload?.pinnedFiles) ? payload.pinnedFiles : [],
@@ -676,6 +733,8 @@ app.whenReady().then(() => {
               hasGraphApi: typeof window.cowork.mapGraphFast === 'function' && Boolean(document.querySelector('#graphCanvas')),
               hasProjectsApi: typeof window.cowork.listProjects === 'function' && Boolean(document.querySelector('#projectsList')),
               hasAutoEditPill: Boolean(document.querySelector('#autoAcceptTopPill')),
+              hasArtifactCanvas: Boolean(document.querySelector('[data-pane="artifact"]')),
+              hasUsageApi: typeof window.cowork.getUsage === 'function',
               hasUpdateBtn: Boolean(document.querySelector('#openUpdatesBtn')),
               hasUpdateModal: Boolean(document.querySelector('#updatesModal')),
               updaterOk: upd.ok,

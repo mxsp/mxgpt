@@ -14,6 +14,19 @@ contextBridge.exposeInMainWorld('cowork', {
   login: (creds) => ipcRenderer.invoke('auth:login', creds),
   logout: () => ipcRenderer.invoke('auth:logout'),
   getProviderPresets: () => ipcRenderer.invoke('providers:presets'),
+  listProviders: () => ipcRenderer.invoke('providers:list'),
+  saveProvider: (prof) => ipcRenderer.invoke('providers:save', prof),
+  deleteProvider: (id) => ipcRenderer.invoke('providers:delete', id),
+  activateProvider: (id) => ipcRenderer.invoke('providers:activate', id),
+  refreshProvider: (id) => ipcRenderer.invoke('providers:refresh', id),
+
+  // Token Usage Statistics
+  getUsage: () => ipcRenderer.invoke('usage:get'),
+  resetUsage: () => ipcRenderer.invoke('usage:reset'),
+
+  // Artifact Canvas Actions
+  saveArtifact: (art) => ipcRenderer.invoke('artifact:save', art),
+  openArtifactInBrowser: (htmlDoc) => ipcRenderer.invoke('artifact:openBrowser', htmlDoc),
 
   // Built-in Updater
   checkUpdate: (opts) => ipcRenderer.invoke('updater:check', opts || {}),

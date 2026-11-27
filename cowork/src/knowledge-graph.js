@@ -512,7 +512,7 @@ async function mapProjectWithFastModel({ projectId = '', workspace = '', useFast
   }
 
   const cfg = storage.getSettings();
-  const fastModel = cfg.fastModel || 'lfm3:latest';
+  const fastModel = cfg.graphMapperModel || cfg.fastModel || 'lfm3:latest';
   onProgress?.({ phase: 'mapping', message: `Mapping semantics with Fast model (${fastModel.replace(/:latest$/, '')})…` });
 
   // Build ultra-compact digest so the Fast model responds in ~1-3 seconds
@@ -560,6 +560,15 @@ Rules: max 5 clusters, max 16 file roles, max 10 conceptual links. Use exact rel
       messages: [{ role: 'user', content: digestLines.join('\n') }],
       think: 'off',
       priority: 'fast',
+    });
+
+    storage.recordUsage({
+      model: res.model || fastModel,
+      role: 'graph',
+      promptTokens: res.usage?.promptTokens || Math.round(digestLines.join('\n').length / 4),
+      evalTokens: res.usage?.evalTokens || Math.round((res.content || '').length / 4),
+      elapsedMs: res.elapsedMs || 0,
+      tokensPerSec: res.usage?.tokensPerSec || 0,
     });
 
     const parsed = parseJsonLoose(res.content);

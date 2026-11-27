@@ -371,6 +371,17 @@ Distill the raw source data into a tight, factual, high-signal bullet brief (max
       },
     });
 
+    storage.recordUsage({
+      chatId: task._chatId || '',
+      chatTitle: task._chatTitle || '',
+      model: fastRes.model || fastModel,
+      role: 'worker',
+      promptTokens: fastRes.usage?.promptTokens || Math.round(rawEvidence.length / 4),
+      evalTokens: fastRes.usage?.evalTokens || Math.round((fastRes.content || '').length / 4),
+      elapsedMs: fastRes.elapsedMs || 0,
+      tokensPerSec: fastRes.usage?.tokensPerSec || 0,
+    });
+
     const elapsedMs = Date.now() - startedAt;
     onEvent('worker_done', {
       id,
@@ -406,6 +417,8 @@ Distill the raw source data into a tight, factual, high-signal bullet brief (max
 
 async function runCoworkTurn({
   mode = 'copilot', // 'fast' | 'smart' | 'copilot' | 'copilot_b'
+  chatId = '',
+  chatTitle = '',
   prompt = '',
   history = [],
   pinnedFiles = [],
@@ -451,6 +464,9 @@ async function runCoworkTurn({
   const memoryHint = toolsCfg.notes
     ? `If the user explicitly asks you to remember a preference, fact, or project note for future sessions, include a \`\`\`memory-save JSON block: {"title":"short title","content":"fact to remember","tags":["tag"]}.`
     : '';
+  const artifactHint = `When creating interactive dashboards, web apps, charts, diagrams, or visual UI mockups, output a complete self-contained fenced \`\`\`html, \`\`\`svg, \`\`\`jsx, or \`\`\`mermaid code block so mx-Cowork opens it automatically in the live Artifact Preview Canvas.`;
+  const globalCustomInstr = cfg.customInstructions ? `User Custom Instructions:\n${cfg.customInstructions}` : '';
+  const workerModel = cfg.agentModel || cfg.fastModel || 'lfm3:latest';
 
   // ---- Direct Fast or Smart modes
   if (mode === 'fast' || mode === 'smart') {
@@ -469,8 +485,10 @@ async function runCoworkTurn({
 
     const sys = [
       `You are mx-Cowork, a local desktop AI copilot. Today: ${today}. Workspace: ${workspace}.`,
+      globalCustomInstr,
       projectContextBlock,
       `Be crisp, structured, and actionable. Use Markdown.`,
+      artifactHint,
       fileActionsHint,
       codeRunHint,
       memoryHint,
@@ -495,6 +513,17 @@ async function runCoworkTurn({
         else if (ev.type === 'thinking') onEvent('thinking', { delta: ev.delta });
         else if (ev.type === 'text') onEvent('text', { delta: ev.delta });
       },
+    });
+
+    storage.recordUsage({
+      chatId,
+      chatTitle,
+      model: res.model || chosenModel,
+      role: 'main',
+      promptTokens: res.usage?.promptTokens || Math.round((sys.length + userContent.length) / 4),
+      evalTokens: res.usage?.evalTokens || Math.round(((res.content || '').length + (res.thinking || '').length) / 4),
+      elapsedMs: res.elapsedMs || 0,
+      tokensPerSec: res.usage?.tokensPerSec || 0,
     });
 
     const { fileActions, codeRuns, savedNotes } = extractSpecialBlocks(res.content, toolsCfg);
@@ -624,9 +653,9 @@ Rules:
     onEvent('phase', { phase: 'delegating', label: `Running ${plan.tasks.length} tool/worker task${plan.tasks.length > 1 ? 's' : ''}…` });
     for (const t of plan.tasks) {
       if (signal?.aborted) break;
-      const r = await runDelegatedWorker(t, {
+      const r = await runDelegatedWorker({ ...t, _chatId: chatId, _chatTitle: chatTitle }, {
         workspace,
-        fastModel: cfg.fastModel,
+        fastModel: workerModel,
         toolsCfg,
         signal,
         onEvent,
@@ -649,9 +678,11 @@ Rules:
 
   const synthSys = [
     `You are mx-Cowork's ${orchestratorLabel} Orchestrator. Today: ${today}. Workspace: ${workspace}.`,
+    globalCustomInstr,
     projectContextBlock,
     `Your local tools and fast worker models retrieved the evidence below. Synthesize a crisp, deeply helpful, accurate response using Markdown.`,
     `Cite web sources as Markdown links and reference local files by relative path.`,
+    artifactHint,
     fileActionsHint,
     codeRunHint,
     memoryHint,
@@ -685,6 +716,17 @@ Rules:
       else if (ev.type === 'thinking') onEvent('thinking', { delta: ev.delta });
       else if (ev.type === 'text') onEvent('text', { delta: ev.delta });
     },
+  });
+
+  storage.recordUsage({
+    chatId,
+    chatTitle,
+    model: finalRes.model || orchestratorModel,
+    role: 'main',
+    promptTokens: finalRes.usage?.promptTokens || Math.round((synthSys.length + synthPromptParts.join('\n').length) / 4),
+    evalTokens: finalRes.usage?.evalTokens || Math.round(((finalRes.content || '').length + (finalRes.thinking || '').length) / 4),
+    elapsedMs: finalRes.elapsedMs || 0,
+    tokensPerSec: finalRes.usage?.tokensPerSec || 0,
   });
 
   const { fileActions, codeRuns, savedNotes } = extractSpecialBlocks(finalRes.content, toolsCfg);

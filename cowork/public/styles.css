@@ -667,3 +667,64 @@ svg { width: 20px; height: 20px; fill: none; stroke: currentColor; stroke-width:
 .gi-role { font-size: 11.5px; color: var(--accent-ink); background: var(--accent-soft); padding: 3px 8px; border-radius: 6px; margin-top: 4px; display: inline-block; }
 .app:has(.panel.open) .auto-edit-pill { display: none; }
 
+/* ============ Artifact Display Canvas (identical to mx-GPT WebUI) ============ */
+.art-panel-bar { display: flex; align-items: center; gap: 8px; padding: 0 10px 0 12px; border-bottom: 1px solid var(--border); background: var(--bg); min-height: 40px; }
+.art-tabs { display: flex; gap: 2px; }
+.panel-tab { padding: 8px 11px 9px; font-size: 12.5px; color: var(--muted); border-bottom: 2px solid transparent; margin-bottom: -1px; font-weight: 500; }
+.panel-tab:hover { color: var(--text); }
+.panel-tab.active { color: var(--text); border-bottom-color: var(--accent); font-weight: 600; }
+.art-meta-right { margin-left: auto; font-size: 11px; color: var(--faint); display: inline-flex; align-items: center; gap: 8px; white-space: nowrap; }
+.art-live-pill { display: inline-flex; align-items: center; gap: 5px; font-size: 11px; font-weight: 600; color: var(--accent-ink); background: var(--accent-soft); padding: 2px 8px; border-radius: 999px; }
+.art-live-pill i { width: 6px; height: 6px; border-radius: 50%; background: var(--accent); display: inline-block; }
+.art-stage { flex: 1; min-height: 0; display: flex; flex-direction: column; overflow: hidden; background: var(--bg); }
+.artifact-frame { flex: 1; width: 100%; border: 0; background: #fff; }
+.artifact-code { flex: 1; overflow: auto; padding: 14px 16px; background: var(--code-bg); }
+.artifact-code pre { margin: 0; }
+.artifact-code code { font-family: var(--font-mono); font-size: 12.4px; line-height: 1.6; white-space: pre; }
+.artifact-empty { display: grid; place-items: center; height: 100%; color: var(--muted); font-size: 13px; padding: 32px; text-align: center; line-height: 1.55; }
+
+.art-card { position: relative; overflow: hidden; display: flex; align-items: center; gap: 12px; width: 100%; border: 1px solid var(--border); border-radius: 12px; background: var(--bg-elev); padding: 11px 14px; text-align: left; transition: all .15s; }
+.art-card:hover { border-color: var(--border-strong); box-shadow: var(--shadow-sm); transform: translateY(-1px); }
+.art-card.building { border-color: color-mix(in srgb, var(--accent) 45%, var(--border)); background: color-mix(in srgb, var(--accent-soft) 28%, var(--bg-elev)); }
+.art-card.building::after { content: ""; position: absolute; left: 0; right: 0; bottom: 0; height: 2px; background: linear-gradient(90deg, transparent, var(--accent), transparent); background-size: 200% 100%; animation: shimmer 1.3s linear infinite; }
+.art-icon { width: 34px; height: 34px; border-radius: 9px; background: var(--accent-soft); color: var(--accent); display: grid; place-items: center; flex: none; }
+.art-icon svg { width: 17px; height: 17px; }
+.art-info { flex: 1; min-width: 0; display: flex; flex-direction: column; gap: 1px; }
+.art-title { display: block; font-size: 13.5px; font-weight: 600; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.art-meta { display: block; font-size: 11.5px; color: var(--muted); }
+.art-open { font-size: 12px; font-weight: 500; color: var(--accent-ink); background: var(--accent-soft); padding: 4px 10px; border-radius: 7px; flex: none; }
+
+/* ============ WebUI-Identical Settings Modal, Provider Cards & Token Usage ============ */
+.modal.modal-xl { max-width: 740px; }
+.provider-card { border: 1px solid var(--border); border-radius: 11px; padding: 11px 13px; margin-bottom: 8px; background: var(--bg-elev); }
+.pc-top { display: flex; align-items: center; justify-content: space-between; gap: 8px; }
+.pc-name { display: flex; align-items: center; gap: 8px; min-width: 0; }
+.pc-name b { font-size: 13px; font-weight: 600; }
+.pc-url { font-family: var(--font-mono); font-size: 11px; color: var(--muted); margin: 4px 0 8px; word-break: break-all; }
+.pc-actions { display: flex; gap: 6px; flex-wrap: wrap; }
+.badge-pill { font-size: 10px; padding: 2px 7px; border-radius: 999px; background: var(--code-bg); border: 1px solid var(--border); color: var(--muted); font-weight: 600; }
+.badge-pill.hot { background: var(--accent-soft); border-color: transparent; color: var(--accent-ink); }
+.badge-pill.ok { background: var(--green-soft); border-color: transparent; color: var(--green); }
+
+.usage-cards { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 9px; margin-bottom: 12px; }
+.usage-card { border: 1px solid var(--border); border-radius: 12px; padding: 11px 12px; background: var(--bg-elev); }
+.usage-card > span { display: block; font-size: 10px; color: var(--muted); text-transform: uppercase; letter-spacing: .05em; font-weight: 600; }
+.usage-card > b { display: block; font-size: 22px; font-weight: 600; margin-top: 4px; line-height: 1.1; font-variant-numeric: tabular-nums; }
+.usage-card > small { display: block; color: var(--faint); font-size: 11px; margin-top: 2px; }
+.usage-sec { border: 1px solid var(--border); border-radius: 12px; padding: 12px 14px; margin-bottom: 12px; background: var(--bg-elev); }
+.usage-sec h3 { margin: 0 0 8px; font-size: 13px; font-weight: 600; display: flex; align-items: center; justify-content: space-between; gap: 8px; }
+.usage-bars { display: flex; align-items: flex-end; gap: 4px; height: 110px; padding-top: 8px; }
+.usage-bar { flex: 1; height: 100%; display: flex; flex-direction: column; justify-content: flex-end; align-items: stretch; gap: 4px; }
+.usage-bar-fill { background: var(--accent); opacity: .85; border-radius: 4px 4px 2px 2px; transition: height .2s; }
+.usage-bar:hover .usage-bar-fill { opacity: 1; }
+.usage-bar span { font-size: 9px; color: var(--faint); text-align: center; white-space: nowrap; }
+.usage-table { width: 100%; border-collapse: collapse; font-size: 12px; }
+.usage-table th { text-align: left; font-weight: 600; color: var(--muted); font-size: 10px; text-transform: uppercase; letter-spacing: .04em; padding: 0 8px 6px; border-bottom: 1px solid var(--border); }
+.usage-table td { padding: 6px 8px; border-bottom: 1px solid var(--border); }
+.usage-table tr:last-child td { border-bottom: 0; }
+.usage-table .num { text-align: right; font-variant-numeric: tabular-nums; white-space: nowrap; }
+.usage-table .m { font-family: var(--font-mono); font-size: 11px; max-width: 210px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.usage-chat-row { cursor: pointer; }
+.usage-chat-row:hover td { background: var(--hover); }
+@media (max-width: 640px) { .usage-cards { grid-template-columns: repeat(2, 1fr); } }
+
