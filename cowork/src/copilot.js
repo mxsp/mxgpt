@@ -890,7 +890,7 @@ async function runCoworkTurn({
     }
 
     if (viewParts.length) {
-      activeViewContextBlock = `<active_workspace_view>\n${viewParts.join('\n\n')}\n</active_workspace_view>`;
+      activeViewContextBlock = `[Active Workspace View]\n${viewParts.join('\n\n')}\n[/Active Workspace View]`;
     }
   }
 

@@ -482,6 +482,20 @@ async function chatCompletion({
     think,
     signal,
     onEvent,
+  }).catch(async (err) => {
+    // Ollama's XML parser occasionally throws HTTP 500 "XML syntax error ... unexpected EOF" on certain templates; retry once cleanly with think='off'
+    if (/XML syntax error|unexpected EOF/i.test(err?.message || '') && !signal?.aborted) {
+      return chatViaMxgpt(cfg, {
+        model: chosenModel,
+        systemPrompt: String(systemPrompt || '').replace(/<\/?[a-zA-Z_][a-zA-Z0-9_-]*>/g, ''),
+        messages,
+        images: cleanImages,
+        think: 'off',
+        signal,
+        onEvent,
+      });
+    }
+    throw err;
   });
 }
 
@@ -1027,7 +1041,7 @@ async function chatViaMxgpt(cfg, { model, systemPrompt, messages, images = [], t
       lines.push(`${m.role === 'user' ? 'User' : 'Assistant'}: ${String(m.content || '').slice(0, 2500)}`);
     }
     const last = messages[messages.length - 1];
-    promptText = `<conversation_history>\n${lines.join('\n\n')}\n</conversation_history>\n\n${String(last?.content || '')}`;
+    promptText = `[Conversation History]\n${lines.join('\n\n')}\n[/Conversation History]\n\n${String(last?.content || '')}`;
   }
 
   let content = '';
