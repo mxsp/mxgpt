@@ -35,19 +35,19 @@ flowchart LR
 
 ### Option 1: Native Desktop Coworker App (Linux & Windows — Zero WebUI)
 
-Download the native Electron desktop application directly from **[GitHub Releases](https://github.com/mxsp/mxgpt/releases)** (own OS window, native folder picker, native Save As dialogs, zero local HTTP server, zero browser tabs):
+Download the native Electron desktop application directly from **[GitHub Releases](https://github.com/mxsp/mxgpt/releases)** — styled identically to the `mx-GPT` web workspace, with built-in login (`https://max.fyreflysystems.de` default), multi-provider switching, local OS file navigation & live editing, and a built-in GitHub Release updater:
 
-- **Windows:** Run `mx-Cowork Setup 1.1.0.exe` (Setup Wizard with Start Menu/Desktop shortcuts) or extract `mx-Cowork-1.1.0-win-x64.zip` and double-click `mx-Cowork.exe`.
-- **Linux (AppImage):**
+- **Windows:** Extract `mx-Cowork-1.2.0-win-x64.zip` and double-click `mx-Cowork.exe`.
+- **Linux (AppImage — supports 1-click in-app self-update):**
   ```bash
-  chmod +x mx-Cowork-1.1.0.AppImage
-  ./mx-Cowork-1.1.0.AppImage
+  chmod +x mx-Cowork-1.2.0.AppImage
+  ./mx-Cowork-1.2.0.AppImage
   ```
 - **Linux (Debian / Ubuntu / Kali `.deb`):**
   ```bash
-  sudo apt install ./mx-cowork_1.1.0_amd64.deb
+  sudo apt install ./mx-cowork_1.2.0_amd64.deb
   ```
-- Open **⚙ Endpoint & Models** (`Ctrl+,`) to connect to your `mx-GPT` URL or LAN Ollama (`http://192.168.x.x:11434`).
+- On launch, sign in to **`https://max.fyreflysystems.de`** (default) or switch to **Other Provider** (OpenAI, Anthropic, OpenRouter, Groq, Google Gemini, Mistral, Direct Ollama, LM Studio, or any OpenAI-compatible API).
 
 ### Option 2: CLI One-Time Setup Script (Linux / macOS / Windows)
 
@@ -110,11 +110,12 @@ Produces `dist/mx-cowork-linux-x64.tar.gz`, `dist/mx-cowork-windows-x64.zip`, `d
 - **Live Streaming Artifacts**: Clean building card + live code stream transitioning smoothly to live HTML/SVG/JSX/Mermaid preview.
 - **Usage & Analytics (`/api/usage`)**: Per-user token and throughput tracking.
 
-### mx-Cowork Local Desktop App (`cowork/`)
-- **Copilot Orchestrator**: Smart model plans tasks and synthesizes final deliverables; Fast model handles local retrieval, document extraction, and web distillation.
-- **Local Files & Safe File Management**: Full-text search across `.pdf`, `.docx`, `.xlsx`, `.pptx`, `.md`, JSON, CSV, and source code; interactive approval cards for `mkdir`, `write`, `move`, `rename`, `copy`, and soft-`delete` with **1-click Undo**.
-- **Email Drafting Studio**: Auto-filled drafts from Copilot, 1-click AI tone/language refinements (`Shorter`, `Formal`, `Friendly`, `Direct`, `Fix Grammar`, `→ DE`, `→ EN`), `mailto:` launch, and `.eml` export.
-- **Research Desk**: Local DuckDuckGo + Wikipedia + readable web fetcher with saved briefs and 1-click Markdown export to your workspace.
+### mx-Cowork Native Desktop App (`cowork/`)
+- **Identical `mx-GPT` Visual Design + Native Login**: Warm parchment / charcoal UI matching `mx-GPT`, with a built-in login screen pre-configured for **`https://max.fyreflysystems.de`** and 1-click switching to **OpenAI**, **Anthropic**, **OpenRouter**, **Groq**, **Google Gemini**, **Mistral**, **Direct Ollama**, **LM Studio**, or any OpenAI-compatible endpoint.
+- **Copilot Orchestrator (`Fast` · `Smart` · `Copilot`)**: Smart model plans tasks and synthesizes final deliverables; Fast model handles local retrieval, document extraction, and web distillation.
+- **OS File Navigation, Find & Live Editor**: Jump across OS folders (`Home`, `Desktop`, `Documents`, `Downloads`, parent `↑`, typed path bar, native OS folder picker), search filenames & content (`.pdf`, `.docx`, `.xlsx`, `.md`, code), create/rename/delete files, and edit local files right inside the app (`Ctrl+S`) with automatic **1-click Undo** snapshots.
+- **Built-in GitHub Release Updater**: Checks `mxsp/mxgpt` Releases, verifies `SHA256SUMS.txt`, and supports 1-click self-update & relaunch on Linux AppImage and Windows (plus verified `.deb` download & install command).
+- **Email Drafting Studio & Research Desk**: Auto-filled drafts from Copilot, 1-click AI refinements, native Save As `.eml`, direct OS Mail launch, and local DuckDuckGo + Wikipedia research briefs.
 
 ---
 

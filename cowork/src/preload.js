@@ -6,11 +6,23 @@ contextBridge.exposeInMainWorld('cowork', {
   isNativeApp: true,
   platform: process.platform,
 
-  // App & Settings
+  // App, Auth, Providers & Settings
   appInfo: () => ipcRenderer.invoke('app:info'),
   getSettings: () => ipcRenderer.invoke('settings:get'),
   saveSettings: (patch) => ipcRenderer.invoke('settings:save', patch),
   testEndpoint: (cfg) => ipcRenderer.invoke('endpoint:test', cfg),
+  login: (creds) => ipcRenderer.invoke('auth:login', creds),
+  logout: () => ipcRenderer.invoke('auth:logout'),
+  getProviderPresets: () => ipcRenderer.invoke('providers:presets'),
+
+  // Built-in Updater
+  checkUpdate: (opts) => ipcRenderer.invoke('updater:check', opts || {}),
+  applyUpdate: () => ipcRenderer.invoke('updater:apply'),
+  onUpdateProgress: (cb) => {
+    const listener = (_, msg) => cb(msg);
+    ipcRenderer.on('updater:progress', listener);
+    return () => ipcRenderer.removeListener('updater:progress', listener);
+  },
 
   // Native OS Dialogs & Shell
   pickFolder: () => ipcRenderer.invoke('dialog:pickFolder'),
@@ -37,9 +49,16 @@ contextBridge.exposeInMainWorld('cowork', {
     return () => ipcRenderer.removeListener('cowork:menu', listener);
   },
 
-  // Local Files & Undo
+  // Local OS Files, Navigation, Editor & Undo
+  navigateOs: (targetPath) => ipcRenderer.invoke('files:navigateOs', targetPath),
+  pickFiles: () => ipcRenderer.invoke('files:pickFiles'),
   listFiles: (relPath) => ipcRenderer.invoke('files:list', relPath),
   readFile: (relPath) => ipcRenderer.invoke('files:read', relPath),
+  readFileForEdit: (relPath) => ipcRenderer.invoke('files:readForEdit', relPath),
+  writeFile: (opts) => ipcRenderer.invoke('files:write', opts),
+  mkdir: (relPath) => ipcRenderer.invoke('files:mkdir', relPath),
+  renameFile: (opts) => ipcRenderer.invoke('files:rename', opts),
+  deleteFile: (relPath) => ipcRenderer.invoke('files:delete', relPath),
   searchFiles: (opts) => ipcRenderer.invoke('files:search', opts),
   folderOverview: (relPath) => ipcRenderer.invoke('files:overview', relPath),
   executeFileAction: (action) => ipcRenderer.invoke('files:action', action),

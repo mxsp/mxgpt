@@ -16,9 +16,12 @@ npm install --no-audit --no-fund
 echo "=== Building native Linux (AppImage, .deb) and Windows GUI (.zip) apps ==="
 npm run build:all
 
+VERSION="$(node -p "require('$CW_DIR/package.json').version")"
+rm -f "$OUT_DIR"/*.AppImage "$OUT_DIR"/*.deb "$OUT_DIR"/*.zip "$OUT_DIR/SHA256SUMS.txt"
+
 cp -f "$CW_DIR"/dist/*.AppImage "$OUT_DIR/"
 cp -f "$CW_DIR"/dist/*.deb "$OUT_DIR/"
-cp -f "$CW_DIR"/dist/*-win.zip "$OUT_DIR/mx-Cowork-1.1.0-win-x64.zip"
+cp -f "$CW_DIR"/dist/*-win.zip "$OUT_DIR/mx-Cowork-${VERSION}-win-x64.zip"
 
 (cd "$OUT_DIR" && sha256sum *.AppImage *.deb *.zip > SHA256SUMS.txt)
 ls -lh "$OUT_DIR"

@@ -22,6 +22,7 @@ const localFiles = require('./local-files');
 const research = require('./research');
 const emailMod = require('./email');
 const copilot = require('./copilot');
+const updater = require('./updater');
 
 const ACTIVE_RUNS = new Map(); // chatId -> AbortController
 let mainWindow = null;
@@ -54,6 +55,7 @@ function buildAppMenu() {
         { label: 'Choose Workspace Folder…', accelerator: 'CmdOrCtrl+O', click: () => sendMenuAction('pick-folder') },
         { type: 'separator' },
         { label: 'Settings…', accelerator: 'CmdOrCtrl+,', click: () => sendMenuAction('open-settings') },
+        { label: 'Check for Updates…', click: () => sendMenuAction('open-updates') },
         { type: 'separator' },
         { role: 'quit' },
       ],
@@ -107,7 +109,7 @@ function createWindow() {
     minHeight: 600,
     title: 'mx-Cowork',
     icon: fs.existsSync(iconPath) ? iconPath : undefined,
-    backgroundColor: storage.getSettings().theme === 'dark' ? '#0f1218' : '#f6f7f9',
+    backgroundColor: storage.getSettings().theme === 'dark' ? '#262624' : '#faf9f5',
     show: false,
     webPreferences: {
       preload: path.join(__dirname, 'preload.js'),
@@ -162,6 +164,69 @@ function registerIpc() {
 
   ipcMain.handle('endpoint:test', async (_, overrideCfg) => {
     return endpoint.testConnection(overrideCfg && Object.keys(overrideCfg).length ? overrideCfg : null);
+  });
+
+  ipcMain.handle('auth:login', async (_, creds) => {
+    const patch = {
+      endpointType: creds?.endpointType || 'mxgpt',
+      providerPreset: creds?.providerPreset || creds?.endpointType || 'mxgpt',
+      endpointUrl: String(creds?.endpointUrl || 'https://max.fyreflysystems.de').trim().replace(/\/+$/, ''),
+      username: String(creds?.username || '').trim(),
+      password: creds?.password || '__KEEP__',
+      apiKey: creds?.apiKey ? String(creds.apiKey).trim() : '__KEEP__',
+    };
+    if (creds?.fastModel) patch.fastModel = String(creds.fastModel).trim();
+    if (creds?.smartModel) patch.smartModel = String(creds.smartModel).trim();
+
+    // Verify credentials against the remote/local provider before persisting
+    const testRes = await endpoint.testConnection(patch);
+    storage.saveSettings({ ...patch, signedIn: true });
+    endpoint.resetSession();
+    return { ok: true, connection: testRes, settings: storage.publicSettings() };
+  });
+
+  ipcMain.handle('auth:logout', () => {
+    storage.saveSettings({ signedIn: false, password: '', apiKey: '' });
+    endpoint.resetSession();
+    return { ok: true, settings: storage.publicSettings() };
+  });
+
+  ipcMain.handle('providers:presets', () => ({
+    presets: endpoint.PROVIDER_PRESETS,
+    defaultUrl: 'https://max.fyreflysystems.de',
+  }));
+
+  // ---- Built-in GitHub Release Updater (Gimel-style)
+  ipcMain.handle('updater:check', async (_, opts) => {
+    const s = storage.getSettings();
+    return updater.checkForUpdate({
+      currentVersion: app.getVersion(),
+      isPackaged: app.isPackaged,
+      force: Boolean(opts?.force),
+      repo: s.updateRepo || updater.DEFAULT_UPDATE_REPO,
+    });
+  });
+
+  ipcMain.handle('updater:apply', async (event) => {
+    const s = storage.getSettings();
+    return updater.applyUpdate({
+      currentVersion: app.getVersion(),
+      isPackaged: app.isPackaged,
+      repo: s.updateRepo || updater.DEFAULT_UPDATE_REPO,
+      onProgress: (p) => {
+        if (!event.sender.isDestroyed()) {
+          event.sender.send('updater:progress', p);
+        }
+      },
+      relaunchFn: (execPath, exitOnly = false) => {
+        if (!exitOnly) {
+          app.relaunch(execPath ? { execPath } : undefined);
+        }
+        app.exit(0);
+      },
+      revealFn: (filePath) => shell.showItemInFolder(filePath),
+      openExternalFn: (url) => shell.openExternal(url),
+    });
   });
 
   // ---- Native OS Dialogs & Shell
@@ -327,13 +392,54 @@ function registerIpc() {
     }
   });
 
-  // ---- Local Files & Undo
+  // ---- Local OS Files, Navigation, Search, Editor & Undo
+  ipcMain.handle('files:navigateOs', (_, targetPath) => {
+    const nextWs = localFiles.navigateOsFolder(targetPath);
+    return { workspace: nextWs, settings: storage.publicSettings() };
+  });
+  ipcMain.handle('files:pickFiles', async () => {
+    const res = await dialog.showOpenDialog(mainWindow, {
+      title: 'Attach Local Files to Chat',
+      defaultPath: localFiles.getWorkspace(),
+      properties: ['openFile', 'multiSelections'],
+    });
+    if (res.canceled || !res.filePaths?.length) return { canceled: true, pinned: [] };
+    const root = localFiles.getWorkspace();
+    const pinned = [];
+    let switchedWorkspace = null;
+    for (const abs of res.filePaths) {
+      let rel = path.relative(root, path.resolve(abs));
+      if (rel.startsWith('..') || path.isAbsolute(rel)) {
+        // Switch workspace to the chosen file's parent folder so Cowork can access it cleanly
+        const parentDir = path.dirname(path.resolve(abs));
+        storage.saveSettings({ workspace: parentDir });
+        switchedWorkspace = parentDir;
+        rel = path.basename(abs);
+      }
+      pinned.push(rel.replace(/\\/g, '/'));
+    }
+    return {
+      canceled: false,
+      pinned,
+      switchedWorkspace,
+      settings: storage.publicSettings(),
+    };
+  });
   ipcMain.handle('files:list', (_, relPath) => localFiles.listDir(relPath || ''));
   ipcMain.handle('files:read', async (_, relPath) => {
     const target = localFiles.resolveSafe(relPath || '');
     const content = await localFiles.readTextContent(target.abs, 80000);
     return { path: target.rel, content };
   });
+  ipcMain.handle('files:readForEdit', (_, relPath) => localFiles.readFileForEdit(relPath || ''));
+  ipcMain.handle('files:write', (_, opts) => localFiles.executeFileAction({
+    type: 'write',
+    path: opts?.path,
+    content: opts?.content ?? '',
+  }));
+  ipcMain.handle('files:mkdir', (_, relPath) => localFiles.executeFileAction({ type: 'mkdir', path: relPath }));
+  ipcMain.handle('files:rename', (_, opts) => localFiles.executeFileAction({ type: 'rename', from: opts?.from, to: opts?.to }));
+  ipcMain.handle('files:delete', (_, relPath) => localFiles.executeFileAction({ type: 'delete', path: relPath }));
   ipcMain.handle('files:search', (_, opts) => localFiles.searchFiles(opts || {}));
   ipcMain.handle('files:overview', (_, relPath) => localFiles.folderOverview(relPath || ''));
   ipcMain.handle('files:action', (_, action) => localFiles.executeFileAction(action));
@@ -416,12 +522,24 @@ app.whenReady().then(() => {
           (async () => {
             const info = await window.cowork.appInfo();
             const set = await window.cowork.getSettings();
+            const presets = await window.cowork.getProviderPresets();
+            const upd = await window.cowork.checkUpdate({ force: false });
             return {
               hasApi: typeof window.cowork === 'object',
               app: info.app,
               version: info.version,
               title: document.title,
               modes: [...document.querySelectorAll('#modeSeg button')].map(b => b.dataset.mode),
+              defaultEndpoint: set.settings.endpointUrl,
+              endpointType: set.settings.endpointType,
+              providerCount: (presets.presets || []).length,
+              hasLoginScreen: Boolean(document.querySelector('#loginScreen')),
+              hasFileEditor: Boolean(document.querySelector('#fileEditorView')),
+              hasOsNav: typeof window.cowork.navigateOs === 'function' && typeof window.cowork.writeFile === 'function',
+              hasUpdateBtn: Boolean(document.querySelector('#openUpdatesBtn')),
+              hasUpdateModal: Boolean(document.querySelector('#updatesModal')),
+              updaterOk: upd.ok,
+              latestTag: upd.latestTag || null,
               workspace: set.settings.workspace,
             };
           })()

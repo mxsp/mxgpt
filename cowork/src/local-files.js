@@ -35,9 +35,73 @@ function quickFolders() {
     { label: 'Documents', path: path.join(home, 'Documents') },
     { label: 'Downloads', path: path.join(home, 'Downloads') },
   ];
+  if (process.platform === 'win32') {
+    for (const drv of ['C:\\', 'D:\\', 'E:\\']) {
+      if (fs.existsSync(drv)) candidates.push({ label: drv.slice(0, 2), path: drv });
+    }
+  } else {
+    candidates.push({ label: '/', path: '/' });
+  }
   return candidates.filter((c) => {
     try { return fs.existsSync(c.path) && fs.statSync(c.path).isDirectory(); } catch { return false; }
   });
+}
+
+function navigateOsFolder(targetPath) {
+  const cur = getWorkspace();
+  let next;
+  if (targetPath === '..') {
+    next = path.dirname(cur);
+  } else {
+    let raw = String(targetPath || '').trim();
+    if (raw === '~' || raw.startsWith('~/')) {
+      raw = path.join(os.homedir(), raw.slice(1));
+    }
+    next = path.isAbsolute(raw) ? path.resolve(raw) : path.resolve(cur, raw);
+  }
+  if (!fs.existsSync(next) || !fs.statSync(next).isDirectory()) {
+    throw new Error(`Folder not found: ${next}`);
+  }
+  storage.saveSettings({ workspace: next });
+  return next;
+}
+
+async function readFileForEdit(relPath, baseDir = getWorkspace()) {
+  const target = resolveSafe(relPath, baseDir);
+  const st = await fsp.stat(target.abs);
+  if (st.isDirectory()) throw new Error('Path is a directory');
+  const ext = path.extname(target.abs).toLowerCase();
+  const isOfficeOrPdf = ext === '.pdf' || OFFICE_EXTS.has(ext);
+  let editable = false;
+  let content = '';
+  if (isOfficeOrPdf) {
+    content = await readTextContent(target.abs, 120000);
+    editable = false;
+  } else if (st.size <= 2 * 1024 * 1024) {
+    const buf = await fsp.readFile(target.abs);
+    const sample = buf.subarray(0, Math.min(2048, buf.length));
+    const hasNul = sample.includes(0);
+    if (!hasNul || TEXT_EXTS.has(ext)) {
+      content = buf.toString('utf8');
+      editable = true;
+    } else {
+      content = `[Binary file (${ext || 'unknown'}, ${formatBytes(st.size)}) — use "Open in OS" to view]`;
+      editable = false;
+    }
+  } else {
+    content = await readTextContent(target.abs, 120000);
+    editable = false;
+  }
+  return {
+    path: target.rel,
+    name: path.basename(target.abs),
+    absPath: target.abs,
+    ext,
+    size: st.size,
+    sizeLabel: formatBytes(st.size),
+    editable,
+    content,
+  };
 }
 
 function getWorkspace() {
@@ -478,9 +542,11 @@ async function undoFileAction(undoId) {
 module.exports = {
   quickFolders,
   getWorkspace,
+  navigateOsFolder,
   resolveSafe,
   listDir,
   readTextContent,
+  readFileForEdit,
   searchFiles,
   folderOverview,
   executeFileAction,

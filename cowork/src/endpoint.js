@@ -1,18 +1,126 @@
 'use strict';
 
 /**
- * Dual-mode LLM Endpoint Client:
- *   1. mx-GPT remote endpoint (https://max.fyreflysystems.de) — authenticates via
- *      POST /api/login, streams SSE via POST /api/chat, and auto-cleans ephemeral
- *      remote chats so the user's web sidebar stays tidy.
- *   2. Direct Ollama endpoint (http://127.0.0.1:11434 or LAN :11434/:11435) —
- *      streams NDJSON via POST /api/chat with Inkling thinking calibration and
- *      priority queue headers.
+ * Multi-Provider LLM Endpoint Client for mx-Cowork:
+ *
+ *   1. mx-GPT Remote Endpoint (DEFAULT: https://max.fyreflysystems.de)
+ *      Cookie auth (/api/login), SSE streaming (/api/chat), ephemeral chat cleanup.
+ *   2. Direct Ollama Endpoint (Localhost / LAN)
+ *      NDJSON streaming (/api/chat) with Inkling thinking calibration & queue priority headers.
+ *   3. OpenAI & OpenAI-Compatible Providers
+ *      OpenAI, OpenRouter, Groq, Google Gemini (OpenAI compat), Mistral, LM Studio, Custom.
+ *      Bearer auth, /models discovery, SSE /chat/completions streaming (content + reasoning_content).
+ *   4. Anthropic Claude API
+ *      Native /v1/messages SSE streaming with x-api-key & anthropic-version headers.
  */
 
 const storage = require('./storage');
 
-const USER_AGENT = 'Mozilla/5.0 (compatible; mx-Cowork/1.0)';
+const USER_AGENT = 'Mozilla/5.0 (compatible; mx-Cowork/1.2)';
+
+const PROVIDER_PRESETS = [
+  {
+    id: 'mxgpt',
+    label: 'mx-GPT (Default)',
+    badge: 'Default',
+    endpointType: 'mxgpt',
+    endpointUrl: 'https://max.fyreflysystems.de',
+    fastModel: 'lfm3:latest',
+    smartModel: 'inkling-2-mini:latest',
+    authMode: 'login',
+    hint: 'Default hosted mx-GPT server at https://max.fyreflysystems.de (LFM3 Fast + Inkling Smart).',
+  },
+  {
+    id: 'openai',
+    label: 'OpenAI',
+    endpointType: 'openai',
+    endpointUrl: 'https://api.openai.com/v1',
+    fastModel: 'gpt-4o-mini',
+    smartModel: 'gpt-4o',
+    authMode: 'apikey',
+    hint: 'Official OpenAI API. Uses your OpenAI API key.',
+  },
+  {
+    id: 'anthropic',
+    label: 'Anthropic',
+    endpointType: 'anthropic',
+    endpointUrl: 'https://api.anthropic.com',
+    fastModel: 'claude-3-5-haiku-latest',
+    smartModel: 'claude-sonnet-4-20250514',
+    authMode: 'apikey',
+    hint: 'Anthropic Claude native Messages API (Haiku for Fast workers, Sonnet for Smart).',
+  },
+  {
+    id: 'openrouter',
+    label: 'OpenRouter',
+    endpointType: 'openai',
+    endpointUrl: 'https://openrouter.ai/api/v1',
+    fastModel: 'openai/gpt-4o-mini',
+    smartModel: 'anthropic/claude-3.5-sonnet',
+    authMode: 'apikey',
+    hint: 'OpenRouter unified API — mix any Fast & Smart model across providers.',
+  },
+  {
+    id: 'groq',
+    label: 'Groq',
+    endpointType: 'openai',
+    endpointUrl: 'https://api.groq.com/openai/v1',
+    fastModel: 'llama-3.1-8b-instant',
+    smartModel: 'llama-3.3-70b-versatile',
+    authMode: 'apikey',
+    hint: 'Ultra-fast Groq inference (Llama 3.1 8B Fast + Llama 3.3 70B Smart).',
+  },
+  {
+    id: 'gemini',
+    label: 'Google Gemini',
+    endpointType: 'openai',
+    endpointUrl: 'https://generativelanguage.googleapis.com/v1beta/openai',
+    fastModel: 'gemini-2.5-flash',
+    smartModel: 'gemini-2.5-pro',
+    authMode: 'apikey',
+    hint: 'Google Gemini via its OpenAI-compatible endpoint (AI Studio API key).',
+  },
+  {
+    id: 'mistral',
+    label: 'Mistral',
+    endpointType: 'openai',
+    endpointUrl: 'https://api.mistral.ai/v1',
+    fastModel: 'mistral-small-latest',
+    smartModel: 'mistral-large-latest',
+    authMode: 'apikey',
+    hint: 'Mistral AI API (Mistral Small Fast + Mistral Large Smart).',
+  },
+  {
+    id: 'ollama',
+    label: 'Direct Ollama',
+    endpointType: 'ollama',
+    endpointUrl: 'http://127.0.0.1:11434',
+    fastModel: 'lfm3:latest',
+    smartModel: 'inkling-2-mini:latest',
+    authMode: 'none',
+    hint: 'Local or LAN Ollama server (no API key required).',
+  },
+  {
+    id: 'lmstudio',
+    label: 'LM Studio',
+    endpointType: 'openai',
+    endpointUrl: 'http://127.0.0.1:1234/v1',
+    fastModel: 'local-model',
+    smartModel: 'local-model',
+    authMode: 'apikey-optional',
+    hint: 'Local LM Studio / llama.cpp / vLLM OpenAI-compatible server.',
+  },
+  {
+    id: 'custom_openai',
+    label: 'Custom OpenAI-Compat',
+    endpointType: 'openai',
+    endpointUrl: 'https://api.example.com/v1',
+    fastModel: '',
+    smartModel: '',
+    authMode: 'apikey-optional',
+    hint: 'Any OpenAI-compatible API endpoint (Together, DeepSeek, LiteLLM, vLLM, etc.).',
+  },
+];
 
 let sessionCookie = '';
 let sessionKey = ''; // endpointUrl + username
@@ -34,6 +142,18 @@ function resetSession() {
   sessionKey = '';
 }
 
+function normalizeOpenAIBase(url) {
+  let u = String(url || '').trim().replace(/\/+$/, '');
+  u = u.replace(/\/chat\/completions$/i, '');
+  return u;
+}
+
+function normalizeAnthropicBase(url) {
+  let u = String(url || '').trim().replace(/\/+$/, '');
+  u = u.replace(/\/v1\/messages$/i, '').replace(/\/v1$/i, '');
+  return u;
+}
+
 async function ensureMxgptAuth(cfg, force = false) {
   const key = `${cfg.endpointUrl}|${cfg.username}`;
   if (!force && sessionCookie && sessionKey === key) return sessionCookie;
@@ -48,7 +168,7 @@ async function ensureMxgptAuth(cfg, force = false) {
       sessionKey = key;
       return '';
     }
-    throw new Error('Sign-in required: open Settings and enter your max.fyreflysystems.de username and password.');
+    throw new Error(`Sign-in required: open Settings and enter your ${cfg.endpointUrl} username and password.`);
   }
 
   const res = await fetch(`${cfg.endpointUrl}/api/login`, {
@@ -74,7 +194,7 @@ async function ensureMxgptAuth(cfg, force = false) {
   return cookie;
 }
 
-async function mxgptFetch(cfg, path, opts = {}, retryAuth = true) {
+async function mxgptFetch(cfg, reqPath, opts = {}, retryAuth = true) {
   const cookie = await ensureMxgptAuth(cfg, false);
   const headers = {
     'user-agent': USER_AGENT,
@@ -82,10 +202,10 @@ async function mxgptFetch(cfg, path, opts = {}, retryAuth = true) {
   };
   if (cookie) headers.cookie = cookie;
 
-  const res = await fetch(`${cfg.endpointUrl}${path}`, { ...opts, headers });
+  const res = await fetch(`${cfg.endpointUrl}${reqPath}`, { ...opts, headers });
   if (res.status === 401 && retryAuth && cfg.username && cfg.password) {
     await ensureMxgptAuth(cfg, true);
-    return mxgptFetch(cfg, path, opts, false);
+    return mxgptFetch(cfg, reqPath, opts, false);
   }
   return res;
 }
@@ -104,12 +224,39 @@ function resolveInklingThink(model, think) {
   return 'minimal';
 }
 
+function openAIHeaders(cfg) {
+  const h = {
+    'content-type': 'application/json',
+    'user-agent': USER_AGENT,
+  };
+  if (cfg.apiKey) h.authorization = `Bearer ${cfg.apiKey}`;
+  if (/openrouter\.ai/i.test(cfg.endpointUrl || '')) {
+    h['HTTP-Referer'] = 'https://github.com/mxsp/mxgpt';
+    h['X-Title'] = 'mx-Cowork';
+  }
+  return h;
+}
+
+function anthropicHeaders(cfg) {
+  const h = {
+    'content-type': 'application/json',
+    'user-agent': USER_AGENT,
+    'anthropic-version': '2023-06-01',
+  };
+  if (cfg.apiKey) h['x-api-key'] = cfg.apiKey;
+  return h;
+}
+
 async function testConnection(overrideCfg = null) {
-  const cfg = { ...storage.getSettings(), ...(overrideCfg || {}) };
-  if (overrideCfg?.password === '__KEEP__') cfg.password = storage.getSettings().password;
+  const saved = storage.getSettings();
+  const cfg = { ...saved, ...(overrideCfg || {}) };
+  if (overrideCfg?.password === '__KEEP__') cfg.password = saved.password;
+  if (overrideCfg?.apiKey === '__KEEP__') cfg.apiKey = saved.apiKey;
   if (!cfg.endpointUrl) throw new Error('Endpoint URL is required');
+  cfg.endpointUrl = String(cfg.endpointUrl).trim().replace(/\/+$/, '');
 
   const t0 = Date.now();
+
   if (cfg.endpointType === 'ollama') {
     const res = await fetch(`${cfg.endpointUrl}/api/tags`, {
       headers: { 'user-agent': USER_AGENT },
@@ -131,7 +278,60 @@ async function testConnection(overrideCfg = null) {
     };
   }
 
-  // mx-GPT endpoint
+  if (cfg.endpointType === 'openai') {
+    const base = normalizeOpenAIBase(cfg.endpointUrl);
+    const res = await fetch(`${base}/models`, {
+      headers: openAIHeaders(cfg),
+      signal: AbortSignal.timeout(12000),
+    });
+    if (!res.ok) {
+      const txt = (await res.text().catch(() => '')).slice(0, 240);
+      throw new Error(`OpenAI-compatible HTTP ${res.status}: ${txt || res.statusText}`);
+    }
+    const data = await res.json();
+    const rawList = Array.isArray(data.data) ? data.data : Array.isArray(data.models) ? data.models : [];
+    const models = rawList
+      .map((m) => ({
+        name: m.id || m.name || '',
+        displayName: m.name || m.id || '',
+      }))
+      .filter((m) => m.name)
+      .sort((a, b) => a.name.localeCompare(b.name));
+    return {
+      ok: true,
+      endpointType: 'openai',
+      endpointUrl: base,
+      latencyMs: Date.now() - t0,
+      models,
+    };
+  }
+
+  if (cfg.endpointType === 'anthropic') {
+    if (!cfg.apiKey) throw new Error('Anthropic API key is required');
+    const base = normalizeAnthropicBase(cfg.endpointUrl || 'https://api.anthropic.com');
+    const res = await fetch(`${base}/v1/models?limit=40`, {
+      headers: anthropicHeaders(cfg),
+      signal: AbortSignal.timeout(12000),
+    });
+    if (!res.ok) {
+      const txt = (await res.text().catch(() => '')).slice(0, 240);
+      throw new Error(`Anthropic HTTP ${res.status}: ${txt || res.statusText}`);
+    }
+    const data = await res.json();
+    const models = (data.data || []).map((m) => ({
+      name: m.id,
+      displayName: m.display_name || m.id,
+    }));
+    return {
+      ok: true,
+      endpointType: 'anthropic',
+      endpointUrl: base,
+      latencyMs: Date.now() - t0,
+      models,
+    };
+  }
+
+  // Default: mx-GPT remote endpoint (https://max.fyreflysystems.de)
   resetSession();
   const res = await mxgptFetch(cfg, '/api/models', { signal: AbortSignal.timeout(15000) });
   if (!res.ok) {
@@ -154,7 +354,8 @@ async function testConnection(overrideCfg = null) {
 }
 
 /**
- * Run a single completion turn against the configured endpoint (mx-GPT or Ollama).
+ * Run a single completion turn against the configured provider
+ * (mx-GPT default, Ollama, OpenAI-compatible, or Anthropic).
  * Streams tokens via onEvent({ type: 'queue'|'thinking'|'text', ... }).
  */
 async function chatCompletion({
@@ -182,6 +383,26 @@ async function chatCompletion({
       onEvent,
     });
   }
+  if (cfg.endpointType === 'openai') {
+    return chatViaOpenAI(cfg, {
+      model: chosenModel,
+      systemPrompt,
+      messages,
+      think,
+      signal,
+      onEvent,
+    });
+  }
+  if (cfg.endpointType === 'anthropic') {
+    return chatViaAnthropic(cfg, {
+      model: chosenModel,
+      systemPrompt,
+      messages,
+      think,
+      signal,
+      onEvent,
+    });
+  }
   return chatViaMxgpt(cfg, {
     model: chosenModel,
     systemPrompt,
@@ -190,6 +411,209 @@ async function chatCompletion({
     signal,
     onEvent,
   });
+}
+
+async function chatViaOpenAI(cfg, { model, systemPrompt, messages, signal, onEvent }) {
+  const base = normalizeOpenAIBase(cfg.endpointUrl);
+  const fullMsgs = [];
+  if (systemPrompt) fullMsgs.push({ role: 'system', content: systemPrompt });
+  for (const m of messages) {
+    fullMsgs.push({
+      role: m.role === 'assistant' ? 'assistant' : 'user',
+      content: String(m.content || ''),
+    });
+  }
+
+  const body = {
+    model,
+    messages: fullMsgs,
+    stream: true,
+    temperature: 0.4,
+  };
+
+  const t0 = Date.now();
+  let firstTokenAt = 0;
+  const res = await fetch(`${base}/chat/completions`, {
+    method: 'POST',
+    headers: openAIHeaders(cfg),
+    body: JSON.stringify(body),
+    signal,
+  });
+  if (!res.ok) {
+    const errTxt = (await res.text().catch(() => '')).slice(0, 350);
+    throw new Error(`Provider HTTP ${res.status}: ${errTxt || res.statusText}`);
+  }
+
+  const reader = res.body.getReader();
+  const dec = new TextDecoder();
+  let buf = '';
+  let content = '';
+  let thinking = '';
+  let promptTokens = 0;
+  let evalTokens = 0;
+  let chunks = 0;
+
+  const handleLine = (line) => {
+    const trimmed = line.trim();
+    if (!trimmed || !trimmed.startsWith('data:')) return;
+    const payload = trimmed.slice(5).trim();
+    if (!payload || payload === '[DONE]') return;
+    let obj;
+    try { obj = JSON.parse(payload); } catch { return; }
+    if (obj.error) {
+      throw new Error(obj.error.message || JSON.stringify(obj.error));
+    }
+    const delta = obj.choices?.[0]?.delta || {};
+    const rDelta = delta.reasoning_content || delta.reasoning || '';
+    if (rDelta) {
+      if (!firstTokenAt) firstTokenAt = Date.now();
+      thinking += rDelta;
+      chunks++;
+      onEvent?.({ type: 'thinking', delta: rDelta });
+    }
+    if (delta.content) {
+      if (!firstTokenAt) firstTokenAt = Date.now();
+      content += delta.content;
+      chunks++;
+      onEvent?.({ type: 'text', delta: delta.content });
+    }
+    if (obj.usage) {
+      promptTokens = obj.usage.prompt_tokens || promptTokens;
+      evalTokens = obj.usage.completion_tokens || evalTokens;
+    }
+  };
+
+  while (true) {
+    const { value, done } = await reader.read();
+    if (done) break;
+    buf += dec.decode(value, { stream: true });
+    let nl;
+    while ((nl = buf.indexOf('\n')) >= 0) {
+      handleLine(buf.slice(0, nl));
+      buf = buf.slice(nl + 1);
+    }
+  }
+  if (buf.trim()) handleLine(buf);
+
+  const elapsedMs = Date.now() - t0;
+  const genSec = Math.max(0.05, (Date.now() - (firstTokenAt || t0)) / 1000);
+  const estTokens = evalTokens || Math.max(chunks, Math.round((content.length + thinking.length) / 4));
+  const tokensPerSec = estTokens > 0 ? Number((estTokens / genSec).toFixed(1)) : 0;
+
+  return {
+    content: content.trim(),
+    thinking: thinking.trim(),
+    model,
+    elapsedMs,
+    usage: { promptTokens, evalTokens: estTokens, tokensPerSec },
+  };
+}
+
+async function chatViaAnthropic(cfg, { model, systemPrompt, messages, signal, onEvent }) {
+  if (!cfg.apiKey) throw new Error('Anthropic API key is required (open Settings).');
+  const base = normalizeAnthropicBase(cfg.endpointUrl || 'https://api.anthropic.com');
+
+  // Anthropic requires strictly alternating user/assistant messages starting with user
+  const cleanMsgs = [];
+  for (const m of messages) {
+    const role = m.role === 'assistant' ? 'assistant' : 'user';
+    const text = String(m.content || '').trim();
+    if (!text) continue;
+    if (cleanMsgs.length && cleanMsgs[cleanMsgs.length - 1].role === role) {
+      cleanMsgs[cleanMsgs.length - 1].content += '\n\n' + text;
+    } else {
+      cleanMsgs.push({ role, content: text });
+    }
+  }
+  if (!cleanMsgs.length || cleanMsgs[0].role !== 'user') {
+    cleanMsgs.unshift({ role: 'user', content: 'Hello.' });
+  }
+
+  const body = {
+    model,
+    max_tokens: 4096,
+    stream: true,
+    messages: cleanMsgs,
+  };
+  if (systemPrompt) body.system = systemPrompt;
+
+  const t0 = Date.now();
+  let firstTokenAt = 0;
+  const res = await fetch(`${base}/v1/messages`, {
+    method: 'POST',
+    headers: anthropicHeaders(cfg),
+    body: JSON.stringify(body),
+    signal,
+  });
+  if (!res.ok) {
+    const errTxt = (await res.text().catch(() => '')).slice(0, 350);
+    throw new Error(`Anthropic HTTP ${res.status}: ${errTxt || res.statusText}`);
+  }
+
+  const reader = res.body.getReader();
+  const dec = new TextDecoder();
+  let buf = '';
+  let content = '';
+  let thinking = '';
+  let promptTokens = 0;
+  let evalTokens = 0;
+
+  const handleBlock = (raw) => {
+    let evName = '';
+    const dataLines = [];
+    for (const line of raw.split(/\r?\n/)) {
+      if (line.startsWith('event:')) evName = line.slice(6).trim();
+      else if (line.startsWith('data:')) dataLines.push(line.slice(5).trim());
+    }
+    if (!dataLines.length) return;
+    let obj;
+    try { obj = JSON.parse(dataLines.join('\n')); } catch { return; }
+
+    if (evName === 'error' || obj.type === 'error') {
+      throw new Error(obj.error?.message || 'Anthropic stream error');
+    }
+    if (obj.type === 'message_start' && obj.message?.usage) {
+      promptTokens = obj.message.usage.input_tokens || promptTokens;
+    } else if (obj.type === 'content_block_delta') {
+      const d = obj.delta || {};
+      if (d.type === 'thinking_delta' && d.thinking) {
+        if (!firstTokenAt) firstTokenAt = Date.now();
+        thinking += d.thinking;
+        onEvent?.({ type: 'thinking', delta: d.thinking });
+      } else if (d.type === 'text_delta' && d.text) {
+        if (!firstTokenAt) firstTokenAt = Date.now();
+        content += d.text;
+        onEvent?.({ type: 'text', delta: d.text });
+      }
+    } else if (obj.type === 'message_delta' && obj.usage) {
+      evalTokens = obj.usage.output_tokens || evalTokens;
+    }
+  };
+
+  while (true) {
+    const { value, done } = await reader.read();
+    if (done) break;
+    buf += dec.decode(value, { stream: true });
+    let sep;
+    while ((sep = buf.indexOf('\n\n')) >= 0) {
+      handleBlock(buf.slice(0, sep));
+      buf = buf.slice(sep + 2);
+    }
+  }
+  if (buf.trim()) handleBlock(buf);
+
+  const elapsedMs = Date.now() - t0;
+  const genSec = Math.max(0.05, (Date.now() - (firstTokenAt || t0)) / 1000);
+  const estTokens = evalTokens || Math.round((content.length + thinking.length) / 4);
+  const tokensPerSec = estTokens > 0 ? Number((estTokens / genSec).toFixed(1)) : 0;
+
+  return {
+    content: content.trim(),
+    thinking: thinking.trim(),
+    model,
+    elapsedMs,
+    usage: { promptTokens, evalTokens: estTokens, tokensPerSec },
+  };
 }
 
 async function chatViaOllama(cfg, { model, systemPrompt, messages, think, priority, signal, onEvent }) {
@@ -429,6 +853,7 @@ async function chatViaMxgpt(cfg, { model, systemPrompt, messages, think, signal,
 }
 
 module.exports = {
+  PROVIDER_PRESETS,
   testConnection,
   chatCompletion,
   resetSession,

@@ -5,22 +5,33 @@ const $$ = (s, root = document) => [...root.querySelectorAll(s)];
 const CW = window.cowork;
 
 const S = {
+  appInfo: null,
   settings: null,
+  providerPresets: [],
+  selectedPreset: 'mxgpt',
+  loginPreset: 'openai',
+  assignModelTarget: 'fast',
+  updateInfo: null,
+  updating: false,
   quickFolders: [],
   mode: 'copilot',
   think: 'low',
   chats: [],
   chat: null,
   messages: [],
+  chatSearch: '',
   streaming: false,
   activeStreamId: null,
   pinnedFiles: [],
   cwd: '',
+  searchActive: false,
+  editor: null, // { path, name, absPath, editable, content, savedContent }
   drafts: [],
   activeDraftId: null,
   briefs: [],
   undo: [],
-  drawerTab: 'files',
+  panelOpen: false,
+  panelTab: 'files',
 };
 
 function esc(s) {
@@ -34,9 +45,39 @@ function esc(s) {
 function toast(msg, ms = 2600) {
   const el = $('#toast');
   el.textContent = msg;
-  el.hidden = false;
+  el.classList.add('on');
   clearTimeout(toast._t);
-  toast._t = setTimeout(() => { el.hidden = true; }, ms);
+  toast._t = setTimeout(() => el.classList.remove('on'), ms);
+}
+
+// Inline modal prompt (Electron disables window.prompt)
+function askText({ title, label, value = '', placeholder = '' }) {
+  return new Promise((resolve) => {
+    const modal = $('#promptModal');
+    const inp = $('#promptModalInput');
+    $('#promptModalTitle').textContent = title;
+    $('#promptModalLabel').textContent = label;
+    inp.value = value;
+    inp.placeholder = placeholder;
+    modal.hidden = false;
+    setTimeout(() => { inp.focus(); inp.select(); }, 20);
+
+    const finish = (val) => {
+      modal.hidden = true;
+      $('#promptOkBtn').onclick = null;
+      $('#promptCancelBtn').onclick = null;
+      $('#promptCancelX').onclick = null;
+      inp.onkeydown = null;
+      resolve(val);
+    };
+    $('#promptOkBtn').onclick = () => finish(inp.value.trim() || null);
+    $('#promptCancelBtn').onclick = () => finish(null);
+    $('#promptCancelX').onclick = () => finish(null);
+    inp.onkeydown = (e) => {
+      if (e.key === 'Enter') { e.preventDefault(); finish(inp.value.trim() || null); }
+      if (e.key === 'Escape') { e.preventDefault(); finish(null); }
+    };
+  });
 }
 
 // Lightweight safe Markdown renderer (hides raw email-draft / file-actions JSON blocks)
@@ -100,20 +141,34 @@ function renderMd(raw) {
     out.push(`<p>${inline(line)}</p>`);
   }
   closeLists();
-
   return out.join('\n').replace(/\x00BLK(\d+)\x00/g, (_, i) => blocks[Number(i)] || '');
 }
 
-const MODE_HINTS = {
-  fast: 'Fast: LFM3 1.7B direct (~27 t/s) · instant answers & quick edits',
-  smart: 'Smart: Inkling 26B direct · deep reasoning & writing',
-  copilot: 'Copilot: Smart plans & synthesizes · Fast delegates file/web retrieval',
-};
+function updateGreeting() {
+  const h = new Date().getHours();
+  const base = h < 12 ? 'Good morning' : h < 18 ? 'Good afternoon' : 'Good evening';
+  const name = S.settings?.username ? `, ${S.settings.username}` : '';
+  $('#greeting').textContent = base + name;
+}
+
+function modeHintText(m) {
+  const fast = (S.settings?.fastModel || 'lfm3:latest').replace(/:latest$/, '');
+  const smart = (S.settings?.smartModel || 'inkling-2-mini:latest').replace(/:latest$/, '');
+  if (m === 'fast') return `Fast: ${fast} direct`;
+  if (m === 'smart') return `Smart: ${smart} direct`;
+  return `Copilot: ${smart} orchestrates · ${fast} retrieves`;
+}
 
 function setMode(m) {
   S.mode = m;
-  $$('#modeSeg button').forEach((b) => b.classList.toggle('on', b.dataset.mode === m));
-  $('#modeHint').textContent = MODE_HINTS[m] || '';
+  $('#modeControl').dataset.mode = m;
+  $$('#modeSeg button').forEach((b) => {
+    const on = b.dataset.mode === m;
+    b.classList.toggle('on', on);
+    b.setAttribute('aria-checked', String(on));
+  });
+  $('#modeHint').textContent = modeHintText(m);
+  $('#topModel').textContent = m === 'fast' ? 'Fast' : m === 'smart' ? 'Smart' : 'Copilot';
 }
 
 function setThink(t) {
@@ -121,41 +176,180 @@ function setThink(t) {
   $$('#thinkSeg button').forEach((b) => b.classList.toggle('on', b.dataset.think === t));
 }
 
-function setDrawerTab(tab) {
-  S.drawerTab = tab;
-  $('#app').classList.remove('drawer-closed');
-  $$('#drawerTabs button').forEach((b) => b.classList.toggle('on', b.dataset.tab === tab));
-  $$('.tab-pane').forEach((p) => p.classList.toggle('active', p.dataset.pane === tab));
-  if (tab === 'files') loadFiles(S.cwd);
+function applyThemeUI(theme) {
+  const t = theme === 'dark' ? 'dark' : 'light';
+  document.documentElement.dataset.theme = t;
+  $('#themeIcon use').setAttribute('href', t === 'dark' ? '#i-sun' : '#i-moon');
+}
+
+async function toggleTheme() {
+  const next = document.documentElement.dataset.theme === 'dark' ? 'light' : 'dark';
+  applyThemeUI(next);
+  await CW.saveSettings({ theme: next });
+}
+
+// ---- Right Slide-Out Panel (identical to mx-GPT webapp)
+const PANEL_META = {
+  files: { title: 'OS Files & Editor', icon: '#i-folder' },
+  email: { title: 'Email Studio', icon: '#i-mail' },
+  research: { title: 'Research Desk', icon: '#i-globe' },
+  undo: { title: 'Undo History', icon: '#i-undo' },
+};
+
+function openPanel(tab, toggleIfSame = false) {
+  if (toggleIfSame && S.panelOpen && S.panelTab === tab) {
+    closePanel();
+    return;
+  }
+  S.panelOpen = true;
+  S.panelTab = tab;
+  $('#panel').classList.add('open');
+  $('#panel').setAttribute('aria-hidden', 'false');
+  const meta = PANEL_META[tab] || PANEL_META.files;
+  $('#panelTitle').textContent = meta.title;
+  $('#panelIcon use').setAttribute('href', meta.icon);
+
+  $$('.top-actions .ghost-btn[data-panel]').forEach((b) => {
+    b.classList.toggle('active', b.dataset.panel === tab);
+  });
+  $$('.pane').forEach((p) => p.classList.toggle('active', p.dataset.pane === tab));
+
+  if (tab === 'files' && !S.editor) loadFiles(S.cwd);
   if (tab === 'email') loadDrafts();
   if (tab === 'research') loadBriefs();
   if (tab === 'undo') loadUndo();
 }
 
-// ---- Boot & Settings
+function closePanel() {
+  S.panelOpen = false;
+  $('#panel').classList.remove('open');
+  $('#panel').setAttribute('aria-hidden', 'true');
+  $$('.top-actions .ghost-btn[data-panel]').forEach((b) => b.classList.remove('active'));
+}
+
+// ---- Account & Connection Header/Footer State
+function renderAccountUI() {
+  const s = S.settings || {};
+  let host = 'max.fyreflysystems.de';
+  try { host = new URL(s.endpointUrl || 'https://max.fyreflysystems.de').host; } catch {}
+
+  const preset = S.providerPresets.find((p) => p.id === s.providerPreset);
+  const displayName = s.endpointType === 'mxgpt'
+    ? (s.username ? `User ${s.username}` : 'mx-GPT')
+    : (preset?.label || s.endpointType || 'Provider');
+
+  $('#userName').textContent = displayName;
+  $('#userAvatar').textContent = (displayName[0] || 'M').toUpperCase();
+  $('#connLabel').textContent = host;
+  $('#footProviderBtn').textContent = host;
+  $('#modeHint').textContent = modeHintText(S.mode);
+  updateGreeting();
+}
+
+function shouldShowLogin() {
+  const s = S.settings || {};
+  if (s.signedIn) return false;
+  if (s.endpointType === 'ollama') return false;
+  if (s.endpointType === 'mxgpt' && s.username && s.hasPassword) return false;
+  if ((s.endpointType === 'openai' || s.endpointType === 'anthropic') && s.hasApiKey) return false;
+  return true;
+}
+
+function showLoginScreen() {
+  const s = S.settings || {};
+  $('#loginUrl').value = s.endpointUrl && s.endpointType === 'mxgpt'
+    ? s.endpointUrl
+    : 'https://max.fyreflysystems.de';
+  $('#loginUser').value = s.username || '';
+  $('#loginPw').value = '';
+  $('#loginErr').textContent = '';
+  $('#lpErr').textContent = '';
+  renderLoginProviderChips();
+  selectLoginPreset(S.loginPreset || 'openai');
+  $('#loginScreen').hidden = false;
+  setTimeout(() => $('#loginUser').focus(), 40);
+}
+
+function hideLoginScreen() {
+  $('#loginScreen').hidden = true;
+}
+
+function renderLoginProviderChips() {
+  const wrap = $('#loginProviderChips');
+  wrap.innerHTML = '';
+  for (const p of S.providerPresets.filter((x) => x.id !== 'mxgpt')) {
+    const btn = document.createElement('button');
+    btn.type = 'button';
+    btn.className = 'prov-chip' + (S.loginPreset === p.id ? ' on' : '');
+    btn.textContent = p.label;
+    btn.onclick = () => selectLoginPreset(p.id);
+    wrap.appendChild(btn);
+  }
+}
+
+function selectLoginPreset(id) {
+  const p = S.providerPresets.find((x) => x.id === id) || S.providerPresets[1];
+  if (!p) return;
+  S.loginPreset = p.id;
+  $('#lpUrl').value = p.endpointUrl;
+  $('#lpFast').value = p.fastModel || '';
+  $('#lpSmart').value = p.smartModel || '';
+  $('#lpKeyWrap').hidden = p.endpointType === 'ollama';
+  renderLoginProviderChips();
+}
+
+async function checkConnectionQuiet() {
+  try {
+    const r = await CW.testEndpoint({});
+    const host = new URL(r.endpointUrl).host;
+    $('#connLabel').textContent = `${host} · ${r.latencyMs}ms`;
+    $('#footProviderBtn').textContent = host;
+  } catch {
+    const t = S.settings?.endpointType || 'mxgpt';
+    $('#connLabel').textContent = t === 'mxgpt' ? 'Not signed in — click' : 'Provider offline';
+  }
+}
+
+// ---- Boot
 async function boot() {
   if (!CW) throw new Error('Native Electron preload bridge unavailable');
-  const data = await CW.getSettings();
+  const [info, data, prov] = await Promise.all([
+    CW.appInfo(),
+    CW.getSettings(),
+    CW.getProviderPresets(),
+  ]);
+  S.appInfo = info;
   S.settings = data.settings;
+  S.providerPresets = prov?.presets || [];
   S.quickFolders = data.quickFolders || [];
-  document.documentElement.dataset.theme = S.settings.theme || 'light';
+
+  $('#appVersionBadge').textContent = `v${info.version || '1.2.0'}`;
+  applyThemeUI(S.settings.theme || 'light');
   setMode(S.settings.defaultMode || 'copilot');
   setThink(S.settings.think || 'low');
-  renderWorkspaceBox();
+  renderAccountUI();
+  renderWorkspaceUI();
+
+  if (shouldShowLogin()) {
+    showLoginScreen();
+  }
+
   await Promise.all([loadChats(), loadFiles(''), loadDrafts(), loadBriefs(), loadUndo()]);
   checkConnectionQuiet();
+  checkUpdatesQuiet();
 
-  // Native OS menu bar actions
+  CW.onUpdateProgress((p) => renderUpdateProgress(p));
   CW.onMenuAction(({ action, payload }) => {
     if (action === 'new-task') newChat();
     else if (action === 'pick-folder') pickWorkspaceFolder();
     else if (action === 'open-settings') openSettings();
+    else if (action === 'open-updates') openUpdatesModal();
     else if (action === 'set-mode') setMode(payload);
-    else if (action === 'toggle-drawer') $('#app').classList.toggle('drawer-closed');
+    else if (action === 'toggle-drawer') S.panelOpen ? closePanel() : openPanel(S.panelTab || 'files');
     else if (action === 'toggle-theme') toggleTheme();
   });
 
-  // Drag & drop local files anywhere onto the app window to pin them to chat
+  // Drag & drop local files onto the window to pin them to chat
   document.addEventListener('dragover', (e) => { e.preventDefault(); });
   document.addEventListener('drop', async (e) => {
     e.preventDefault();
@@ -167,12 +361,60 @@ async function boot() {
         if (!S.pinnedFiles.includes(p)) S.pinnedFiles.push(p);
       }
       renderPinned();
-      loadFiles(S.cwd);
+      if (S.panelOpen && S.panelTab === 'files' && !S.editor) loadFiles(S.cwd);
       toast(`Pinned ${res.pinned.length} file${res.pinned.length > 1 ? 's' : ''}`);
     } else {
-      toast('Drop files inside your current workspace folder to pin them');
+      toast('Tip: click + in the composer to attach files from any folder');
     }
   });
+
+  // Global keyboard shortcuts (Ctrl+S saves active file in editor)
+  document.addEventListener('keydown', (e) => {
+    if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === 's') {
+      if (S.panelOpen && S.panelTab === 'files' && S.editor?.editable) {
+        e.preventDefault();
+        saveEditorFile();
+      }
+    }
+  });
+}
+
+// ---- Workspace & OS Folder Navigation
+function renderWorkspaceUI() {
+  const ws = S.settings?.workspace || '';
+  const base = ws.split(/[\\/]/).filter(Boolean).pop() || ws || '/';
+  $('#wsTopLabel').textContent = base;
+  $('#wsTopPill').title = `OS Folder: ${ws}`;
+  $('#osPathInput').value = S.cwd ? `${ws.replace(/[\\/]+$/, '')}/${S.cwd}` : ws;
+
+  const q = $('#wsQuick');
+  q.innerHTML = '';
+  for (const f of S.quickFolders) {
+    const btn = document.createElement('button');
+    btn.textContent = f.label;
+    btn.title = f.path;
+    btn.className = ws === f.path ? 'on' : '';
+    btn.onclick = () => navigateOsTo(f.path);
+    q.appendChild(btn);
+  }
+}
+
+async function navigateOsTo(targetPath) {
+  try {
+    const res = await CW.navigateOs(targetPath);
+    S.settings = res.settings;
+    S.cwd = '';
+    S.pinnedFiles = [];
+    S.searchActive = false;
+    $('#fileSearchInput').value = '';
+    $('#fileSearchClearBtn').hidden = true;
+    closeFileEditor(true);
+    renderWorkspaceUI();
+    renderPinned();
+    await loadFiles('');
+  } catch (e) {
+    toast(e.message, 3500);
+  }
 }
 
 async function pickWorkspaceFolder() {
@@ -181,72 +423,58 @@ async function pickWorkspaceFolder() {
   S.settings = res.settings;
   S.cwd = '';
   S.pinnedFiles = [];
-  renderWorkspaceBox();
+  closeFileEditor(true);
+  renderWorkspaceUI();
   renderPinned();
-  loadFiles('');
+  openPanel('files');
+  await loadFiles('');
   toast(`Workspace → ${res.workspace}`);
 }
 
-async function toggleTheme() {
-  const next = document.documentElement.dataset.theme === 'dark' ? 'light' : 'dark';
-  document.documentElement.dataset.theme = next;
-  await CW.saveSettings({ theme: next });
+// ---- Chats Sidebar (grouped like mx-GPT webapp)
+function chatGroupLabel(ts) {
+  const d = new Date(ts || 0);
+  const now = new Date();
+  const startToday = new Date(now.getFullYear(), now.getMonth(), now.getDate()).getTime();
+  if (d.getTime() >= startToday) return 'Today';
+  if (d.getTime() >= startToday - 86400000) return 'Yesterday';
+  return 'Earlier';
 }
 
-function renderWorkspaceBox() {
-  const ws = S.settings?.workspace || '';
-  $('#wsPath').textContent = ws;
-  $('#wsPath').title = ws;
-  const q = $('#wsQuick');
-  q.innerHTML = '';
-  for (const f of S.quickFolders) {
-    const btn = document.createElement('button');
-    btn.textContent = f.label;
-    btn.title = f.path;
-    btn.onclick = async () => {
-      const res = await CW.saveSettings({ workspace: f.path });
-      S.settings = res.settings;
-      S.cwd = '';
-      S.pinnedFiles = [];
-      renderWorkspaceBox();
-      renderPinned();
-      loadFiles('');
-      toast(`Workspace → ${f.label}`);
-    };
-    q.appendChild(btn);
-  }
-}
-
-async function checkConnectionQuiet() {
-  const pill = $('#connPill');
-  const lbl = $('#connLabel');
-  try {
-    const r = await CW.testEndpoint({});
-    pill.className = 'conn-pill ok';
-    const host = new URL(r.endpointUrl).host;
-    lbl.textContent = `${host} · ${r.latencyMs}ms`;
-  } catch {
-    pill.className = 'conn-pill err';
-    lbl.textContent = S.settings?.username ? 'Endpoint error — click' : 'Sign in to endpoint';
-  }
-}
-
-// ---- Chats
 async function loadChats() {
   const d = await CW.listChats();
   S.chats = d.chats || [];
+  renderChatList();
+}
+
+function renderChatList() {
   const list = $('#chatList');
+  const q = S.chatSearch.trim().toLowerCase();
+  const filtered = q ? S.chats.filter((c) => (c.title || '').toLowerCase().includes(q)) : S.chats;
   list.innerHTML = '';
-  for (const c of S.chats) {
+  if (!filtered.length) {
+    list.innerHTML = `<div class="sb-empty">${q ? 'No matching chats' : 'No conversations yet'}</div>`;
+    return;
+  }
+
+  let lastGroup = '';
+  for (const c of filtered) {
+    const grp = chatGroupLabel(c.updated);
+    if (grp !== lastGroup) {
+      lastGroup = grp;
+      const lbl = document.createElement('div');
+      lbl.className = 'sb-label';
+      lbl.textContent = grp;
+      list.appendChild(lbl);
+    }
     const row = document.createElement('div');
-    row.className = 'chat-row' + (S.chat?.id === c.id ? ' active' : '');
-    const icon = c.mode === 'fast' ? '⚡' : c.mode === 'smart' ? '◆' : '✦';
-    row.innerHTML = `<span class="cr-mode">${icon}</span><span class="cr-title">${esc(c.title)}</span><button class="cr-del" title="Delete">✕</button>`;
+    row.className = 'chat-item' + (S.chat?.id === c.id ? ' active' : '');
+    row.innerHTML = `<span class="ci-title">${esc(c.title)}</span><button class="ci-del" title="Delete chat"><svg><use href="#i-trash"/></svg></button>`;
     row.onclick = (e) => {
-      if (e.target.closest('.cr-del')) return;
+      if (e.target.closest('.ci-del')) return;
       openChat(c.id);
     };
-    row.querySelector('.cr-del').onclick = async (e) => {
+    row.querySelector('.ci-del').onclick = async (e) => {
       e.stopPropagation();
       await CW.deleteChat(c.id);
       if (S.chat?.id === c.id) { S.chat = null; S.messages = []; renderMessages(); }
@@ -260,32 +488,34 @@ async function openChat(id) {
   const d = await CW.getChat(id);
   S.chat = d.chat;
   S.messages = d.chat.messages || [];
+  $('#chatTitle').textContent = d.chat.title || 'New chat';
   if (d.chat.mode) setMode(d.chat.mode);
   renderMessages();
-  loadChats();
+  renderChatList();
 }
 
 function newChat() {
   S.chat = null;
   S.messages = [];
+  $('#chatTitle').textContent = 'New chat';
   renderMessages();
-  loadChats();
+  renderChatList();
   $('#promptInput').focus();
 }
 
-// ---- Rendering Messages & Coworker Cards
+// ---- Messages Rendering (exact mx-GPT webapp layout)
 function renderPinned() {
   const bar = $('#pinnedBar');
   if (!S.pinnedFiles.length) { bar.hidden = true; bar.innerHTML = ''; return; }
   bar.hidden = false;
   bar.innerHTML = S.pinnedFiles.map((p) =>
-    `<span class="pin-chip">📄 ${esc(p)} <button data-unpin="${esc(p)}">×</button></span>`
+    `<span class="attach-pill"><svg style="width:14px;height:14px;color:var(--accent)"><use href="#i-file"/></svg><span title="${esc(p)}">${esc(p)}</span><button data-unpin="${esc(p)}" title="Remove"><svg style="width:12px;height:12px"><use href="#i-x"/></svg></button></span>`
   ).join('');
   $$('[data-unpin]', bar).forEach((b) => {
     b.onclick = () => {
       S.pinnedFiles = S.pinnedFiles.filter((x) => x !== b.dataset.unpin);
       renderPinned();
-      loadFiles(S.cwd);
+      if (S.panelOpen && S.panelTab === 'files' && !S.editor) loadFiles(S.cwd);
     };
   });
 }
@@ -293,40 +523,43 @@ function renderPinned() {
 function renderCopilotPanel(msg) {
   if (!msg.plan && !(msg.workers && msg.workers.length)) return null;
   const panel = document.createElement('div');
-  panel.className = 'copilot-panel';
+  panel.className = 'subagents-panel';
   const workers = msg.workers || [];
   const running = workers.filter((w) => w.status === 'running').length;
   const done = workers.filter((w) => w.status === 'done' || w.ok).length;
 
   const head = document.createElement('div');
-  head.className = 'cp-head';
+  head.className = 'subagents-header';
   head.innerHTML = `
-    <span class="cp-title">✦ Copilot Plan: ${esc(msg.plan?.goal || 'Orchestrating')}</span>
-    <span class="cp-flow">${workers.length ? `Smart → ${workers.length} Fast worker${workers.length > 1 ? 's' : ''} (${done}/${workers.length} done${running ? ', running' : ''}) → Smart` : 'Smart direct'}</span>`;
+    <span class="sa-h-icon"><svg><use href="#i-agents"/></svg></span>
+    <span class="sa-h-title">${esc(msg.plan?.goal || 'Copilot Orchestration')}</span>
+    <span class="sa-h-meta">${workers.length ? `${done}/${workers.length} fast workers${running ? ' · running' : ''}` : 'Smart direct'}</span>`;
   panel.appendChild(head);
 
   if (workers.length) {
     const grid = document.createElement('div');
-    grid.className = 'cp-grid';
+    grid.className = 'subagents-grid';
     for (const w of workers) {
       const card = document.createElement('div');
       const isRun = w.status === 'running';
       const isErr = w.status === 'error' || w.ok === false;
-      card.className = 'worker-card' + (isRun ? ' running open' : isErr ? ' error' : '');
+      card.className = 'subagent-card' + (isRun ? ' running open' : isErr ? ' error' : '');
       const stat = isRun
-        ? `<span class="wk-stat"><span class="spin"></span>Running</span>`
+        ? `<span class="sa-pill running">Running</span>`
         : isErr
-          ? `<span class="wk-stat err">Failed</span>`
-          : `<span class="wk-stat done">✓ ${w.elapsedMs ? (w.elapsedMs / 1000).toFixed(1) + 's' : 'Done'}${w.tokensPerSec ? ' · ' + w.tokensPerSec + ' t/s' : ''}</span>`;
+          ? `<span class="sa-pill error">Failed</span>`
+          : `<span class="sa-pill done">${w.elapsedMs ? (w.elapsedMs / 1000).toFixed(1) + 's' : 'Done'}${w.tokensPerSec ? ' · ' + w.tokensPerSec + ' t/s' : ''}</span>`;
       card.innerHTML = `
-        <div class="wk-head">
-          <span class="wk-role" data-role="${esc(w.role || 'analyst')}">${esc(w.label || 'Worker')}</span>
-          <span class="wk-model">${esc((w.model || 'lfm3').replace(/:latest$/, ''))}</span>
-          ${stat}
-        </div>
-        <div class="wk-task">${esc(w.task || '')}</div>
-        <div class="wk-body">${esc(w.brief || w.stream || w.error || 'Retrieving…')}</div>`;
-      card.querySelector('.wk-head').onclick = () => card.classList.toggle('open');
+        <button type="button" class="subagent-head">
+          <div class="subagent-top">
+            <span class="subagent-role">${esc(w.label || 'Worker')}</span>
+            <span class="subagent-model">${esc((w.model || 'fast').replace(/:latest$/, ''))}</span>
+            ${stat}
+          </div>
+          <div class="subagent-task">${esc(w.task || '')}</div>
+        </button>
+        <div class="subagent-body">${esc(w.brief || w.stream || w.error || 'Retrieving…')}</div>`;
+      card.querySelector('.subagent-head').onclick = () => card.classList.toggle('open');
       grid.appendChild(card);
     }
     panel.appendChild(grid);
@@ -339,19 +572,19 @@ function renderEmailCard(draft) {
   card.className = 'action-card';
   card.innerHTML = `
     <div class="ac-head">
-      <div class="ac-title">✉️ Email Draft Ready</div>
-      <div class="pane-btns">
-        <button class="mini-btn" data-em="copy">Copy</button>
-        <button class="mini-btn" data-em="open">Open in Mail</button>
-        <button class="mini-btn" data-em="eml">Save .eml…</button>
-        <button class="mini-btn primary" data-em="edit">Edit in Studio</button>
+      <div class="ac-title">Email Draft Ready</div>
+      <div class="row-gap">
+        <button class="btn tiny" data-em="copy">Copy</button>
+        <button class="btn tiny" data-em="open">Open in Mail</button>
+        <button class="btn tiny" data-em="eml">Save .eml</button>
+        <button class="btn tiny primary" data-em="edit">Edit in Studio</button>
       </div>
     </div>
     <div class="ac-row">
       <div class="ac-desc">
         ${draft.to ? `<div><b>To:</b> ${esc(draft.to)}</div>` : ''}
         <div><b>Subject:</b> ${esc(draft.subject || '(No subject)')}</div>
-        <div class="ac-reason" style="white-space:pre-wrap;margin-top:6px;color:var(--text-2)">${esc((draft.body || '').slice(0, 320))}${(draft.body || '').length > 320 ? '…' : ''}</div>
+        <div class="ac-reason" style="white-space:pre-wrap;margin-top:5px;color:var(--text-2)">${esc((draft.body || '').slice(0, 300))}${(draft.body || '').length > 300 ? '…' : ''}</div>
       </div>
     </div>`;
   card.querySelector('[data-em="copy"]').onclick = () => {
@@ -365,7 +598,7 @@ function renderEmailCard(draft) {
   };
   card.querySelector('[data-em="edit"]').onclick = () => {
     loadDraftIntoStudio(draft);
-    setDrawerTab('email');
+    openPanel('email');
   };
   return card;
 }
@@ -376,8 +609,8 @@ function renderFileActionsCard(actions) {
   const pendingCount = actions.filter((a) => a.status === 'pending').length;
   card.innerHTML = `
     <div class="ac-head">
-      <div class="ac-title">🗂 Proposed File Actions (${actions.length})</div>
-      ${pendingCount > 0 ? `<button class="mini-btn primary" data-apply-all>Apply All (${pendingCount})</button>` : '<span class="ac-stat">Processed</span>'}
+      <div class="ac-title">Proposed Local File Actions (${actions.length})</div>
+      ${pendingCount > 0 ? `<button class="btn tiny primary" data-apply-all>Apply All (${pendingCount})</button>` : '<span class="ac-stat">Processed</span>'}
     </div>`;
 
   for (const act of actions) {
@@ -393,11 +626,11 @@ function renderFileActionsCard(actions) {
         ${act.reason ? `<div class="ac-reason">${esc(act.reason)}</div>` : ''}
         ${act.result ? `<div class="ac-reason">${esc(act.result)}</div>` : ''}
       </div>
-      <div class="pane-btns"></div>`;
-    const btns = row.querySelector('.pane-btns');
+      <div class="row-gap"></div>`;
+    const btns = row.querySelector('.row-gap');
     if (act.status === 'pending') {
       const appBtn = document.createElement('button');
-      appBtn.className = 'mini-btn primary';
+      appBtn.className = 'btn tiny primary';
       appBtn.textContent = 'Apply';
       appBtn.onclick = async () => {
         appBtn.disabled = true;
@@ -412,17 +645,17 @@ function renderFileActionsCard(actions) {
         }
       };
       const skBtn = document.createElement('button');
-      skBtn.className = 'mini-btn';
+      skBtn.className = 'btn tiny';
       skBtn.textContent = 'Skip';
       skBtn.onclick = () => { act.status = 'skipped'; renderMessages(); };
       btns.append(appBtn, skBtn);
     } else if (act.status === 'applied') {
       const st = document.createElement('span');
-      st.className = 'ac-stat'; st.textContent = '✓ Applied';
+      st.className = 'ac-stat'; st.textContent = 'Applied';
       btns.appendChild(st);
       if (act.undoId) {
         const uBtn = document.createElement('button');
-        uBtn.className = 'mini-btn'; uBtn.textContent = 'Undo';
+        uBtn.className = 'btn tiny'; uBtn.textContent = 'Undo';
         uBtn.onclick = async () => {
           const r = await CW.undoFileAction(act.undoId);
           act.status = 'pending'; act.undoId = null; act.result = r.summary;
@@ -472,69 +705,74 @@ function renderMessages() {
       continue;
     }
 
-    const modeCls = m.mode || 'copilot';
-    const spd = m.usage?.tokensPerSec ? `${m.usage.tokensPerSec} t/s` : '';
-    const meta = document.createElement('div');
-    meta.className = 'msg-meta';
-    meta.innerHTML = `<span class="mode-tag ${esc(modeCls)}">${esc(modeCls)}</span>${m.model ? `<span>${esc(m.model.replace(/:latest$/, ''))}</span>` : ''}${spd ? `<span>· ${esc(spd)}</span>` : ''}`;
-    el.appendChild(meta);
+    const av = document.createElement('div');
+    av.className = 'msg-avatar' + (m.streaming ? ' spin' : '');
+    av.innerHTML = '<svg><use href="#i-star"/></svg>';
+    el.appendChild(av);
+
+    const body = document.createElement('div');
+    body.className = 'msg-body';
 
     if (m.livePhase) {
       const ph = document.createElement('div');
-      ph.className = 'live-phase' + (m.queuePos ? ' queued' : '');
-      ph.innerHTML = `<span class="spin"></span><span>${esc(m.livePhase)}</span>`;
-      el.appendChild(ph);
+      ph.className = 'loading-state' + (m.queuePos ? ' queued' : '');
+      ph.innerHTML = `<span class="mini-spin"></span><span>${esc(m.livePhase)}</span>`;
+      body.appendChild(ph);
     }
 
     const cp = renderCopilotPanel(m);
-    if (cp) el.appendChild(cp);
+    if (cp) body.appendChild(cp);
 
     if (m.thinking) {
       const th = document.createElement('details');
       th.className = 'think-box';
-      th.innerHTML = `<summary>Reasoning (${m.thinking.length} chars)</summary><pre>${esc(m.thinking)}</pre>`;
-      el.appendChild(th);
+      th.innerHTML = `<summary>Thinking (${m.thinking.length} chars)</summary><pre>${esc(m.thinking)}</pre>`;
+      body.appendChild(th);
     }
 
     if (m.content) {
       const pr = document.createElement('div');
       pr.className = 'prose';
       pr.innerHTML = renderMd(m.content);
-      el.appendChild(pr);
+      body.appendChild(pr);
     }
 
-    if (m.emailDraft) el.appendChild(renderEmailCard(m.emailDraft));
-    if (m.fileActions?.length) el.appendChild(renderFileActionsCard(m.fileActions));
+    if (m.emailDraft) body.appendChild(renderEmailCard(m.emailDraft));
+    if (m.fileActions?.length) body.appendChild(renderFileActionsCard(m.fileActions));
 
     if (m.sources?.length) {
       const sr = document.createElement('div');
-      sr.className = 'sources-row';
+      sr.className = 'sources';
       for (const s of m.sources.slice(0, 10)) {
         if (s.type === 'url' && s.url) {
           const b = document.createElement('button');
-          b.className = 'src-pill';
-          b.innerHTML = `🌐 <span>${esc(s.title || s.url)}</span>`;
+          b.className = 'src-chip';
+          b.innerHTML = `<svg style="width:13px;height:13px;color:var(--accent)"><use href="#i-globe"/></svg><span>${esc(s.title || s.url)}</span>`;
           b.onclick = () => CW.openExternal(s.url);
           sr.appendChild(b);
         } else if (s.path) {
           const b = document.createElement('button');
-          b.className = 'src-pill';
-          b.innerHTML = `📄 <span>${esc(s.path)}</span>`;
-          b.onclick = () => { setDrawerTab('files'); previewFile(s.path); };
+          b.className = 'src-chip';
+          b.innerHTML = `<svg style="width:13px;height:13px;color:var(--accent)"><use href="#i-file"/></svg><span>${esc(s.path)}</span>`;
+          b.onclick = () => { openPanel('files'); openFileInEditor(s.path); };
           sr.appendChild(b);
         }
       }
-      el.appendChild(sr);
+      body.appendChild(sr);
     }
 
     if (!m.streaming && m.content) {
-      const bar = document.createElement('div');
-      bar.className = 'msg-bar';
+      const foot = document.createElement('div');
+      foot.className = 'msg-foot-bar';
+      const spd = m.usage?.tokensPerSec ? `${m.usage.tokensPerSec} t/s` : '';
+      const info = [m.mode || 'copilot', m.model ? m.model.replace(/:latest$/, '') : '', spd].filter(Boolean).join(' · ');
+      const span = document.createElement('span');
+      span.textContent = info;
       const cpBtn = document.createElement('button');
-      cpBtn.className = 'mini-btn'; cpBtn.textContent = 'Copy';
+      cpBtn.textContent = 'Copy';
       cpBtn.onclick = () => { navigator.clipboard?.writeText(m.content); toast('Copied'); };
       const svBtn = document.createElement('button');
-      svBtn.className = 'mini-btn'; svBtn.textContent = 'Save as Research Brief';
+      svBtn.textContent = 'Save Brief';
       svBtn.onclick = async () => {
         await CW.saveBrief({
           title: (m.plan?.goal || S.chat?.title || 'Research Brief').slice(0, 80),
@@ -544,17 +782,18 @@ function renderMessages() {
         toast('Saved to Research Desk');
         loadBriefs();
       };
-      bar.append(cpBtn, svBtn);
-      el.appendChild(bar);
+      foot.append(span, cpBtn, svBtn);
+      body.appendChild(foot);
     }
 
+    el.appendChild(body);
     wrap.appendChild(el);
   }
-  const feed = $('#feed');
-  feed.scrollTop = feed.scrollHeight;
+  const sc = $('#scrollArea');
+  sc.scrollTop = sc.scrollHeight;
 }
 
-// ---- Send / Stream Cowork Turn over Direct Electron IPC
+// ---- Send / Stream Cowork Turn
 async function sendPrompt(overrideText = null) {
   if (S.streaming) {
     if (S.chat?.id) CW.stopCowork(S.chat.id).catch(() => {});
@@ -586,7 +825,7 @@ async function sendPrompt(overrideText = null) {
   S.messages.push(assistant);
   S.streaming = true;
   $('#sendBtn').classList.add('stop');
-  $('#sendBtn').textContent = 'Stop ■';
+  $('#sendIcon use').setAttribute('href', '#i-stop');
   renderMessages();
 
   const activeDraft = ($('#mailSubject').value || $('#mailBody').value)
@@ -603,6 +842,7 @@ async function sendPrompt(overrideText = null) {
     if (sid !== streamId) return;
     if (ev === 'chat' && d.chat) {
       S.chat = d.chat;
+      $('#chatTitle').textContent = d.chat.title || 'New chat';
       loadChats();
     } else if (ev === 'phase') {
       assistant.queuePos = 0;
@@ -657,7 +897,7 @@ async function sendPrompt(overrideText = null) {
       assistant.livePhase = '';
       assistant.streaming = false;
       assistant.content += `\n\n> **Error:** ${d.message}`;
-      toast(d.message, 4000);
+      toast(d.message, 4500);
       renderMessages();
     }
   });
@@ -674,7 +914,7 @@ async function sendPrompt(overrideText = null) {
     });
   } catch (e) {
     assistant.content += `\n\n> **Error:** ${e.message}`;
-    toast(e.message, 4000);
+    toast(e.message, 4500);
   } finally {
     off();
     assistant.streaming = false;
@@ -682,50 +922,93 @@ async function sendPrompt(overrideText = null) {
     S.streaming = false;
     S.activeStreamId = null;
     $('#sendBtn').classList.remove('stop');
-    $('#sendBtn').textContent = 'Send ↑';
+    $('#sendIcon use').setAttribute('href', '#i-send');
     renderMessages();
   }
 }
 
-// ---- Files Pane
+// ---- OS File Browser + Find + Live File Editor
+function renderFileCrumbs() {
+  const wrap = $('#fileCrumbs');
+  wrap.innerHTML = '';
+  const rootBtn = document.createElement('button');
+  const wsName = (S.settings?.workspace || '/').split(/[\\/]/).filter(Boolean).pop() || '/';
+  rootBtn.textContent = wsName;
+  rootBtn.onclick = () => loadFiles('');
+  wrap.appendChild(rootBtn);
+
+  if (S.cwd) {
+    const parts = S.cwd.split('/').filter(Boolean);
+    let acc = '';
+    for (const part of parts) {
+      acc = acc ? `${acc}/${part}` : part;
+      const target = acc;
+      const sep = document.createElement('span');
+      sep.className = 'sep';
+      sep.textContent = '/';
+      const b = document.createElement('button');
+      b.textContent = part;
+      b.onclick = () => loadFiles(target);
+      wrap.append(sep, b);
+    }
+  }
+}
+
 async function loadFiles(relPath = '') {
   try {
     const d = await CW.listFiles(relPath);
     S.cwd = d.path || '';
-    $('#fileCrumb').textContent = '/' + S.cwd;
+    S.searchActive = false;
+    $('#fileSearchClearBtn').hidden = true;
+    renderWorkspaceUI();
+    renderFileCrumbs();
+
     const list = $('#fileList');
     list.innerHTML = '';
-
-    if (S.cwd) {
-      const parent = S.cwd.includes('/') ? S.cwd.slice(0, S.cwd.lastIndexOf('/')) : '';
-      const up = document.createElement('div');
-      up.className = 'f-item';
-      up.innerHTML = `<span>↩</span><span class="f-name">..</span>`;
-      up.onclick = () => loadFiles(parent);
-      list.appendChild(up);
+    if (!d.items.length) {
+      list.innerHTML = '<div class="sb-empty" style="padding:24px;text-align:center">This folder is empty.</div>';
+      return;
     }
 
     for (const it of d.items) {
       const row = document.createElement('div');
-      row.className = 'f-item';
+      row.className = 'file-row' + (it.isDir ? ' dir' : '');
       const pinned = S.pinnedFiles.includes(it.relPath);
       row.innerHTML = `
-        <span>${it.isDir ? '📁' : '📄'}</span>
-        <span class="f-name" title="${esc(it.relPath)}">${esc(it.name)}</span>
-        ${it.isDir ? '' : `<span class="f-size">${esc(it.sizeLabel)}</span><button class="f-pin ${pinned ? 'on' : ''}">${pinned ? 'Pinned' : 'Pin'}</button>`}`;
+        <span class="file-ico"><svg><use href="${it.isDir ? '#i-folder' : '#i-file'}"/></svg></span>
+        <span class="file-main">
+          <span class="file-name" title="${esc(it.relPath)}">${esc(it.name)}</span>
+        </span>
+        ${it.isDir ? '' : `<span class="file-sub">${esc(it.sizeLabel)}</span>`}
+        <span class="file-acts ${pinned ? 'pinned' : ''}">
+          ${it.isDir ? '' : `<button data-act="pin" class="${pinned ? 'on' : ''}" title="${pinned ? 'Unpin' : 'Pin to chat'}"><svg><use href="#i-pin"/></svg></button>`}
+          ${it.isDir ? '' : `<button data-act="edit" title="Edit file"><svg><use href="#i-edit"/></svg></button>`}
+          <button data-act="rename" title="Rename"><svg><use href="#i-external"/></svg></button>
+          <button data-act="del" class="danger" title="Move to safe trash"><svg><use href="#i-trash"/></svg></button>
+        </span>`;
+
       row.onclick = (e) => {
-        if (e.target.closest('.f-pin')) return;
+        if (e.target.closest('.file-acts')) return;
         if (it.isDir) loadFiles(it.relPath);
-        else previewFile(it.relPath);
+        else openFileInEditor(it.relPath);
       };
-      const pinBtn = row.querySelector('.f-pin');
-      if (pinBtn) {
-        pinBtn.onclick = (e) => { e.stopPropagation(); togglePin(it.relPath); };
-      }
+      const pinBtn = row.querySelector('[data-act="pin"]');
+      if (pinBtn) pinBtn.onclick = (e) => { e.stopPropagation(); togglePin(it.relPath); };
+      const editBtn = row.querySelector('[data-act="edit"]');
+      if (editBtn) editBtn.onclick = (e) => { e.stopPropagation(); openFileInEditor(it.relPath); };
+      row.querySelector('[data-act="rename"]').onclick = (e) => { e.stopPropagation(); renameItem(it.relPath, it.name); };
+      row.querySelector('[data-act="del"]').onclick = async (e) => {
+        e.stopPropagation();
+        try {
+          const r = await CW.deleteFile(it.relPath);
+          toast(r.summary);
+          loadFiles(S.cwd); loadUndo();
+        } catch (err) { toast(err.message); }
+      };
       list.appendChild(row);
     }
   } catch (e) {
-    $('#fileList').innerHTML = `<div class="muted-note">Could not read folder: ${esc(e.message)}</div>`;
+    $('#fileList').innerHTML = `<div class="sb-empty">Could not read folder: ${esc(e.message)}</div>`;
   }
 }
 
@@ -733,47 +1016,154 @@ function togglePin(relPath) {
   if (S.pinnedFiles.includes(relPath)) S.pinnedFiles = S.pinnedFiles.filter((x) => x !== relPath);
   else S.pinnedFiles.push(relPath);
   renderPinned();
-  loadFiles(S.cwd);
+  if (!S.editor && !S.searchActive) loadFiles(S.cwd);
+  updateEditorPinBtn();
 }
 
 async function searchLocalFiles() {
   const q = $('#fileSearchInput').value.trim();
   if (!q) { loadFiles(S.cwd); return; }
-  $('#fileList').innerHTML = '<div class="muted-note">Searching files &amp; contents…</div>';
+  S.searchActive = true;
+  $('#fileSearchClearBtn').hidden = false;
+  $('#fileList').innerHTML = '<div class="sb-empty" style="padding:18px">Searching filenames &amp; file contents…</div>';
   try {
     const d = await CW.searchFiles({ query: q, relPath: S.cwd });
     const list = $('#fileList');
-    list.innerHTML = `<div class="muted-note" style="padding:2px 6px">${d.results.length} matches (scanned ${d.scanned} files)</div>`;
+    list.innerHTML = `<div class="sb-label" style="padding:4px 8px 8px">${d.results.length} matches (scanned ${d.scanned} files)</div>`;
     for (const hit of d.results) {
-      const box = document.createElement('div');
+      const row = document.createElement('div');
+      row.className = 'file-row';
       const pinned = S.pinnedFiles.includes(hit.relPath);
-      box.innerHTML = `
-        <div class="f-item">
-          <span>📄</span>
-          <span class="f-name" title="${esc(hit.relPath)}">${esc(hit.relPath)}</span>
-          <span class="f-size">${esc(hit.sizeLabel)}</span>
-          <button class="f-pin ${pinned ? 'on' : ''}">${pinned ? 'Pinned' : 'Pin'}</button>
-        </div>
-        ${hit.snippet ? `<div class="f-snip">${esc(hit.snippet)}</div>` : ''}`;
-      box.querySelector('.f-item').onclick = (e) => {
-        if (e.target.closest('.f-pin')) return;
-        previewFile(hit.relPath);
+      row.innerHTML = `
+        <span class="file-ico"><svg><use href="#i-file"/></svg></span>
+        <span class="file-main">
+          <span class="file-name" title="${esc(hit.relPath)}">${esc(hit.relPath)}</span>
+          ${hit.snippet ? `<span class="file-snip">${esc(hit.snippet)}</span>` : ''}
+        </span>
+        <span class="file-sub">${esc(hit.sizeLabel)}</span>
+        <span class="file-acts ${pinned ? 'pinned' : ''}">
+          <button data-act="pin" class="${pinned ? 'on' : ''}" title="Pin to chat"><svg><use href="#i-pin"/></svg></button>
+          <button data-act="edit" title="Open in editor"><svg><use href="#i-edit"/></svg></button>
+        </span>`;
+      row.onclick = (e) => {
+        if (e.target.closest('.file-acts')) return;
+        openFileInEditor(hit.relPath);
       };
-      box.querySelector('.f-pin').onclick = (e) => { e.stopPropagation(); togglePin(hit.relPath); };
-      list.appendChild(box);
+      row.querySelector('[data-act="pin"]').onclick = (e) => { e.stopPropagation(); togglePin(hit.relPath); searchLocalFiles(); };
+      row.querySelector('[data-act="edit"]').onclick = (e) => { e.stopPropagation(); openFileInEditor(hit.relPath); };
+      list.appendChild(row);
     }
   } catch (e) { toast(e.message); }
 }
 
-async function previewFile(relPath) {
+// ---- Live OS File Editor
+function updateEditorStats() {
+  const txt = $('#edTextarea').value;
+  const lines = txt ? txt.split('\n').length : 0;
+  $('#edStats').textContent = `${lines} lines · ${txt.length} chars`;
+  const dirty = S.editor && S.editor.editable && txt !== S.editor.savedContent;
+  $('#edDirtyDot').hidden = !dirty;
+}
+
+function updateEditorPinBtn() {
+  if (!S.editor) return;
+  const pinned = S.pinnedFiles.includes(S.editor.path);
+  $('#edPinBtn').classList.toggle('primary', pinned);
+}
+
+async function openFileInEditor(relPath) {
   try {
-    const d = await CW.readFile(relPath);
-    $('#filePreview').hidden = false;
-    $('#fpName').textContent = d.path;
-    $('#fpBody').textContent = d.content;
-    $('#fpPinBtn').onclick = () => togglePin(d.path);
-    $('#fpRevealBtn').onclick = () => CW.revealFile(d.path);
-    $('#fpOpenBtn').onclick = () => CW.openFile(d.path).catch((e) => toast(e.message));
+    const f = await CW.readFileForEdit(relPath);
+    S.editor = { ...f, savedContent: f.content };
+    $('#filesBrowserView').hidden = true;
+    $('#fileEditorView').hidden = false;
+    $('#edFileName').textContent = f.name;
+    $('#edFilePath').textContent = f.absPath;
+    $('#edTextarea').value = f.content;
+    $('#edTextarea').readOnly = !f.editable;
+    $('#edSaveBtn').disabled = !f.editable;
+    $('#edReadonlyNote').hidden = f.editable;
+    updateEditorStats();
+    updateEditorPinBtn();
+  } catch (e) {
+    toast(e.message, 4000);
+  }
+}
+
+function closeFileEditor(force = false) {
+  if (!force && S.editor?.editable && $('#edTextarea').value !== S.editor.savedContent) {
+    toast('Closed without saving (use Undo or re-open)');
+  }
+  S.editor = null;
+  $('#fileEditorView').hidden = true;
+  $('#filesBrowserView').hidden = false;
+}
+
+async function saveEditorFile() {
+  if (!S.editor || !S.editor.editable) return;
+  const content = $('#edTextarea').value;
+  try {
+    const r = await CW.writeFile({ path: S.editor.path, content });
+    S.editor.savedContent = content;
+    updateEditorStats();
+    loadUndo();
+    toast(r.summary || `Saved ${S.editor.name}`);
+  } catch (e) {
+    toast(e.message, 4000);
+  }
+}
+
+async function createNewFile() {
+  const name = await askText({
+    title: 'New File',
+    label: `Create file inside /${S.cwd}`,
+    placeholder: 'notes.md',
+  });
+  if (!name) return;
+  const rel = S.cwd ? `${S.cwd}/${name}` : name;
+  try {
+    await CW.writeFile({ path: rel, content: '' });
+    await loadFiles(S.cwd);
+    loadUndo();
+    openFileInEditor(rel);
+    toast(`Created ${rel}`);
+  } catch (e) { toast(e.message); }
+}
+
+async function createNewFolder() {
+  const name = await askText({
+    title: 'New Folder',
+    label: `Create folder inside /${S.cwd}`,
+    placeholder: 'project-docs',
+  });
+  if (!name) return;
+  const rel = S.cwd ? `${S.cwd}/${name}` : name;
+  try {
+    await CW.mkdir(rel);
+    await loadFiles(S.cwd);
+    loadUndo();
+    toast(`Created folder ${rel}`);
+  } catch (e) { toast(e.message); }
+}
+
+async function renameItem(relPath, currentName) {
+  const nextName = await askText({
+    title: 'Rename',
+    label: `Rename "${currentName}"`,
+    value: currentName,
+  });
+  if (!nextName || nextName === currentName) return;
+  const dir = relPath.includes('/') ? relPath.slice(0, relPath.lastIndexOf('/')) : '';
+  const to = dir ? `${dir}/${nextName}` : nextName;
+  try {
+    const r = await CW.renameFile({ from: relPath, to });
+    toast(r.summary);
+    if (S.editor && S.editor.path === relPath) {
+      openFileInEditor(to);
+    } else {
+      loadFiles(S.cwd);
+    }
+    loadUndo();
   } catch (e) { toast(e.message); }
 }
 
@@ -790,11 +1180,11 @@ async function loadDrafts() {
   const d = await CW.listDrafts();
   S.drafts = d.drafts || [];
   const list = $('#draftsList');
-  list.innerHTML = S.drafts.length ? '' : '<div class="muted-note">No saved drafts yet. Ask Copilot to draft an email!</div>';
+  list.innerHTML = S.drafts.length ? '' : '<div class="muted-note">No saved drafts yet. Ask Copilot to draft an email.</div>';
   for (const dr of S.drafts) {
     const card = document.createElement('div');
     card.className = 'saved-card';
-    card.innerHTML = `<div class="sc-row"><b>${esc(dr.subject || '(No subject)')}</b><button class="mini-btn danger">✕</button></div><small>${esc(dr.to || 'No recipient')} · ${new Date(dr.updatedAt).toLocaleDateString()}</small>`;
+    card.innerHTML = `<div class="sc-row"><b>${esc(dr.subject || '(No subject)')}</b><button class="btn tiny danger">✕</button></div><small>${esc(dr.to || 'No recipient')} · ${new Date(dr.updatedAt).toLocaleDateString()}</small>`;
     card.onclick = (e) => { if (!e.target.closest('button')) loadDraftIntoStudio(dr); };
     card.querySelector('button').onclick = async (e) => {
       e.stopPropagation();
@@ -810,28 +1200,25 @@ async function loadBriefs() {
   const d = await CW.listBriefs();
   S.briefs = d.briefs || [];
   const list = $('#briefsList');
-  list.innerHTML = S.briefs.length ? '' : '<div class="muted-note">Save any Copilot research output here or export it to disk.</div>';
+  list.innerHTML = S.briefs.length ? '' : '<div class="muted-note">Save any Copilot answer as a research brief or export to Markdown.</div>';
   for (const b of S.briefs) {
     const card = document.createElement('div');
     card.className = 'saved-card';
     card.innerHTML = `
-      <div class="sc-row"><b>${esc(b.title)}</b><button class="mini-btn danger" data-del>✕</button></div>
+      <div class="sc-row"><b>${esc(b.title)}</b><button class="btn tiny danger" data-del>✕</button></div>
       <small>${new Date(b.updatedAt).toLocaleString()}</small>
-      <div class="pane-btns" style="margin-top:4px">
-        <button class="mini-btn" data-save-md>Save .md…</button>
-        <button class="mini-btn" data-mail>Draft Email</button>
+      <div class="row-gap" style="margin-top:4px">
+        <button class="btn tiny" data-save-md>Save .md…</button>
+        <button class="btn tiny" data-mail>Draft Email</button>
       </div>`;
-    card.querySelector('[data-del]').onclick = async () => {
-      await CW.deleteBrief(b.id);
-      loadBriefs();
-    };
+    card.querySelector('[data-del]').onclick = async () => { await CW.deleteBrief(b.id); loadBriefs(); };
     card.querySelector('[data-save-md]').onclick = async () => {
       const r = await CW.exportBriefMd(b);
       if (!r.canceled) { toast(`Saved ${r.filePath}`); loadFiles(S.cwd); }
     };
     card.querySelector('[data-mail]').onclick = () => {
       loadDraftIntoStudio({ subject: b.title, body: b.markdown });
-      setDrawerTab('email');
+      openPanel('email');
     };
     list.appendChild(card);
   }
@@ -848,20 +1235,20 @@ async function quickResearch() {
     if (d.wiki) {
       const w = document.createElement('div');
       w.className = 'saved-card';
-      w.innerHTML = `<b>Wikipedia: ${esc(d.wiki.title)}</b><small>${esc(d.wiki.extract.slice(0, 220))}…</small>`;
+      w.innerHTML = `<b>Wikipedia: ${esc(d.wiki.title)}</b><small>${esc(d.wiki.extract.slice(0, 200))}…</small>`;
       w.onclick = () => CW.openExternal(d.wiki.url);
       out.appendChild(w);
     }
     for (const r of d.results || []) {
       const c = document.createElement('div');
       c.className = 'saved-card';
-      c.innerHTML = `<b>${esc(r.title)}</b><small>${esc(r.snippet.slice(0, 160))}</small>`;
+      c.innerHTML = `<b>${esc(r.title)}</b><small>${esc(r.snippet.slice(0, 150))}</small>`;
       c.onclick = () => CW.openExternal(r.url);
       out.appendChild(c);
     }
     const askBtn = document.createElement('button');
-    askBtn.className = 'mini-btn primary';
-    askBtn.textContent = '✦ Run full Copilot Deep Research on this';
+    askBtn.className = 'btn tiny primary';
+    askBtn.textContent = 'Run Copilot Deep Research';
     askBtn.onclick = () => { setMode('copilot'); sendPrompt(`Research "${q}" thoroughly and write a clear, cited executive brief.`); };
     out.appendChild(askBtn);
   } catch (e) {
@@ -881,117 +1268,425 @@ async function loadUndo() {
   for (const u of S.undo) {
     const card = document.createElement('div');
     card.className = 'saved-card';
-    card.innerHTML = `<div class="sc-row"><b>${esc(u.summary)}</b><button class="mini-btn">Undo</button></div><small>${new Date(u.ts).toLocaleString()}</small>`;
+    card.innerHTML = `<div class="sc-row"><b>${esc(u.summary)}</b><button class="btn tiny">Undo</button></div><small>${new Date(u.ts).toLocaleString()}</small>`;
     card.querySelector('button').onclick = async () => {
       try {
         const r = await CW.undoFileAction(u.id);
         toast(r.summary);
-        loadUndo(); loadFiles(S.cwd);
+        loadUndo();
+        if (S.editor) openFileInEditor(S.editor.path);
+        else loadFiles(S.cwd);
       } catch (e) { toast(e.message); }
     };
     list.appendChild(card);
   }
 }
 
-// ---- Settings Modal
+// ---- Settings & Multi-Provider Modal
+function syncProviderAuthUI(endpointType) {
+  $('#authFields').style.display = endpointType === 'mxgpt' ? 'flex' : 'none';
+  $('#apiKeyField').hidden = !(endpointType === 'openai' || endpointType === 'anthropic');
+}
+
+function renderProviderChips() {
+  const wrap = $('#providerChips');
+  wrap.innerHTML = '';
+  for (const p of S.providerPresets) {
+    const btn = document.createElement('button');
+    btn.type = 'button';
+    btn.className = 'prov-chip' + (S.selectedPreset === p.id ? ' on' : '');
+    btn.innerHTML = `${esc(p.label)}${p.badge ? ` <span class="prov-badge">${esc(p.badge)}</span>` : ''}`;
+    btn.onclick = () => selectProviderPreset(p.id, true);
+    wrap.appendChild(btn);
+  }
+}
+
+function selectProviderPreset(presetId, fillFields = true) {
+  const p = S.providerPresets.find((x) => x.id === presetId) || S.providerPresets[0];
+  if (!p) return;
+  S.selectedPreset = p.id;
+  $('#providerHint').textContent = p.hint || '';
+  if (fillFields) {
+    $('#setEndpointType').value = p.endpointType;
+    $('#setEndpointUrl').value = p.endpointUrl;
+    if (p.fastModel) $('#setFastModel').value = p.fastModel;
+    if (p.smartModel) $('#setSmartModel').value = p.smartModel;
+  }
+  syncProviderAuthUI($('#setEndpointType').value);
+  renderProviderChips();
+}
+
+function renderFetchedModels(models) {
+  const wrap = $('#fetchedModelsWrap');
+  const list = $('#fetchedModelsList');
+  if (!models || !models.length) { wrap.hidden = true; return; }
+  wrap.hidden = false;
+  list.innerHTML = '';
+  for (const m of models.slice(0, 60)) {
+    const btn = document.createElement('button');
+    btn.type = 'button';
+    btn.className = 'fm-pill';
+    btn.textContent = m.name;
+    btn.onclick = () => {
+      if (S.assignModelTarget === 'smart') {
+        $('#setSmartModel').value = m.name;
+        toast(`Smart model → ${m.name}`);
+      } else {
+        $('#setFastModel').value = m.name;
+        toast(`Fast model → ${m.name}`);
+      }
+    };
+    list.appendChild(btn);
+  }
+}
+
 function openSettings() {
   const s = S.settings || {};
+  S.selectedPreset = s.providerPreset || s.endpointType || 'mxgpt';
   $('#setEndpointType').value = s.endpointType || 'mxgpt';
   $('#setEndpointUrl').value = s.endpointUrl || 'https://max.fyreflysystems.de';
   $('#setUsername').value = s.username || '';
   $('#setPassword').value = '';
   $('#setPassword').placeholder = s.hasPassword ? '•••••••• (saved — leave blank to keep)' : 'Enter password';
+  $('#setApiKey').value = '';
+  $('#setApiKey').placeholder = s.hasApiKey ? '•••••••• (saved — leave blank to keep)' : 'sk-... (stored locally)';
   $('#setFastModel').value = s.fastModel || 'lfm3:latest';
   $('#setSmartModel').value = s.smartModel || 'inkling-2-mini:latest';
   $('#setWorkspace').value = s.workspace || '';
   $('#setSignature').value = s.emailSignature || '';
   $('#setAutoApprove').checked = !!s.autoApproveFileActions;
-  $('#authFields').style.display = ($('#setEndpointType').value === 'mxgpt') ? 'flex' : 'none';
+  $('#fetchedModelsWrap').hidden = true;
   $('#testOut').hidden = true;
+  selectProviderPreset(S.selectedPreset, false);
   $('#settingsModal').hidden = false;
 }
 
 function collectSettingsForm() {
   const pw = $('#setPassword').value;
+  const key = $('#setApiKey').value.trim();
   return {
     endpointType: $('#setEndpointType').value,
-    endpointUrl: $('#setEndpointUrl').value.trim(),
+    providerPreset: S.selectedPreset || $('#setEndpointType').value,
+    endpointUrl: $('#setEndpointUrl').value.trim() || 'https://max.fyreflysystems.de',
     username: $('#setUsername').value.trim(),
     password: pw ? pw : '__KEEP__',
+    apiKey: key ? key : '__KEEP__',
     fastModel: $('#setFastModel').value.trim() || 'lfm3:latest',
     smartModel: $('#setSmartModel').value.trim() || 'inkling-2-mini:latest',
     workspace: $('#setWorkspace').value.trim(),
     emailSignature: $('#setSignature').value,
     autoApproveFileActions: $('#setAutoApprove').checked,
+    signedIn: true,
   };
 }
 
+// ---- Gimel-style Built-in Updater
+function fmtBytes(n) {
+  if (!n) return '';
+  if (n >= 1024 * 1024) return (n / (1024 * 1024)).toFixed(1) + ' MB';
+  if (n >= 1024) return (n / 1024).toFixed(0) + ' KB';
+  return n + ' B';
+}
+
+function installKindLabel(kind) {
+  if (kind === 'appimage') return 'Linux AppImage (auto-update)';
+  if (kind === 'win-portable') return 'Windows App (auto-update)';
+  if (kind === 'deb') return 'Linux .deb Package';
+  if (kind === 'git') return 'Git Dev Checkout';
+  return 'GitHub Release';
+}
+
+function updateSidebarUpdateBadge(info) {
+  const btn = $('#openUpdatesBtn');
+  const dot = $('#updDot');
+  const ver = $('#appVersionBadge');
+  if (!info) return;
+  if (info.updateAvailable) {
+    btn.classList.add('has-update');
+    dot.hidden = false;
+    $('#updBtnLabel').textContent = 'Update available';
+    ver.textContent = `v${info.latestVersion}`;
+  } else {
+    btn.classList.remove('has-update');
+    dot.hidden = true;
+    $('#updBtnLabel').textContent = 'Updates';
+    ver.textContent = `v${info.currentVersion || S.appInfo?.version || '1.2.0'}`;
+  }
+}
+
+async function checkUpdatesQuiet() {
+  try {
+    const info = await CW.checkUpdate({ force: false });
+    S.updateInfo = info;
+    updateSidebarUpdateBadge(info);
+  } catch {}
+}
+
+function renderUpdateModal(info) {
+  const banner = $('#updBanner');
+  $('#updCurVer').textContent = `v${info?.currentVersion || S.appInfo?.version || '—'}`;
+  $('#updLatestVer').textContent = info?.ok ? `v${info.latestVersion}` : 'Unavailable';
+  $('#updKind').textContent = installKindLabel(info?.installKind);
+  $('#updAsset').textContent = info?.asset
+    ? `${info.asset.name} (${fmtBytes(info.asset.size)})`
+    : (info?.installKind === 'git' ? 'git pull --ff-only' : 'GitHub Releases');
+
+  if (!info?.ok) {
+    banner.className = 'upd-banner err';
+    banner.textContent = info?.error || 'Could not reach GitHub Releases.';
+  } else if (info.updateAvailable) {
+    banner.className = 'upd-banner avail';
+    banner.textContent = `New version available: ${info.releaseName || 'v' + info.latestVersion}`;
+  } else {
+    banner.className = 'upd-banner ok';
+    banner.textContent = `You are up to date (v${info.currentVersion}).`;
+  }
+
+  const notesWrap = $('#updNotesWrap');
+  if (info?.releaseNotes) {
+    notesWrap.hidden = false;
+    $('#updNotes').innerHTML = renderMd(info.releaseNotes);
+  } else {
+    notesWrap.hidden = true;
+  }
+
+  const installBtn = $('#updInstallBtn');
+  installBtn.disabled = S.updating || !info?.ok || !info?.updateAvailable;
+  if (info?.installKind === 'deb') installBtn.textContent = 'Download .deb & Verify';
+  else if (info?.installKind === 'git') installBtn.textContent = 'Pull Latest Changes';
+  else installBtn.textContent = 'Download & Install Update';
+}
+
+function renderUpdateProgress(p) {
+  $('#updProgressWrap').hidden = false;
+  const pct = typeof p.percent === 'number' ? p.percent : 0;
+  $('#updBarFill').style.width = `${Math.max(0, Math.min(100, pct))}%`;
+  $('#updProgPct').textContent = `${pct}%`;
+  if (p.phase === 'downloading') {
+    const dl = p.total ? `${fmtBytes(p.downloaded)} / ${fmtBytes(p.total)}` : fmtBytes(p.downloaded);
+    $('#updProgText').textContent = `Downloading update… (${dl})`;
+  } else {
+    $('#updProgText').textContent = p.message || p.phase || 'Updating…';
+  }
+}
+
+async function runUpdateCheck(force = true) {
+  const banner = $('#updBanner');
+  banner.className = 'upd-banner';
+  banner.textContent = 'Checking GitHub Releases (mxsp/mxgpt)…';
+  $('#updCheckBtn').disabled = true;
+  $('#updInstallBtn').disabled = true;
+  try {
+    const info = await CW.checkUpdate({ force });
+    S.updateInfo = info;
+    updateSidebarUpdateBadge(info);
+    renderUpdateModal(info);
+  } catch (e) {
+    banner.className = 'upd-banner err';
+    banner.textContent = `Check failed: ${e.message}`;
+  } finally {
+    $('#updCheckBtn').disabled = false;
+  }
+}
+
+function openUpdatesModal() {
+  $('#updProgressWrap').hidden = true;
+  $('#updCmdHint').hidden = true;
+  $('#updatesModal').hidden = false;
+  if (S.updateInfo) renderUpdateModal(S.updateInfo);
+  runUpdateCheck(true);
+}
+
+async function doLogout() {
+  const r = await CW.logout();
+  S.settings = r.settings;
+  $('#settingsModal').hidden = true;
+  renderAccountUI();
+  showLoginScreen();
+  toast('Signed out');
+}
+
 // ---- Event Wiring
-$('#modeSeg').onclick = (e) => { const b = e.target.closest('button[data-mode]'); if (b) setMode(b.dataset.mode); };
-$('#thinkSeg').onclick = (e) => { const b = e.target.closest('button[data-think]'); if (b) setThink(b.dataset.think); };
-$('#drawerTabs').onclick = (e) => { const b = e.target.closest('button[data-tab]'); if (b) setDrawerTab(b.dataset.tab); };
-$('#toggleDrawerBtn').onclick = () => $('#app').classList.toggle('drawer-closed');
+$('#collapseBtn').onclick = () => { $('#sidebar').classList.add('collapsed'); $('#expandBtn').hidden = false; };
+$('#expandBtn').onclick = () => { $('#sidebar').classList.remove('collapsed'); $('#expandBtn').hidden = true; };
 $('#newChatBtn').onclick = newChat;
+$('#chatSearch').oninput = (e) => { S.chatSearch = e.target.value; renderChatList(); };
 $('#themeBtn').onclick = toggleTheme;
 $('#openSettingsBtn').onclick = openSettings;
-$('#connPill').onclick = openSettings;
-$('#wsPickBtn').onclick = pickWorkspaceFolder;
+$('#footProviderBtn').onclick = openSettings;
+$('#footLoginBtn').onclick = showLoginScreen;
+$('#logoutBtn').onclick = doLogout;
+$('#settingsLogoutBtn').onclick = doLogout;
+$('#openUpdatesBtn').onclick = openUpdatesModal;
 $('#closeSettingsBtn').onclick = () => { $('#settingsModal').hidden = true; };
+$('#closeUpdatesBtn').onclick = () => { if (!S.updating) $('#updatesModal').hidden = true; };
 
-$('#setEndpointType').onchange = () => {
-  const isMxgpt = $('#setEndpointType').value === 'mxgpt';
-  $('#authFields').style.display = isMxgpt ? 'flex' : 'none';
-  if (isMxgpt && !$('#setEndpointUrl').value.includes('fyrefly')) $('#setEndpointUrl').value = 'https://max.fyreflysystems.de';
-  if (!isMxgpt && $('#setEndpointUrl').value.includes('fyrefly')) $('#setEndpointUrl').value = 'http://127.0.0.1:11434';
+// Login screen wiring
+$('#loginTabs').onclick = (e) => {
+  const b = e.target.closest('button[data-ltab]');
+  if (!b) return;
+  const tab = b.dataset.ltab;
+  $$('#loginTabs button').forEach((x) => x.classList.toggle('on', x.dataset.ltab === tab));
+  $('#loginMxgptForm').hidden = tab !== 'mxgpt';
+  $('#loginProviderForm').hidden = tab !== 'provider';
 };
+$('#loginPwEye').onclick = () => {
+  const inp = $('#loginPw');
+  inp.type = inp.type === 'password' ? 'text' : 'password';
+  inp.focus();
+};
+$('#lpKeyEye').onclick = () => {
+  const inp = $('#lpKey');
+  inp.type = inp.type === 'password' ? 'text' : 'password';
+  inp.focus();
+};
+$('#loginSkipBtn').onclick = () => { hideLoginScreen(); openPanel('files'); };
 
-$('#testConnBtn').onclick = async () => {
-  const out = $('#testOut');
-  out.hidden = false; out.className = 'test-out'; out.textContent = 'Testing connection…';
+$('#loginMxgptForm').onsubmit = async (e) => {
+  e.preventDefault();
+  const err = $('#loginErr');
+  const btn = $('#loginSubmitBtn');
+  err.textContent = '';
+  btn.disabled = true;
+  btn.textContent = 'Signing in…';
   try {
-    const r = await CW.testEndpoint(collectSettingsForm());
-    out.className = 'test-out ok';
-    out.textContent = `Connected to ${r.endpointUrl} (${r.latencyMs}ms) · ${r.models.length} models: ${r.models.map((m) => m.name).slice(0, 5).join(', ')}`;
-  } catch (e) {
-    out.className = 'test-out err';
-    out.textContent = `Connection failed: ${e.message}`;
+    const r = await CW.login({
+      endpointType: 'mxgpt',
+      providerPreset: 'mxgpt',
+      endpointUrl: $('#loginUrl').value.trim() || 'https://max.fyreflysystems.de',
+      username: $('#loginUser').value.trim(),
+      password: $('#loginPw').value,
+      fastModel: 'lfm3:latest',
+      smartModel: 'inkling-2-mini:latest',
+    });
+    S.settings = r.settings;
+    renderAccountUI();
+    hideLoginScreen();
+    checkConnectionQuiet();
+    toast(`Signed in to ${new URL(S.settings.endpointUrl).host}`);
+  } catch (ex) {
+    err.textContent = ex.message || 'Sign in failed';
+  } finally {
+    btn.disabled = false;
+    btn.textContent = 'Continue';
   }
 };
 
-$('#saveSettingsBtn').onclick = async () => {
+$('#loginProviderForm').onsubmit = async (e) => {
+  e.preventDefault();
+  const err = $('#lpErr');
+  const btn = $('#lpSubmitBtn');
+  const preset = S.providerPresets.find((x) => x.id === S.loginPreset) || S.providerPresets[1];
+  err.textContent = '';
+  btn.disabled = true;
+  btn.textContent = 'Connecting…';
   try {
-    const d = await CW.saveSettings(collectSettingsForm());
-    S.settings = d.settings;
-    S.cwd = '';
-    $('#settingsModal').hidden = true;
-    renderWorkspaceBox();
-    loadFiles('');
+    const r = await CW.login({
+      endpointType: preset.endpointType,
+      providerPreset: preset.id,
+      endpointUrl: $('#lpUrl').value.trim() || preset.endpointUrl,
+      apiKey: $('#lpKey').value.trim(),
+      fastModel: $('#lpFast').value.trim() || preset.fastModel,
+      smartModel: $('#lpSmart').value.trim() || preset.smartModel,
+    });
+    S.settings = r.settings;
+    renderAccountUI();
+    hideLoginScreen();
     checkConnectionQuiet();
-    toast('Settings saved');
-  } catch (e) { toast(e.message); }
+    toast(`Connected to ${preset.label}`);
+  } catch (ex) {
+    err.textContent = ex.message || 'Connection failed';
+  } finally {
+    btn.disabled = false;
+    btn.textContent = 'Connect & Continue';
+  }
 };
 
+// Topbar & Composer controls
+$$('.top-actions .ghost-btn[data-panel]').forEach((b) => {
+  b.onclick = () => openPanel(b.dataset.panel, true);
+});
+$('#panelClose').onclick = closePanel;
+$('#wsTopPill').onclick = () => openPanel('files', false);
+$('#filesAccessBtn').onclick = () => openPanel('files', true);
+$('#openBrowseBtn').onclick = pickWorkspaceFolder;
+$('#attachFileBtn').onclick = async () => {
+  const res = await CW.pickFiles();
+  if (res.canceled) return;
+  if (res.switchedWorkspace) {
+    S.settings = res.settings;
+    S.cwd = '';
+    renderWorkspaceUI();
+    loadFiles('');
+  }
+  for (const p of res.pinned || []) {
+    if (!S.pinnedFiles.includes(p)) S.pinnedFiles.push(p);
+  }
+  renderPinned();
+  toast(`Attached ${res.pinned.length} file${res.pinned.length > 1 ? 's' : ''}`);
+};
+
+$('#modeSeg').onclick = (e) => { const b = e.target.closest('button[data-mode]'); if (b) setMode(b.dataset.mode); };
+$('#thinkSeg').onclick = (e) => { const b = e.target.closest('button[data-think]'); if (b) setThink(b.dataset.think); };
 $('#sendBtn').onclick = () => sendPrompt();
 $('#promptInput').addEventListener('keydown', (e) => {
   if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); sendPrompt(); }
 });
 $('#promptInput').addEventListener('input', (e) => {
   e.target.style.height = 'auto';
-  e.target.style.height = Math.min(e.target.scrollHeight, 180) + 'px';
+  e.target.style.height = Math.min(e.target.scrollHeight, 200) + 'px';
 });
 $$('.starter').forEach((b) => {
   b.onclick = () => { setMode('copilot'); sendPrompt(b.dataset.prompt); };
 });
 
+// OS Files & Editor wiring
+$('#osUpBtn').onclick = () => {
+  if (S.cwd) {
+    const parent = S.cwd.includes('/') ? S.cwd.slice(0, S.cwd.lastIndexOf('/')) : '';
+    loadFiles(parent);
+  } else {
+    navigateOsTo('..');
+  }
+};
+$('#osPathInput').addEventListener('keydown', (e) => {
+  if (e.key === 'Enter') {
+    e.preventDefault();
+    navigateOsTo($('#osPathInput').value.trim());
+  }
+});
+$('#wsPickBtn').onclick = pickWorkspaceFolder;
 $('#refreshFilesBtn').onclick = () => loadFiles(S.cwd);
 $('#fileSearchBtn').onclick = searchLocalFiles;
+$('#fileSearchClearBtn').onclick = () => { $('#fileSearchInput').value = ''; loadFiles(S.cwd); };
 $('#fileSearchInput').addEventListener('keydown', (e) => { if (e.key === 'Enter') searchLocalFiles(); });
-$('#fpCloseBtn').onclick = () => { $('#filePreview').hidden = true; };
+$('#newFileBtn').onclick = createNewFile;
+$('#newFolderBtn').onclick = createNewFolder;
 $('#auditWsBtn').onclick = () => {
   setMode('copilot');
   sendPrompt(`Audit the folder "${S.cwd || '/'}" in my workspace and propose a clean organization plan using file-actions.`);
 };
 
+$('#edBackBtn').onclick = () => { closeFileEditor(); loadFiles(S.cwd); };
+$('#edTextarea').oninput = updateEditorStats;
+$('#edSaveBtn').onclick = saveEditorFile;
+$('#edPinBtn').onclick = () => { if (S.editor) togglePin(S.editor.path); };
+$('#edRenameBtn').onclick = () => { if (S.editor) renameItem(S.editor.path, S.editor.name); };
+$('#edOpenOsBtn').onclick = () => { if (S.editor) CW.openFile(S.editor.path).catch((e) => toast(e.message)); };
+$('#edRevealBtn').onclick = () => { if (S.editor) CW.revealFile(S.editor.path); };
+$('#edAskAiBtn').onclick = () => {
+  if (!S.editor) return;
+  if (!S.pinnedFiles.includes(S.editor.path)) {
+    S.pinnedFiles.push(S.editor.path);
+    renderPinned();
+    updateEditorPinBtn();
+  }
+  const inp = $('#promptInput');
+  inp.value = `Review and help me improve "${S.editor.path}" (propose edits via file-actions if needed): `;
+  inp.focus();
+};
+
+// Email / Research / Undo wiring
 $('#newDraftBtn').onclick = () => loadDraftIntoStudio({});
 $('#saveDraftBtn').onclick = async () => {
   const d = await CW.saveDraft({
@@ -1018,7 +1713,6 @@ $('#exportEmlBtn').onclick = async () => {
   });
   if (!r.canceled) toast(`Saved ${r.filePath}`);
 };
-
 $$('[data-refine]').forEach((b) => {
   b.onclick = async () => {
     const body = $('#mailBody').value.trim();
@@ -1039,9 +1733,102 @@ $$('[data-refine]').forEach((b) => {
     finally { b.disabled = false; b.textContent = orig; }
   };
 });
-
 $('#resSearchBtn').onclick = quickResearch;
 $('#resSearchInput').addEventListener('keydown', (e) => { if (e.key === 'Enter') quickResearch(); });
 $('#refreshUndoBtn').onclick = loadUndo;
+
+// Settings & Providers Modal wiring
+$('#resetDefaultProviderBtn').onclick = () => {
+  selectProviderPreset('mxgpt', true);
+  toast('Reset to default: https://max.fyreflysystems.de');
+};
+$('#fmTarget').onclick = (e) => {
+  const b = e.target.closest('button[data-target]');
+  if (!b) return;
+  S.assignModelTarget = b.dataset.target;
+  $$('#fmTarget button').forEach((x) => x.classList.toggle('on', x.dataset.target === S.assignModelTarget));
+};
+$('#setFastModel').addEventListener('focus', () => {
+  S.assignModelTarget = 'fast';
+  $$('#fmTarget button').forEach((x) => x.classList.toggle('on', x.dataset.target === 'fast'));
+});
+$('#setSmartModel').addEventListener('focus', () => {
+  S.assignModelTarget = 'smart';
+  $$('#fmTarget button').forEach((x) => x.classList.toggle('on', x.dataset.target === 'smart'));
+});
+$('#setEndpointType').onchange = () => {
+  const t = $('#setEndpointType').value;
+  syncProviderAuthUI(t);
+  const matching = S.providerPresets.find((p) => p.endpointType === t);
+  if (matching) {
+    S.selectedPreset = matching.id;
+    $('#providerHint').textContent = matching.hint || '';
+    renderProviderChips();
+  }
+  if (t === 'mxgpt' && !$('#setEndpointUrl').value.includes('fyrefly')) $('#setEndpointUrl').value = 'https://max.fyreflysystems.de';
+  else if (t === 'ollama' && $('#setEndpointUrl').value.includes('fyrefly')) $('#setEndpointUrl').value = 'http://127.0.0.1:11434';
+  else if (t === 'anthropic' && !$('#setEndpointUrl').value.includes('anthropic')) $('#setEndpointUrl').value = 'https://api.anthropic.com';
+  else if (t === 'openai' && ($('#setEndpointUrl').value.includes('fyrefly') || $('#setEndpointUrl').value.includes('11434'))) $('#setEndpointUrl').value = 'https://api.openai.com/v1';
+};
+$('#testConnBtn').onclick = async () => {
+  const out = $('#testOut');
+  out.hidden = false; out.className = 'test-out'; out.textContent = 'Testing connection & fetching models…';
+  try {
+    const r = await CW.testEndpoint(collectSettingsForm());
+    out.className = 'test-out ok';
+    out.textContent = `Connected to ${r.endpointUrl} (${r.latencyMs}ms) · ${r.models.length} model${r.models.length === 1 ? '' : 's'} available`;
+    renderFetchedModels(r.models);
+  } catch (e) {
+    out.className = 'test-out err';
+    out.textContent = `Connection failed: ${e.message}`;
+    $('#fetchedModelsWrap').hidden = true;
+  }
+};
+$('#saveSettingsBtn').onclick = async () => {
+  try {
+    const d = await CW.saveSettings(collectSettingsForm());
+    S.settings = d.settings;
+    S.cwd = '';
+    $('#settingsModal').hidden = true;
+    hideLoginScreen();
+    renderAccountUI();
+    renderWorkspaceUI();
+    loadFiles('');
+    checkConnectionQuiet();
+    toast('Settings saved');
+  } catch (e) { toast(e.message); }
+};
+
+// Updater Modal wiring
+$('#updCheckBtn').onclick = () => runUpdateCheck(true);
+$('#updOpenGithubBtn').onclick = () => CW.openExternal(S.updateInfo?.releaseUrl || 'https://github.com/mxsp/mxgpt/releases');
+$('#updCopyCmdBtn').onclick = () => { navigator.clipboard?.writeText($('#updCmdText').textContent || ''); toast('Command copied'); };
+$('#updInstallBtn').onclick = async () => {
+  if (S.updating) return;
+  S.updating = true;
+  $('#updInstallBtn').disabled = true;
+  $('#updCheckBtn').disabled = true;
+  $('#updCmdHint').hidden = true;
+  try {
+    const res = await CW.applyUpdate();
+    const banner = $('#updBanner');
+    banner.className = 'upd-banner ok';
+    banner.textContent = res.message || 'Update applied!';
+    toast(res.message || 'Update complete', 4500);
+    if (res.commandHint) {
+      $('#updCmdHint').hidden = false;
+      $('#updCmdText').textContent = res.commandHint;
+    }
+  } catch (e) {
+    const banner = $('#updBanner');
+    banner.className = 'upd-banner err';
+    banner.textContent = `Update failed: ${e.message}`;
+    toast(e.message, 5000);
+  } finally {
+    S.updating = false;
+    $('#updCheckBtn').disabled = false;
+    $('#updInstallBtn').disabled = !S.updateInfo?.updateAvailable;
+  }
+};
 
 boot().catch((e) => toast(`Startup error: ${e.message}`, 5000));

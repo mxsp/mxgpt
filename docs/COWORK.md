@@ -7,15 +7,18 @@
 ## 1. Getting Started
 
 1. **Launch**:
-   - **Windows**: Install via `mx-Cowork Setup 1.1.0.exe` or extract `mx-Cowork-1.1.0-win-x64.zip` and double-click `mx-Cowork.exe`.
-   - **Linux**: Run `./mx-Cowork-1.1.0.AppImage` or install `mx-cowork_1.1.0_amd64.deb`.
+   - **Windows**: Extract `mx-Cowork-1.2.0-win-x64.zip` and double-click `mx-Cowork.exe`.
+   - **Linux**: Run `./mx-Cowork-1.2.0.AppImage` (auto-updates in-app!) or install `mx-cowork_1.2.0_amd64.deb`.
    - **From source**: `cd cowork && npm install && npm start`.
-2. **Connect Endpoint**:
-   - Click **⚙ Endpoint & Models** in the bottom-left sidebar.
-   - Choose **mx-GPT Remote Endpoint** (e.g. `https://your-mxgpt-domain`) and enter your username/password, **or** choose **Direct Ollama Endpoint** (`http://192.168.x.x:11434` on LAN).
-   - Click **Test Connection**, then **Save Settings**.
-3. **Choose Local Workspace**:
-   - Pick **Home**, **Desktop**, **Documents**, or **Downloads** from the sidebar quick buttons, or set any custom folder path in Settings.
+2. **Sign In or Choose Provider**:
+   - On launch, sign in directly to **`https://max.fyreflysystems.de`** (default endpoint) with your User Number and Password.
+   - Or click **Other Provider** (on the login screen or inside **Settings**) to connect **OpenAI**, **Anthropic Claude**, **OpenRouter**, **Groq**, **Google Gemini**, **Mistral**, **Direct Ollama**, **LM Studio**, or any custom OpenAI-compatible API.
+3. **Navigate & Edit OS Files**:
+   - Click **Files** in the top bar (or **OS Files** in the composer) to open the slide-out OS File Explorer & Live Editor.
+   - Jump between **Home**, **Desktop**, **Documents**, **Downloads**, **parent folder (`↑`)**, or type any OS path directly and press `Enter`.
+   - Click any text/code/Markdown/JSON file to edit it live inside the app (`Ctrl+S` to save — every save creates an automatic Undo snapshot!).
+4. **Built-in Software Updates**:
+   - Click **Updates** in the bottom-left sidebar (or `File → Check for Updates…`) to check `mxsp/mxgpt` GitHub Releases, inspect release notes, verify `SHA256SUMS.txt`, and install updates in one click.
 
 ---
 

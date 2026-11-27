@@ -33,10 +33,12 @@ function defaultWorkspace() {
 }
 
 const DEFAULT_SETTINGS = {
-  endpointType: 'mxgpt', // 'mxgpt' | 'ollama'
+  endpointType: 'mxgpt', // 'mxgpt' | 'ollama' | 'openai' | 'anthropic'
+  providerPreset: 'mxgpt', // 'mxgpt' | 'ollama' | 'openai' | 'openrouter' | 'groq' | 'gemini' | 'mistral' | 'lmstudio' | 'custom_openai' | 'anthropic'
   endpointUrl: 'https://max.fyreflysystems.de',
   username: '',
   password: '',
+  apiKey: '',
   fastModel: 'lfm3:latest',
   smartModel: 'inkling-2-mini:latest',
   defaultMode: 'copilot', // 'fast' | 'smart' | 'copilot'
@@ -45,6 +47,8 @@ const DEFAULT_SETTINGS = {
   theme: 'light',
   autoApproveFileActions: false,
   emailSignature: '',
+  updateRepo: 'mxsp/mxgpt',
+  signedIn: false,
 };
 
 function readJson(file, fallback) {
@@ -71,7 +75,7 @@ function saveSettings(patch = {}) {
   const cur = getSettings();
   const next = { ...cur };
   for (const [k, v] of Object.entries(patch)) {
-    if (k === 'password' && v === '__KEEP__') continue;
+    if ((k === 'password' || k === 'apiKey') && v === '__KEEP__') continue;
     if (k in DEFAULT_SETTINGS) next[k] = v;
   }
   if (next.endpointUrl) next.endpointUrl = String(next.endpointUrl).trim().replace(/\/+$/, '');
@@ -86,6 +90,8 @@ function publicSettings() {
     ...s,
     hasPassword: Boolean(s.password),
     password: '',
+    hasApiKey: Boolean(s.apiKey),
+    apiKey: '',
   };
 }
 
