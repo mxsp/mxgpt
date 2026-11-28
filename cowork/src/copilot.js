@@ -507,9 +507,10 @@ function buildNativeTools(toolsCfg, resolvedExecTarget = 'container') {
   return tools;
 }
 
-async function executeReadOnlyTool(tc, { workspace, onEvent }) {
+async function executeReadOnlyTool(tc, { workspace, unmask = (s) => s, onEvent }) {
   const name = String(tc?.name || '').toLowerCase();
-  const args = tc?.args && typeof tc.args === 'object' ? tc.args : {};
+  const rawArgs = tc?.args && typeof tc.args === 'object' ? tc.args : {};
+  const args = maskDeep(rawArgs, unmask);
   const id = storage.newId('rt');
   const startedAt = Date.now();
   const labelMap = {
@@ -630,6 +631,7 @@ async function runChatWithReadTools({
   priority,
   workspace,
   mask,
+  unmask = (s) => s,
   signal,
   onEvent,
   maxReadRounds = 5,
@@ -677,7 +679,7 @@ async function runChatWithReadTools({
       type: 'function',
       function: {
         name: tc.name,
-        arguments: JSON.stringify(tc.args || {}),
+        arguments: serializeMaskedArgs(tc.args || {}, mask),
       },
     }));
     curMessages.push({
@@ -688,7 +690,7 @@ async function runChatWithReadTools({
 
     for (let i = 0; i < readCalls.length; i++) {
       if (signal?.aborted) break;
-      const resultText = await executeReadOnlyTool(readCalls[i], { workspace, onEvent });
+      const resultText = await executeReadOnlyTool(readCalls[i], { workspace, unmask, onEvent });
       curMessages.push({
         role: 'tool',
         tool_call_id: assistantToolCalls[i].id,
@@ -700,13 +702,15 @@ async function runChatWithReadTools({
   return { res: lastRes, finalMessages: curMessages };
 }
 
-async function mergeNativeToolCalls(toolCalls, blocks, toolsCfg, resolvedExecTarget = 'container') {
+async function mergeNativeToolCalls(toolCalls, blocks, toolsCfg, resolvedExecTarget = 'container', unmask = (s) => s) {
   if (!Array.isArray(toolCalls) || !toolCalls.length) return blocks;
   const cfg = storage.getSettings();
   for (let i = 0; i < toolCalls.length; i++) {
     const tc = toolCalls[i];
     const name = String(tc?.name || '').toLowerCase();
-    const args = tc?.args && typeof tc.args === 'object' ? tc.args : {};
+    const rawArgs = tc?.args && typeof tc.args === 'object' ? tc.args : {};
+    // Restore Privacy Shield tokens before writing files, patching code, editing tables, or running scripts!
+    const args = maskDeep(rawArgs, unmask);
 
     if ((name === 'write_file' || name === 'edit_file' || name === 'file_action' || name === 'create_office_doc' || name === 'fill_docx_template') && toolsCfg.osFiles) {
       let type;
@@ -804,9 +808,19 @@ async function mergeNativeToolCalls(toolCalls, blocks, toolsCfg, resolvedExecTar
       }
     }
   }
-  blocks.fileActions = blocks.fileActions.slice(0, 30);
-  blocks.codeRuns = blocks.codeRuns.slice(0, 8);
-  blocks.tableEdits = blocks.tableEdits.slice(0, 6);
+  // Deduplicate in case a native-tool model also echoed a matching fenced block in Markdown
+  const dedupe = (arr, keyFn) => {
+    const seen = new Set();
+    return (arr || []).filter((item) => {
+      const k = keyFn(item);
+      if (seen.has(k)) return false;
+      seen.add(k);
+      return true;
+    });
+  };
+  blocks.fileActions = dedupe(blocks.fileActions, (a) => `${a.type}|${a.path}|${a.from}|${a.to}|${a.oldText || ''}|${(a.content || '').slice(0, 200)}`).slice(0, 30);
+  blocks.codeRuns = dedupe(blocks.codeRuns, (r) => `${r.isServerOp || ''}|${r.serverId || ''}|${r.language}|${(r.code || r.command || '').trim()}`).slice(0, 8);
+  blocks.tableEdits = dedupe(blocks.tableEdits, (t) => `${t.path}|${t.sheetIndex}|${JSON.stringify(t.operations || []).slice(0, 300)}`).slice(0, 6);
   blocks.savedNotes = blocks.savedNotes.slice(0, 5);
   return blocks;
 }
@@ -826,6 +840,23 @@ function summarizeBlocksMarkdown(blocks) {
     parts.push(`Prepared **${blocks.tableEdits.length}** spreadsheet edit${blocks.tableEdits.length > 1 ? 's' : ''} for ${names}.`);
   }
   return parts.join('\n\n');
+}
+
+function maskDeep(val, mask) {
+  if (typeof val === 'string') return mask(val);
+  if (Array.isArray(val)) return val.map((item) => maskDeep(item, mask));
+  if (val && typeof val === 'object') {
+    const out = {};
+    for (const [k, v] of Object.entries(val)) {
+      out[k] = maskDeep(v, mask);
+    }
+    return out;
+  }
+  return val;
+}
+
+function serializeMaskedArgs(args, mask) {
+  return JSON.stringify(maskDeep(args && typeof args === 'object' ? args : {}, mask));
 }
 
 function buildHistoryMessages(history, useNativeTools, mask) {
@@ -889,19 +920,19 @@ function buildHistoryMessages(history, useNativeTools, mask) {
           fnName = 'file_action';
           args = { type: a.type, path: a.path || '', from: a.from || '', to: a.to || '', content: a.content, reason: a.reason || '' };
         }
-        toolCalls.push({ id: callId, type: 'function', function: { name: fnName, arguments: mask(JSON.stringify(args)) } });
+        toolCalls.push({ id: callId, type: 'function', function: { name: fnName, arguments: serializeMaskedArgs(args, mask) } });
         toolResults.push({ role: 'tool', tool_call_id: callId, content: mask(`${a.status || 'applied'}: ${a.result || a.path || a.to || 'done'}`) });
       }
       for (const r of m.codeRuns || []) {
         const callId = `call_hist_${++seq}`;
         const args = { title: r.title || r.language, language: r.language || 'bash', code: r.code || r.command || '', reason: r.reason || '' };
-        toolCalls.push({ id: callId, type: 'function', function: { name: 'run_code', arguments: mask(JSON.stringify(args)) } });
+        toolCalls.push({ id: callId, type: 'function', function: { name: 'run_code', arguments: serializeMaskedArgs(args, mask) } });
         toolResults.push({ role: 'tool', tool_call_id: callId, content: mask(`Exit ${r.exitCode ?? 0}:\n${String(r.output || '(no output)').slice(0, toolOutLimit)}`) });
       }
       for (const t of m.tableEdits || []) {
         const callId = `call_hist_${++seq}`;
         const args = { path: t.path, sheetIndex: t.sheetIndex || 0, summary: t.summary || '', operations: t.operations || [] };
-        toolCalls.push({ id: callId, type: 'function', function: { name: 'edit_table', arguments: mask(JSON.stringify(args)) } });
+        toolCalls.push({ id: callId, type: 'function', function: { name: 'edit_table', arguments: serializeMaskedArgs(args, mask) } });
         toolResults.push({ role: 'tool', tool_call_id: callId, content: mask(`${t.status || 'applied'}: ${t.result || t.path}`) });
       }
 
@@ -952,6 +983,91 @@ function isPrematureIntentStop(content, toolCalls = []) {
   const announcesAction = /\b(ich (baue|erstelle|starte|führe|fuehre|schreibe|lege|mache|prüfe|pruefe|installiere|öffne|oeffne)|erstelle jetzt|baue jetzt|starte jetzt|lass mich|let me|i['’]ll|i will|now i['’]?ll|now i will|going to (create|build|write|run|start|launch|install|inspect)|creating|building|starting|launching|running)\b/i.test(txt);
   const looksComplete = /\b(http:\/\/|https:\/\/|localhost:\d+|fertig|erfolgreich gestartet|läuft auf|laeuft auf|is now running|successfully started|completed)\b/i.test(txt);
   return announcesAction && !looksComplete;
+}
+
+function buildSystemPrompt({
+  roleTitle,
+  today,
+  workspace,
+  blueprint,
+  wsSnapshot,
+  globalCustomInstr,
+  projectContextBlock,
+  activeViewContextBlock,
+  toolsCfg,
+  useNativeTools,
+  resolvedExecTarget,
+  effAutoEdits,
+  effAutoCode,
+  isCopilotSynthesis = false,
+}) {
+  const isWin = process.platform === 'win32';
+  const envLine = resolvedExecTarget === 'host'
+    ? `Execution Target: ON-MACHINE HOST (${isWin ? 'Windows / PowerShell + Python + Node' : 'Linux / bash + Python + Node'}, cwd=${workspace}; local .venv auto-detected for Python; do NOT hardcode /workspace).`
+    : `Execution Target: ISOLATED CONTAINER (Docker/Podman mounted at /workspace).`;
+
+  const operatingRules = [
+    '- Act decisively: when the user asks to create, edit, run, test, or update something, invoke the required tool(s) immediately in this turn. NEVER stop after narration like "I will now run..." or fake text like "Prepared 1 code run...".',
+    '- Coding workflow: inspect existing files first (read_file / search_files with regex & glob), make surgical edits with edit_file (prefer over write_file on existing files), then verify with run_code (tests/linters/syntax). For long-running web apps (Flask, FastAPI, Vite, Node), use start_server + read_server_logs instead of blocking run_code.',
+    '- Office & Excel workflow: for .xlsx/.csv spreadsheets, use real Excel formulas (=SUM, =AVERAGE, =IF, =ROUND, cross-sheet refs) instead of hardcoded totals; use edit_table (supports A1 refs, set_range, sort_rows, add_sheet, rename_sheet). Use fill_docx_template when an existing .docx template should keep its branding, and create_office_doc for fresh .docx, .pptx, or .ics files.',
+    '- Honesty & precision: never fabricate command output, test results, file contents, or URLs. Cite local files by relative path and web sources as Markdown links.',
+  ];
+  if (effAutoEdits || effAutoCode) {
+    operatingRules.push(
+      `- Auto Mode is ACTIVE (${[effAutoCode ? `auto-run code on ${resolvedExecTarget.toUpperCase()}` : '', effAutoEdits ? 'auto-apply file & spreadsheet edits with 1-click Undo' : ''].filter(Boolean).join(' + ')}): emit executable actions directly; they run automatically right after your turn.`
+    );
+  }
+
+  let toolingSection = '';
+  if (useNativeTools) {
+    toolingSection = [
+      '[Tooling Protocol — Native Function Tools]',
+      'Use ONLY the attached native tools to inspect, edit, or execute:',
+      toolsCfg.osFiles ? '- Inspect: read_file (with start_line/end_line), list_dir, search_files (regex + glob), inspect_spreadsheet' : '',
+      toolsCfg.git ? '- Git: git_inspect' : '',
+      toolsCfg.osFiles ? '- Edit & Office: edit_file (preferred for existing files), write_file (new/small files), file_action, edit_table, create_office_doc (docx/pptx/ics), fill_docx_template' : '',
+      toolsCfg.container ? (resolvedExecTarget === 'host'
+        ? '- Execute: run_code (one-shot scripts/tests, supports cwd & timeout_sec), start_server / list_servers / read_server_logs / stop_server (long-running dev servers)'
+        : '- Execute: run_code (isolated container mounted at /workspace)') : '',
+      toolsCfg.notes ? '- Memory: save_memory (when user asks to remember a preference or project note)' : '',
+      'Do NOT duplicate native tool calls as fenced ```file-actions, ```code-run, or ```table-edits JSON blocks in your Markdown reply.',
+    ].filter(Boolean).join('\n');
+  } else {
+    const fencedBlocks = [
+      '[Tooling Protocol — Fenced JSON Blocks]',
+      'No native function tools are attached. Output your complete Markdown answer and any executable fenced JSON blocks directly in one response:',
+    ];
+    if (toolsCfg.osFiles) {
+      fencedBlocks.push(
+        '- File edits (```file-actions JSON array): prefer {"type":"patch","path":"...","oldText":"exact snippet","newText":"replacement","reason":"..."} for existing files; also supports "write", "write_docx" (title + Markdown content), "write_pptx" (title + slides/content), "fill_docx_template" (templatePath + path + replacements), "write_ics", "mkdir", "move", "rename", "copy", "delete".',
+        '- Spreadsheets (```table-edits JSON): {"path":"file.xlsx","sheetIndex":0,"summary":"...","operations":[{"op":"set_cell","cell":"C2","value":"=SUM(B2:B9)"}]} (ops: set_cell, set_formula, set_range, add_column, rename_column, delete_column, add_row, insert_row, delete_row, sort_rows, add_sheet, rename_sheet).'
+      );
+    }
+    if (toolsCfg.container) {
+      fencedBlocks.push(
+        resolvedExecTarget === 'host'
+          ? '- Code execution (```code-run JSON): {"title":"...","language":"python"|"javascript"|"bash"|"powershell","cwd":"optional/subdir","timeoutSec":60,"code":"...","reason":"..."}.'
+          : '- Code execution (```code-run JSON): {"title":"...","language":"python"|"javascript"|"bash","image":"python:3.12-slim","code":"...","reason":"..."}.'
+      );
+    }
+    if (toolsCfg.notes) {
+      fencedBlocks.push('- Memory (```memory-save JSON): {"title":"...","content":"...","tags":["..."]}.');
+    }
+    toolingSection = fencedBlocks.join('\n');
+  }
+
+  return [
+    `[Identity & Environment]\nYou are ${roleTitle}, a local desktop AI coding & office coworker.\nDate: ${today} | Workspace: ${workspace}\n${toolsCfg.container ? envLine : ''}`.trim(),
+    blueprint
+      ? `[Project Structure & Stack]\n${blueprint}`
+      : (wsSnapshot ? `[Workspace Top-Level Items]\n${wsSnapshot}` : ''),
+    globalCustomInstr ? `[User Custom Instructions]\n${globalCustomInstr}` : '',
+    projectContextBlock ? `[Project & Workspace Rules]\n${projectContextBlock}` : '',
+    activeViewContextBlock,
+    `[Operating Rules]\n${operatingRules.join('\n')}${isCopilotSynthesis ? '\n- Synthesize the retrieved local tool & worker evidence below into a crisp, accurate, actionable Markdown response.' : ''}`,
+    toolingSection,
+    `[Interactive Artifacts]\nFor standalone interactive dashboards, charts, diagrams, or UI mockups, output a self-contained fenced \`\`\`html, \`\`\`svg, \`\`\`jsx, or \`\`\`mermaid block to open the live Artifact Preview Canvas.`,
+  ].filter(Boolean).join('\n\n');
 }
 
 function resolveEnabledTools(cfg, overrides = {}) {
@@ -1464,23 +1580,22 @@ async function runCoworkTurn({
       }
     }
 
-    const sys = [
-      `You are mx-Cowork, a context-aware local desktop AI copilot & coding/office coworker. Today: ${today}. Workspace: ${workspace}.`,
-      directBlueprint ? `[Project Structure & Stack]\n${directBlueprint}\n[/Project Structure & Stack]` : '',
-      globalCustomInstr,
+    const sys = buildSystemPrompt({
+      roleTitle: 'mx-Cowork',
+      today,
+      workspace,
+      blueprint: directBlueprint,
+      wsSnapshot: '',
+      globalCustomInstr: cfg.customInstructions || '',
       projectContextBlock,
       activeViewContextBlock,
-      `Be crisp, structured, and actionable. Use Markdown.`,
-      useNativeTools
-        ? `Use the attached tools directly: inspect with read_file/list_dir/search_files/git_inspect/inspect_spreadsheet first, then make surgical edits with edit_file (prefer over write_file for existing files), run tests/scripts with run_code, update/create Excel/CSV with edit_table (supports real =SUM/=IF formulas & multi-sheet ops), or create Word/Calendar docs with create_office_doc.`
-        : noNativeToolHint,
-      artifactHint,
-      tableEditsHint,
-      fileActionsHint,
-      codeRunHint,
-      autoModeHint,
-      memoryHint,
-    ].filter(Boolean).join('\n');
+      toolsCfg,
+      useNativeTools,
+      resolvedExecTarget,
+      effAutoEdits,
+      effAutoCode,
+      isCopilotSynthesis: false,
+    });
 
     const userContent = ctxParts.length ? `${ctxParts.join('\n\n')}\n\nUser request:\n${prompt}` : prompt;
     const msgs = [
@@ -1506,6 +1621,7 @@ async function runCoworkTurn({
         priority: mode,
         workspace,
         mask,
+        unmask,
         signal,
         onEvent,
       });
@@ -1585,7 +1701,7 @@ async function runCoworkTurn({
     });
 
     const blocks = await extractSpecialBlocks(finalContent, toolsCfg, resolvedExecTarget);
-    await mergeNativeToolCalls(res.toolCalls, blocks, toolsCfg, resolvedExecTarget);
+    await mergeNativeToolCalls(res.toolCalls, blocks, toolsCfg, resolvedExecTarget, unmask);
     const { fileActions, tableEdits, codeRuns, savedNotes, savedTasks } = blocks;
     let wasAutoSynthesized = false;
     if (!finalContent.trim() && (fileActions.length || codeRuns.length || tableEdits.length)) {
@@ -1753,24 +1869,22 @@ Rules:
   const useNativeTools = supportsNativeTools(orchestratorModel);
   const nativeTools = useNativeTools ? buildNativeTools(toolsCfg, resolvedExecTarget) : [];
 
-  const synthSys = [
-    `You are mx-Cowork's ${orchestratorLabel} Orchestrator & Coding/Office Coworker. Today: ${today}. Workspace: ${workspace}.`,
-    wsBlueprint ? `[Project Structure & Stack]\n${wsBlueprint}\n[/Project Structure & Stack]` : (wsSnapshot ? `Workspace top-level items: ${wsSnapshot}` : ''),
-    globalCustomInstr,
+  const synthSys = buildSystemPrompt({
+    roleTitle: `mx-Cowork (${orchestratorLabel})`,
+    today,
+    workspace,
+    blueprint: wsBlueprint,
+    wsSnapshot,
+    globalCustomInstr: cfg.customInstructions || '',
     projectContextBlock,
     activeViewContextBlock,
-    `Your local tools and fast worker models retrieved the evidence below. Synthesize a crisp, deeply helpful, accurate response using Markdown.`,
-    `Cite web sources as Markdown links and reference local files by relative path.`,
-    useNativeTools
-      ? `Use the attached tools directly: inspect with read_file/list_dir/search_files/git_inspect/inspect_spreadsheet if you need exact lines or another sheet, make surgical code edits with edit_file (prefer over write_file for existing files), run tests/scripts with run_code, update/create Excel/CSV with edit_table (real =SUM/=IF formulas & multi-sheet ops), or create Word/Calendar docs with create_office_doc.`
-      : noNativeToolHint,
-    artifactHint,
-    tableEditsHint,
-    fileActionsHint,
-    codeRunHint,
-    autoModeHint,
-    memoryHint,
-  ].filter(Boolean).join('\n');
+    toolsCfg,
+    useNativeTools,
+    resolvedExecTarget,
+    effAutoEdits,
+    effAutoCode,
+    isCopilotSynthesis: true,
+  });
 
   const briefBlocks = workerResults.map((w, i) =>
     `### Worker ${i + 1}: ${w.label} (${w.task})\n${w.brief}`
@@ -1805,6 +1919,7 @@ Rules:
       priority: 'smart',
       workspace,
       mask,
+      unmask,
       signal,
       onEvent,
     });
@@ -1884,7 +1999,7 @@ Rules:
   });
 
   const blocks = await extractSpecialBlocks(finalContent, toolsCfg, resolvedExecTarget);
-  await mergeNativeToolCalls(finalRes.toolCalls, blocks, toolsCfg, resolvedExecTarget);
+  await mergeNativeToolCalls(finalRes.toolCalls, blocks, toolsCfg, resolvedExecTarget, unmask);
   const { fileActions, tableEdits, codeRuns, savedNotes, savedTasks } = blocks;
   let wasAutoSynthesized = false;
   if (!finalContent.trim() && (fileActions.length || codeRuns.length || tableEdits.length)) {
@@ -1918,9 +2033,11 @@ Rules:
 
 module.exports = {
   runCoworkTurn,
+  buildSystemPrompt,
   buildNativeTools,
   buildHistoryMessages,
   extractSpecialBlocks,
+  mergeNativeToolCalls,
   executeReadOnlyTool,
   READ_ONLY_TOOL_NAMES,
 };

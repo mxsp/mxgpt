@@ -499,26 +499,97 @@ async function chatCompletion({
   });
 }
 
+function safeParseToolArgs(raw) {
+  const s = String(raw || '').trim();
+  if (!s) return {};
+  try {
+    const parsed = JSON.parse(s);
+    return parsed && typeof parsed === 'object' ? parsed : {};
+  } catch {}
+  const start = s.indexOf('{');
+  const end = s.lastIndexOf('}');
+  if (start >= 0 && end > start) {
+    try {
+      const parsed = JSON.parse(s.slice(start, end + 1));
+      return parsed && typeof parsed === 'object' ? parsed : {};
+    } catch {}
+  }
+  return {};
+}
+
+function sanitizeToolCallsArray(toolCalls) {
+  return (Array.isArray(toolCalls) ? toolCalls : [])
+    .filter((tc) => tc && tc.function && tc.function.name)
+    .map((tc, idx) => {
+      let argStr = typeof tc.function.arguments === 'string'
+        ? tc.function.arguments
+        : JSON.stringify(tc.function.arguments || {});
+      try {
+        JSON.parse(argStr);
+      } catch {
+        argStr = JSON.stringify(safeParseToolArgs(argStr));
+      }
+      return {
+        id: String(tc.id || `call_san_${idx}`),
+        type: 'function',
+        function: {
+          name: String(tc.function.name),
+          arguments: argStr,
+        },
+      };
+    });
+}
+
+function flattenToolMessages(fullMsgs) {
+  return (Array.isArray(fullMsgs) ? fullMsgs : []).map((m) => {
+    if (m.role === 'tool') {
+      return { role: 'user', content: `[Tool result]\n${String(m.content || '(done)')}` };
+    }
+    if (m.role === 'assistant' && Array.isArray(m.tool_calls) && m.tool_calls.length) {
+      const names = m.tool_calls.map((tc) => tc.function?.name || 'tool').join(', ');
+      return { role: 'assistant', content: [m.content || '', `[Called tools: ${names}]`].filter(Boolean).join('\n') };
+    }
+    return m;
+  });
+}
+
 function buildOpenAIMessages(systemPrompt, messages, images = []) {
   const fullMsgs = [];
   if (systemPrompt) fullMsgs.push({ role: 'system', content: systemPrompt });
+  let pendingToolIds = new Set();
+
   messages.forEach((m, idx) => {
     // Preserve native assistant tool_calls and role:'tool' turns verbatim for multi-step OpenAI / OpenCode Go agents!
     if (m.role === 'tool' && m.tool_call_id) {
-      fullMsgs.push({
-        role: 'tool',
-        tool_call_id: String(m.tool_call_id),
-        content: String(m.content || ''),
-      });
+      const tid = String(m.tool_call_id);
+      if (pendingToolIds.has(tid)) {
+        pendingToolIds.delete(tid);
+        fullMsgs.push({
+          role: 'tool',
+          tool_call_id: tid,
+          content: String(m.content || ''),
+        });
+      }
       return;
     }
+    // If previous assistant had tool_calls with missing tool results, close them cleanly before next turn
+    if (pendingToolIds.size > 0) {
+      for (const tid of pendingToolIds) {
+        fullMsgs.push({ role: 'tool', tool_call_id: tid, content: '(completed)' });
+      }
+      pendingToolIds = new Set();
+    }
     if (m.role === 'assistant' && Array.isArray(m.tool_calls) && m.tool_calls.length) {
-      fullMsgs.push({
-        role: 'assistant',
-        content: m.content ? String(m.content) : null,
-        tool_calls: m.tool_calls,
-      });
-      return;
+      const cleanCalls = sanitizeToolCallsArray(m.tool_calls);
+      if (cleanCalls.length) {
+        pendingToolIds = new Set(cleanCalls.map((c) => c.id));
+        fullMsgs.push({
+          role: 'assistant',
+          content: m.content ? String(m.content) : null,
+          tool_calls: cleanCalls,
+        });
+        return;
+      }
     }
     const role = m.role === 'assistant' ? 'assistant' : 'user';
     const isLastUser = idx === messages.length - 1 && role === 'user' && images.length > 0;
@@ -537,6 +608,12 @@ function buildOpenAIMessages(systemPrompt, messages, images = []) {
       fullMsgs.push({ role, content: String(m.content || '') });
     }
   });
+
+  if (pendingToolIds.size > 0) {
+    for (const tid of pendingToolIds) {
+      fullMsgs.push({ role: 'tool', tool_call_id: tid, content: '(completed)' });
+    }
+  }
   return fullMsgs;
 }
 
@@ -578,6 +655,7 @@ async function chatViaOpenAI(cfg, { model, systemPrompt, messages, images = [], 
     if (!res.ok && (res.status === 400 || res.status === 422) && retryBody.tools) {
       delete retryBody.tools;
       delete retryBody.tool_choice;
+      retryBody.messages = flattenToolMessages(retryBody.messages);
       res = await fetch(`${base}/chat/completions`, {
         method: 'POST',
         headers: openAIHeaders(cfg),
@@ -655,9 +733,7 @@ async function chatViaOpenAI(cfg, { model, systemPrompt, messages, images = [], 
   if (buf.trim()) handleLine(buf);
 
   const toolCalls = rawToolCalls.filter((c) => c && c.name).map((c, i) => {
-    let args = {};
-    try { args = JSON.parse(c.arguments || '{}'); } catch { args = {}; }
-    return { id: c.id || `tc_${Date.now().toString(36)}_${i}`, name: c.name, args };
+    return { id: c.id || `tc_${Date.now().toString(36)}_${i}`, name: c.name, args: safeParseToolArgs(c.arguments) };
   });
 
   const elapsedMs = Date.now() - t0;
@@ -927,6 +1003,7 @@ async function chatViaMxgptOpencodeProxy(cfg, { model, systemPrompt, messages, i
     if (!res.ok && (res.status === 400 || res.status === 422) && retryBody.tools) {
       delete retryBody.tools;
       delete retryBody.tool_choice;
+      retryBody.messages = flattenToolMessages(retryBody.messages);
       res = await doPost(retryBody);
     }
   }
@@ -991,9 +1068,7 @@ async function chatViaMxgptOpencodeProxy(cfg, { model, systemPrompt, messages, i
   if (buf.trim()) processLine(buf);
 
   const toolCalls = rawToolCalls.filter((c) => c && c.name).map((c, i) => {
-    let args = {};
-    try { args = JSON.parse(c.arguments || '{}'); } catch { args = {}; }
-    return { id: c.id || `tc_${Date.now().toString(36)}_${i}`, name: c.name, args };
+    return { id: c.id || `tc_${Date.now().toString(36)}_${i}`, name: c.name, args: safeParseToolArgs(c.arguments) };
   });
 
   const elapsedMs = Date.now() - t0;
