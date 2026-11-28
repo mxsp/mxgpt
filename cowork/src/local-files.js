@@ -958,15 +958,21 @@ async function parseTableFile(relPath, baseDir = getWorkspace(), { preserveFormu
     const buf = await fsp.readFile(abs);
     const parsed = officeExport.parseXlsxBuffer(buf, { preserveFormulas });
     const sheets = parsed.sheets || [{ name: 'Sheet1', rows: [['']] }];
+    const enrichedSheets = sheets.map((s) => {
+      const sliced = s.rows.slice(0, 600);
+      const { displayRows, evaluatedCount } = officeExport.evaluateSheetFormulas(sliced, sheets);
+      return { name: s.name, rows: sliced, displayRows, evaluatedCount, totalRows: s.rows.length };
+    });
     return {
       path: rel,
       name,
       ext,
       editable: true,
       delimiter: ',',
-      sheets: sheets.map((s) => ({ name: s.name, rows: s.rows.slice(0, 600), totalRows: s.rows.length })),
-      rows: sheets[0].rows.slice(0, 600),
-      totalRows: sheets[0].rows.length,
+      sheets: enrichedSheets,
+      rows: enrichedSheets[0].rows,
+      displayRows: enrichedSheets[0].displayRows,
+      totalRows: enrichedSheets[0].totalRows,
     };
   }
   const raw = await fsp.readFile(abs, 'utf8');

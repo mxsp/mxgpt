@@ -199,6 +199,8 @@ const READ_ONLY_TOOL_NAMES = new Set([
   'search_files',
   'git_inspect',
   'inspect_spreadsheet',
+  'list_servers',
+  'read_server_logs',
 ]);
 
 function buildNativeTools(toolsCfg, resolvedExecTarget = 'container') {
@@ -238,12 +240,14 @@ function buildNativeTools(toolsCfg, resolvedExecTarget = 'container') {
       type: 'function',
       function: {
         name: 'search_files',
-        description: 'Search filenames and file contents across the workspace (supports code, markdown, CSV, XLSX, DOCX, PDF).',
+        description: 'Search filenames and file contents across the workspace with optional regex and file glob filters (returns exact line numbers).',
         parameters: {
           type: 'object',
           properties: {
-            query: { type: 'string', description: 'Search text or symbol name' },
+            query: { type: 'string', description: 'Search text, symbol name, or regex pattern' },
             path: { type: 'string', description: 'Optional relative subfolder to scope the search' },
+            glob: { type: 'string', description: 'Optional file glob filter, e.g. "*.py", "src/**/*.js", "*.xlsx"' },
+            regex: { type: 'boolean', description: 'Treat query as a regular expression (default false)' },
           },
           required: ['query'],
         },
@@ -350,20 +354,43 @@ function buildNativeTools(toolsCfg, resolvedExecTarget = 'container') {
       type: 'function',
       function: {
         name: 'create_office_doc',
-        description: 'Create or update a real Word document (.docx from Markdown) or Calendar Invite (.ics) directly in the workspace (with 1-click Undo).',
+        description: 'Create or update a real Word document (.docx from Markdown), PowerPoint slide deck (.pptx), or Calendar Invite (.ics) directly in the workspace (with 1-click Undo).',
         parameters: {
           type: 'object',
           properties: {
-            format: { type: 'string', enum: ['docx', 'ics'], description: 'Office file format' },
-            path: { type: 'string', description: 'Relative output path, e.g. reports/Q1-Summary.docx or invite.ics' },
-            title: { type: 'string', description: 'Document or meeting title' },
-            content: { type: 'string', description: 'Markdown body (headings, tables, bullets, bold) for .docx, or description for .ics' },
+            format: { type: 'string', enum: ['docx', 'pptx', 'ics'], description: 'Office file format' },
+            path: { type: 'string', description: 'Relative output path, e.g. reports/Q1-Summary.docx, deck.pptx, or invite.ics' },
+            title: { type: 'string', description: 'Document, presentation, or meeting title' },
+            subtitle: { type: 'string', description: 'Optional subtitle (for .pptx)' },
+            slides: {
+              type: 'array',
+              items: { type: 'object' },
+              description: 'Optional slide array [{title, bullets:[...]}] for .pptx (if omitted, Markdown headings split into slides)',
+            },
+            content: { type: 'string', description: 'Markdown body for .docx/.pptx, or description for .ics' },
             start: { type: 'string', description: 'ISO start datetime for .ics (optional)' },
             duration_min: { type: 'integer', description: 'Duration in minutes for .ics (default 30)' },
             location: { type: 'string', description: 'Meeting location or URL for .ics (optional)' },
             reason: { type: 'string' },
           },
-          required: ['format', 'path', 'content'],
+          required: ['format', 'path'],
+        },
+      },
+    });
+    tools.push({
+      type: 'function',
+      function: {
+        name: 'fill_docx_template',
+        description: 'Fill {{placeholder}} tags inside an existing Word (.docx) template while preserving its original letterhead, logos, headers, footers, and styles.',
+        parameters: {
+          type: 'object',
+          properties: {
+            template_path: { type: 'string', description: 'Relative path to existing .docx template' },
+            path: { type: 'string', description: 'Relative output .docx path' },
+            replacements: { type: 'object', description: 'Key/value map of placeholder names (without braces) to replacement strings' },
+            reason: { type: 'string' },
+          },
+          required: ['template_path', 'path', 'replacements'],
         },
       },
     });
@@ -403,6 +430,61 @@ function buildNativeTools(toolsCfg, resolvedExecTarget = 'container') {
         },
       },
     });
+    if (resolvedExecTarget === 'host') {
+      tools.push({
+        type: 'function',
+        function: {
+          name: 'start_server',
+          description: 'Start a managed background dev server (e.g. Flask, FastAPI, Vite, Node HTTP server) in the workspace without blocking. Captures logs and listening URLs.',
+          parameters: {
+            type: 'object',
+            properties: {
+              title: { type: 'string', description: 'Server label, e.g. "Flask API" or "Vite dev server"' },
+              language: { type: 'string', enum: ['bash', 'python', 'javascript', 'powershell'] },
+              command: { type: 'string', description: 'Command or script to launch the server' },
+              cwd: { type: 'string', description: 'Optional relative subdirectory' },
+            },
+            required: ['command'],
+          },
+        },
+      });
+      tools.push({
+        type: 'function',
+        function: {
+          name: 'list_servers',
+          description: 'List currently managed background dev servers (IDs, status, listening URLs, PIDs).',
+          parameters: { type: 'object', properties: {} },
+        },
+      });
+      tools.push({
+        type: 'function',
+        function: {
+          name: 'read_server_logs',
+          description: 'Read recent stdout/stderr logs from a managed background server.',
+          parameters: {
+            type: 'object',
+            properties: {
+              server_id: { type: 'string', description: 'Server ID returned by start_server or list_servers' },
+            },
+            required: ['server_id'],
+          },
+        },
+      });
+      tools.push({
+        type: 'function',
+        function: {
+          name: 'stop_server',
+          description: 'Stop a running background dev server by ID.',
+          parameters: {
+            type: 'object',
+            properties: {
+              server_id: { type: 'string', description: 'Server ID to terminate' },
+            },
+            required: ['server_id'],
+          },
+        },
+      });
+    }
   }
   if (toolsCfg.notes) {
     tools.push({
@@ -436,8 +518,10 @@ async function executeReadOnlyTool(tc, { workspace, onEvent }) {
     search_files: 'Search Workspace',
     git_inspect: 'Git Inspect',
     inspect_spreadsheet: 'Inspect Spreadsheet',
+    list_servers: 'List Servers',
+    read_server_logs: 'Server Logs',
   };
-  const taskTitle = args.path || args.query || args.focus || labelMap[name] || name;
+  const taskTitle = args.path || args.query || args.focus || args.server_id || labelMap[name] || name;
   onEvent?.('worker_start', {
     id,
     type: name,
@@ -461,11 +545,30 @@ async function executeReadOnlyTool(tc, { workspace, onEvent }) {
       out = `[Directory: ${r.path || '.'} (${r.items.length} items)]\n` +
         r.items.slice(0, 80).map((it) => `${it.isDir ? '[DIR] ' : '[FILE]'} ${it.relPath}${it.isDir ? '' : ` (${it.sizeLabel})`}`).join('\n');
     } else if (name === 'search_files') {
-      const r = await localFiles.searchFiles({ query: args.query || '', relPath: args.path || '', maxResults: 15 }, workspace);
-      out = `[Search "${args.query || ''}": ${r.results.length} matches across ${r.scanned} files]\n` +
+      const r = await localFiles.searchFiles({
+        query: args.query || '',
+        relPath: args.path || '',
+        glob: args.glob || '',
+        regex: Boolean(args.regex),
+        maxResults: 15,
+      }, workspace);
+      out = `[Search "${args.query || ''}"${args.glob ? ` glob=${args.glob}` : ''}${args.regex ? ' (regex)' : ''}: ${r.results.length} matches across ${r.scanned} files]\n` +
         (r.results.length
-          ? r.results.map((h) => `- ${h.relPath} (${h.sizeLabel})${h.snippet ? ` — ${h.snippet}` : ''}`).join('\n')
+          ? r.results.map((h) => {
+              const lineStr = h.matches?.length
+                ? '\n' + h.matches.map((m) => `    L${m.line}: ${m.text}`).join('\n')
+                : (h.snippet ? ` — ${h.snippet}` : '');
+              return `- ${h.relPath} (${h.sizeLabel})${lineStr}`;
+            }).join('\n')
           : '(no matches)');
+    } else if (name === 'list_servers') {
+      const svs = containerRunner.listServers();
+      out = svs.length
+        ? svs.map((s) => `- [${s.id}] "${s.title}" status=${s.status} pid=${s.pid || '?'} urls=${s.urls.join(', ') || '(none)'}`).join('\n')
+        : 'No managed background servers are currently tracked.';
+    } else if (name === 'read_server_logs') {
+      const lg = containerRunner.readServerLogs(args.server_id || args.serverId || '');
+      out = `[Server ${lg.id} "${lg.title}" status=${lg.status} urls=${lg.urls.join(', ') || '(none)'}]\n${lg.logs || '(no logs yet)'}`;
     } else if (name === 'git_inspect') {
       const g = await localTools.gitInspect(workspace, args.focus || '');
       out = g.text.slice(0, 10000);
@@ -605,24 +708,31 @@ async function mergeNativeToolCalls(toolCalls, blocks, toolsCfg, resolvedExecTar
     const name = String(tc?.name || '').toLowerCase();
     const args = tc?.args && typeof tc.args === 'object' ? tc.args : {};
 
-    if ((name === 'write_file' || name === 'edit_file' || name === 'file_action' || name === 'create_office_doc') && toolsCfg.osFiles) {
+    if ((name === 'write_file' || name === 'edit_file' || name === 'file_action' || name === 'create_office_doc' || name === 'fill_docx_template') && toolsCfg.osFiles) {
       let type;
       if (name === 'write_file') type = 'write';
       else if (name === 'edit_file') type = 'patch';
-      else if (name === 'create_office_doc') type = String(args.format || 'docx').toLowerCase() === 'ics' ? 'write_ics' : 'write_docx';
-      else type = String(args.type || 'write').toLowerCase();
-      if (!['mkdir', 'write', 'create', 'patch', 'edit', 'write_docx', 'write_ics', 'move', 'rename', 'copy', 'delete'].includes(type)) continue;
+      else if (name === 'fill_docx_template') type = 'fill_docx_template';
+      else if (name === 'create_office_doc') {
+        const fmt = String(args.format || 'docx').toLowerCase();
+        type = fmt === 'ics' ? 'write_ics' : (fmt === 'pptx' ? 'write_pptx' : 'write_docx');
+      } else type = String(args.type || 'write').toLowerCase();
+      if (!['mkdir', 'write', 'create', 'patch', 'edit', 'write_docx', 'write_pptx', 'fill_docx_template', 'write_ics', 'move', 'rename', 'copy', 'delete'].includes(type)) continue;
       const act = {
         id: `act_${Date.now().toString(36)}_tc${i}`,
         type,
         path: args.path ? String(args.path) : '',
         from: args.from ? String(args.from) : '',
         to: args.to ? String(args.to) : '',
+        templatePath: args.template_path || args.templatePath ? String(args.template_path || args.templatePath) : '',
+        replacements: args.replacements && typeof args.replacements === 'object' ? args.replacements : undefined,
         content: typeof args.content === 'string' ? args.content : undefined,
         oldText: typeof (args.old_text ?? args.oldText) === 'string' ? String(args.old_text ?? args.oldText) : undefined,
         newText: typeof (args.new_text ?? args.newText) === 'string' ? String(args.new_text ?? args.newText) : undefined,
         replaceAll: Boolean(args.replace_all || args.replaceAll),
         title: args.title ? String(args.title) : undefined,
+        subtitle: args.subtitle ? String(args.subtitle) : undefined,
+        slides: Array.isArray(args.slides) ? args.slides : undefined,
         start: args.start ? String(args.start) : undefined,
         durationMin: args.duration_min || args.durationMin ? Number(args.duration_min || args.durationMin) : undefined,
         location: args.location ? String(args.location) : undefined,
@@ -634,22 +744,41 @@ async function mergeNativeToolCalls(toolCalls, blocks, toolsCfg, resolvedExecTar
         if (d) act.diff = d;
       } catch {}
       blocks.fileActions.push(act);
-    } else if (name === 'run_code' && toolsCfg.container) {
+    } else if ((name === 'run_code' || name === 'start_server' || name === 'stop_server') && toolsCfg.container) {
+      if (name === 'stop_server') {
+        const sid = String(args.server_id || args.serverId || '').trim();
+        if (!sid) continue;
+        blocks.codeRuns.push({
+          id: `run_${Date.now().toString(36)}_tc${i}`,
+          title: `Stop server ${sid}`,
+          language: 'bash',
+          code: `# stop server ${sid}`,
+          command: '',
+          isServerOp: 'stop',
+          serverId: sid,
+          execTarget: 'host',
+          reason: `Stop managed background server ${sid}`,
+          status: 'pending',
+          output: '',
+        });
+        continue;
+      }
       const code = typeof args.code === 'string' ? args.code : (typeof args.command === 'string' ? args.command : '');
       if (!code.trim()) continue;
-      const lang = String(args.language || 'python').toLowerCase();
+      const lang = String(args.language || (name === 'start_server' ? 'bash' : 'python')).toLowerCase();
       blocks.codeRuns.push({
         id: `run_${Date.now().toString(36)}_tc${i}`,
-        title: String(args.title || `Run ${lang} ${resolvedExecTarget === 'host' ? 'on host' : 'in container'}`).slice(0, 100),
+        title: String(args.title || (name === 'start_server' ? `Start server (${lang})` : `Run ${lang} ${resolvedExecTarget === 'host' ? 'on host' : 'in container'}`)).slice(0, 100),
         language: lang,
         image: String(args.image || containerRunner.defaultImageForLanguage(lang, cfg.containerImage)),
         code,
-        command: '',
+        command: name === 'start_server' ? code : '',
+        isServerOp: name === 'start_server' ? 'start' : undefined,
         cwd: args.cwd ? String(args.cwd).trim() : '',
         timeoutSec: args.timeout_sec || args.timeoutSec ? Number(args.timeout_sec || args.timeoutSec) : 0,
         network: cfg.containerNetwork || 'none',
         mountMode: cfg.containerMountMode || 'rw',
-        execTarget: resolvedExecTarget,
+        execTarget: name === 'start_server' ? 'host' : resolvedExecTarget,
         reason: String(args.reason || '').slice(0, 180),
         status: 'pending',
         output: '',
@@ -700,13 +829,41 @@ function summarizeBlocksMarkdown(blocks) {
 }
 
 function buildHistoryMessages(history, useNativeTools, mask) {
-  const slice = (history || []).slice(-12);
+  const all = Array.isArray(history) ? history.filter(Boolean) : [];
+  const WINDOW = 12;
+  const older = all.length > WINDOW ? all.slice(0, all.length - WINDOW) : [];
+  const slice = all.slice(-WINDOW);
   const out = [];
   let seq = 0;
+
+  if (older.length) {
+    const digestLines = [];
+    for (const m of older.slice(-16)) {
+      if (m.isHarness) continue;
+      const role = m.role === 'assistant' ? 'Assistant' : 'User';
+      const snippet = String(m.content || '').replace(/\s+/g, ' ').trim().slice(0, 140);
+      const ops = [
+        ...(m.fileActions || []).map((a) => `${a.type}:${a.path || a.to}`),
+        ...(m.tableEdits || []).map((t) => `table:${t.path}`),
+        ...(m.codeRuns || []).map((r) => `run:${r.title || r.language}(exit ${r.exitCode ?? '?'})`),
+      ];
+      if (snippet || ops.length) {
+        digestLines.push(`- ${role}: ${snippet}${ops.length ? ` [${ops.join(', ')}]` : ''}`);
+      }
+    }
+    if (digestLines.length) {
+      out.push({
+        role: 'user',
+        content: mask(`[Earlier session digest — ${older.length} compacted messages]\n${digestLines.join('\n').slice(0, 2400)}`),
+      });
+    }
+  }
 
   for (let i = 0; i < slice.length; i++) {
     const m = slice[i];
     if (!m) continue;
+    const isRecent = i >= slice.length - 4;
+    const toolOutLimit = isRecent ? 3500 : 900;
 
     if (useNativeTools && m.role === 'assistant' && ((m.codeRuns?.length || 0) + (m.fileActions?.length || 0) + (m.tableEdits?.length || 0) > 0)) {
       const cleanTxt = String(m.content || '')
@@ -739,7 +896,7 @@ function buildHistoryMessages(history, useNativeTools, mask) {
         const callId = `call_hist_${++seq}`;
         const args = { title: r.title || r.language, language: r.language || 'bash', code: r.code || r.command || '', reason: r.reason || '' };
         toolCalls.push({ id: callId, type: 'function', function: { name: 'run_code', arguments: mask(JSON.stringify(args)) } });
-        toolResults.push({ role: 'tool', tool_call_id: callId, content: mask(`Exit ${r.exitCode ?? 0}:\n${String(r.output || '(no output)').slice(0, 3500)}`) });
+        toolResults.push({ role: 'tool', tool_call_id: callId, content: mask(`Exit ${r.exitCode ?? 0}:\n${String(r.output || '(no output)').slice(0, toolOutLimit)}`) });
       }
       for (const t of m.tableEdits || []) {
         const callId = `call_hist_${++seq}`;
@@ -1153,24 +1310,35 @@ async function runCoworkTurn({
   const mask = (txt) => (shield ? shield.redact(txt) : String(txt ?? ''));
   const unmask = (txt) => (shield ? shield.restore(txt) : String(txt ?? ''));
 
-  // Pull compact cached project Knowledge Graph & custom project instructions
+  // Pull compact cached project Knowledge Graph, custom project instructions, and repo-native COWORK.md / .coworkrules
   let projectContextBlock = '';
-  if (activeProject) {
-    const pParts = [`Active Project: "${activeProject.name}" (${activeProject.path})`];
-    if (activeProject.instructions) pParts.push(`Project Instructions:\n${activeProject.instructions}`);
-    if (toolsCfg.knowledgeGraph) {
-      const cachedGraph = storage.getProjectGraphCache(activeProject.id);
-      if (cachedGraph) {
-        const gLines = [];
-        if (cachedGraph.aiSummary) gLines.push(`Summary: ${cachedGraph.aiSummary}`);
-        if (cachedGraph.aiClusters?.length) {
-          gLines.push('Clusters: ' + cachedGraph.aiClusters.map((c) => `${c.name} (${c.description})`).join(' | '));
+  {
+    const pParts = [];
+    if (activeProject) {
+      pParts.push(`Active Project: "${activeProject.name}" (${activeProject.path})`);
+      if (activeProject.instructions) pParts.push(`Project Instructions:\n${activeProject.instructions}`);
+      if (toolsCfg.knowledgeGraph) {
+        const cachedGraph = storage.getProjectGraphCache(activeProject.id);
+        if (cachedGraph) {
+          const gLines = [];
+          if (cachedGraph.aiSummary) gLines.push(`Summary: ${cachedGraph.aiSummary}`);
+          if (cachedGraph.aiClusters?.length) {
+            gLines.push('Clusters: ' + cachedGraph.aiClusters.map((c) => `${c.name} (${c.description})`).join(' | '));
+          }
+          if (cachedGraph.topHubs?.length) {
+            gLines.push('Core Hubs: ' + cachedGraph.topHubs.slice(0, 8).map((h) => h.path).join(', '));
+          }
+          if (gLines.length) pParts.push(`Cached Project Knowledge Graph:\n${gLines.join('\n')}`);
         }
-        if (cachedGraph.topHubs?.length) {
-          gLines.push('Core Hubs: ' + cachedGraph.topHubs.slice(0, 8).map((h) => h.path).join(', '));
-        }
-        if (gLines.length) pParts.push(`Cached Project Knowledge Graph:\n${gLines.join('\n')}`);
       }
+    }
+    if (toolsCfg.osFiles) {
+      try {
+        const wsRules = await localFiles.loadWorkspaceRules(workspace);
+        if (wsRules) {
+          pParts.push(`Workspace Rules (${wsRules.file}):\n${wsRules.content}`);
+        }
+      } catch {}
     }
     projectContextBlock = pParts.join('\n');
   }
@@ -1751,6 +1919,7 @@ Rules:
 module.exports = {
   runCoworkTurn,
   buildNativeTools,
+  buildHistoryMessages,
   extractSpecialBlocks,
   executeReadOnlyTool,
   READ_ONLY_TOOL_NAMES,

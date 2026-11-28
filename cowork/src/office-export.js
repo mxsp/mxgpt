@@ -872,6 +872,343 @@ function applyWorkbookOperations(sheetsInput, defaultSheetIndex = 0, operations 
   };
 }
 
+function evaluateSheetFormulas(rowsInput = [], allSheets = null) {
+  const rows = (rowsInput || []).map((r) => [...r]);
+  const sheetsMap = new Map();
+  if (Array.isArray(allSheets)) {
+    for (const sh of allSheets) {
+      if (sh && sh.name) sheetsMap.set(String(sh.name).toLowerCase(), sh.rows || []);
+    }
+  }
+  const cache = new Map();
+  let evaluatedCount = 0;
+
+  const parseNumeric = (val) => {
+    const clean = String(val ?? '').replace(/[€$£,\s]/g, '');
+    if (clean.endsWith('%')) {
+      const n = Number(clean.slice(0, -1));
+      return Number.isFinite(n) ? n / 100 : NaN;
+    }
+    return clean !== '' && /^-?\d+(?:\.\d+)?$/.test(clean) ? Number(clean) : NaN;
+  };
+
+  const getCellVal = (targetRows, rIdx, cIdx, visiting) => {
+    const key = `${targetRows === rows ? 'self' : 'ext'}:${rIdx}:${cIdx}`;
+    if (cache.has(key)) return cache.get(key);
+    const raw = String(targetRows?.[rIdx]?.[cIdx] ?? '').trim();
+    if (!raw.startsWith('=')) return raw;
+    if (visiting.has(key)) return '#REF!';
+    visiting.add(key);
+    const val = evalFormula(raw.slice(1), targetRows, visiting);
+    visiting.delete(key);
+    cache.set(key, val);
+    return val;
+  };
+
+  const expandRange = (rangeStr, defaultRows, visiting) => {
+    let targetRows = defaultRows;
+    let body = rangeStr.trim();
+    const bang = body.indexOf('!');
+    if (bang > 0) {
+      const sName = body.slice(0, bang).replace(/^'|'$/g, '').toLowerCase();
+      body = body.slice(bang + 1);
+      targetRows = sheetsMap.get(sName) || defaultRows;
+    }
+    const [aStr, bStr] = body.split(':');
+    const a = parseCellRef(aStr);
+    const b = bStr ? parseCellRef(bStr) : a;
+    if (!a || !b) return [];
+    const vals = [];
+    for (let r = Math.min(a.row, b.row); r <= Math.max(a.row, b.row); r++) {
+      for (let c = Math.min(a.col, b.col); c <= Math.max(a.col, b.col); c++) {
+        vals.push(getCellVal(targetRows, r, c, visiting));
+      }
+    }
+    return vals;
+  };
+
+  const evalArithmetic = (expr) => {
+    const tokens = expr.match(/\d+(?:\.\d+)?|[()+\-*/]/g);
+    if (!tokens || tokens.join('') !== expr.replace(/\s+/g, '')) return NaN;
+    let pos = 0;
+    const parseExpr = () => {
+      let left = parseTerm();
+      while (tokens[pos] === '+' || tokens[pos] === '-') {
+        const op = tokens[pos++];
+        const right = parseTerm();
+        left = op === '+' ? left + right : left - right;
+      }
+      return left;
+    };
+    const parseTerm = () => {
+      let left = parseFactor();
+      while (tokens[pos] === '*' || tokens[pos] === '/') {
+        const op = tokens[pos++];
+        const right = parseFactor();
+        left = op === '*' ? left * right : (right === 0 ? NaN : left / right);
+      }
+      return left;
+    };
+    const parseFactor = () => {
+      if (tokens[pos] === '-') { pos++; return -parseFactor(); }
+      if (tokens[pos] === '+') { pos++; return parseFactor(); }
+      if (tokens[pos] === '(') {
+        pos++;
+        const v = parseExpr();
+        if (tokens[pos] === ')') pos++;
+        return v;
+      }
+      const n = Number(tokens[pos++]);
+      return Number.isFinite(n) ? n : NaN;
+    };
+    const res = parseExpr();
+    return pos === tokens.length && Number.isFinite(res) ? res : NaN;
+  };
+
+  const splitTopArgs = (s) => {
+    const parts = [];
+    let depth = 0;
+    let inQ = false;
+    let cur = '';
+    for (let i = 0; i < s.length; i++) {
+      const ch = s[i];
+      if (ch === '"') { inQ = !inQ; cur += ch; }
+      else if (!inQ && ch === '(') { depth++; cur += ch; }
+      else if (!inQ && ch === ')') { depth--; cur += ch; }
+      else if (!inQ && depth === 0 && ch === ',') { parts.push(cur.trim()); cur = ''; }
+      else cur += ch;
+    }
+    if (cur.trim() !== '') parts.push(cur.trim());
+    return parts;
+  };
+
+  const evalFormula = (expr, curRows, visiting) => {
+    let s = String(expr || '').trim();
+    // Handle IF(cond, trueVal, falseVal)
+    const ifM = s.match(/^IF\s*\(([\s\S]+)\)$/i);
+    if (ifM) {
+      const args = splitTopArgs(ifM[1]);
+      if (args.length >= 2) {
+        const cmpM = args[0].match(/^([\s\S]+?)(>=|<=|<>|!=|=|>|<)([\s\S]+)$/);
+        if (cmpM) {
+          const lv = evalFormula(cmpM[1], curRows, visiting);
+          const rv = evalFormula(cmpM[3], curRows, visiting);
+          const ln = parseNumeric(lv);
+          const rn = parseNumeric(rv);
+          const bothNum = !Number.isNaN(ln) && !Number.isNaN(rn);
+          const a = bothNum ? ln : String(lv).replace(/^"|"$/g, '');
+          const b = bothNum ? rn : String(rv).replace(/^"|"$/g, '');
+          const op = cmpM[2];
+          const ok = op === '>=' ? a >= b : op === '<=' ? a <= b : (op === '<>' || op === '!=') ? a !== b : op === '=' ? a === b : op === '>' ? a > b : a < b;
+          const chosen = ok ? args[1] : (args[2] ?? '""');
+          return /^"[\s\S]*"$/.test(chosen) ? chosen.slice(1, -1) : evalFormula(chosen, curRows, visiting);
+        }
+      }
+    }
+
+    // Handle ROUND(expr, digits)
+    const roundM = s.match(/^ROUND\s*\(([\s\S]+)\)$/i);
+    if (roundM) {
+      const args = splitTopArgs(roundM[1]);
+      if (args.length >= 1) {
+        const num = parseNumeric(evalFormula(args[0], curRows, visiting));
+        const digits = Math.max(0, Math.min(8, Number(args[1] || 0) || 0));
+        if (Number.isFinite(num)) return Number(num.toFixed(digits)).toString();
+      }
+    }
+
+    // Replace aggregate functions SUM/AVERAGE/AVG/MIN/MAX/COUNT
+    s = s.replace(/\b(SUM|AVERAGE|AVG|MIN|MAX|COUNT)\s*\(([^()]+)\)/gi, (_, fn, argStr) => {
+      const items = splitTopArgs(argStr).flatMap((part) => {
+        if (part.includes(':') || /!/.test(part) || /^[A-Z]+\d+$/i.test(part)) {
+          return expandRange(part, curRows, visiting);
+        }
+        return [evalFormula(part, curRows, visiting)];
+      });
+      const nums = items.map(parseNumeric).filter((n) => Number.isFinite(n));
+      const f = fn.toUpperCase();
+      if (f === 'COUNT') return String(nums.length);
+      if (!nums.length) return '0';
+      if (f === 'SUM') return String(nums.reduce((a, b) => a + b, 0));
+      if (f === 'AVERAGE' || f === 'AVG') return String(nums.reduce((a, b) => a + b, 0) / nums.length);
+      if (f === 'MIN') return String(Math.min(...nums));
+      if (f === 'MAX') return String(Math.max(...nums));
+      return '0';
+    });
+
+    // Replace standalone cell references (including Sheet1!B2)
+    s = s.replace(/(?:'[^']+'!|[A-Za-z0-9_]+!)?[A-Z]{1,3}\d+/g, (tok) => {
+      const vals = expandRange(tok, curRows, visiting);
+      const raw = vals[0] ?? '0';
+      const n = parseNumeric(raw);
+      return Number.isFinite(n) ? String(n) : raw;
+    });
+
+    if (/^"[\s\S]*"$/.test(s)) return s.slice(1, -1);
+    const num = evalArithmetic(s);
+    if (Number.isFinite(num)) {
+      return Number.isInteger(num) ? String(num) : String(Number(num.toFixed(4)));
+    }
+    return `=${expr}`;
+  };
+
+  const displayRows = rows.map((r, rIdx) =>
+    r.map((cell, cIdx) => {
+      const s = String(cell ?? '');
+      if (!s.startsWith('=')) return s;
+      const val = getCellVal(rows, rIdx, cIdx, new Set());
+      if (val !== s) evaluatedCount++;
+      return val;
+    })
+  );
+
+  return { displayRows, evaluatedCount };
+}
+
+function fillDocxTemplate(templateBuf, replacements = {}) {
+  const entries = readZipEntries(templateBuf);
+  const map = replacements && typeof replacements === 'object' ? replacements : {};
+  const keys = Object.keys(map);
+  let replacedCount = 0;
+
+  const replaceInXml = (xml) => {
+    // First collapse split runs inside {{...}} placeholders (Word frequently splits {{key}} across adjacent <w:t> tags)
+    let out = xml.replace(/\{\{((?:[^}<]|<[^>]+>){1,120})\}\}/g, (full, inner) => {
+      const cleanKey = inner.replace(/<[^>]+>/g, '').trim();
+      if (Object.prototype.hasOwnProperty.call(map, cleanKey)) {
+        replacedCount++;
+        return xmlEsc(String(map[cleanKey] ?? ''));
+      }
+      return full;
+    });
+    for (const k of keys) {
+      const token = `{{${k}}}`;
+      if (out.includes(token)) {
+        const parts = out.split(token);
+        replacedCount += parts.length - 1;
+        out = parts.join(xmlEsc(String(map[k] ?? '')));
+      }
+    }
+    return out;
+  };
+
+  const outEntries = [];
+  for (const [name, data] of entries.entries()) {
+    if (/^word\/(document|header\d*|footer\d*)\.xml$/i.test(name)) {
+      outEntries.push({ name, data: Buffer.from(replaceInXml(data.toString('utf8')), 'utf8') });
+    } else {
+      outEntries.push({ name, data });
+    }
+  }
+  return { buffer: createZipBuffer(outEntries), replacedCount };
+}
+
+function buildPptxBuffer({ title = 'mx-Cowork Presentation', subtitle = '', slides = null, markdown = '' } = {}) {
+  let slideList = Array.isArray(slides) && slides.length ? slides : null;
+  if (!slideList) {
+    slideList = [];
+    const lines = cleanMarkdownForExport(markdown).split(/\r?\n/);
+    let cur = null;
+    for (const line of lines) {
+      const hm = line.match(/^#{1,2}\s+(.+)$/);
+      if (hm) {
+        if (cur) slideList.push(cur);
+        cur = { title: hm[1].trim(), bullets: [] };
+      } else if (line.trim()) {
+        if (!cur) cur = { title: title || 'Overview', bullets: [] };
+        const bm = line.match(/^\s*(?:[-*•]|\d+\.)\s+(.+)$/);
+        cur.bullets.push((bm ? bm[1] : line.trim()).replace(/\*\*/g, ''));
+      }
+    }
+    if (cur) slideList.push(cur);
+    if (!slideList.length) {
+      slideList.push({ title: title || 'Presentation', bullets: [subtitle || 'Generated by mx-Cowork'] });
+    }
+  }
+
+  // Ensure a clean title slide if the first slide has no bullets or subtitle is provided
+  const finalSlides = subtitle && slideList[0]?.title !== title
+    ? [{ title, bullets: [subtitle], isTitleSlide: true }, ...slideList]
+    : slideList;
+
+  const entries = [];
+  const slideRelsXmlParts = [];
+  const slideIdListParts = [];
+  const contentTypeOverrides = [];
+
+  finalSlides.slice(0, 40).forEach((sl, idx) => {
+    const n = idx + 1;
+    const sTitle = String(sl.title || `Slide ${n}`).slice(0, 120);
+    const bullets = (Array.isArray(sl.bullets) ? sl.bullets : []).slice(0, 12);
+    const bodyParas = bullets.length
+      ? bullets.map((b) => `<a:p><a:pPr marL="285750" indent="-171450"><a:buChar char="•"/></a:pPr><a:r><a:rPr lang="en-US" sz="1800" dirty="0"><a:solidFill><a:srgbClr val="262624"/></a:solidFill></a:rPr><a:t>${xmlEsc(String(b))}</a:t></a:r></a:p>`).join('')
+      : '<a:p><a:endParaRPr lang="en-US" sz="1800"/></a:p>';
+
+    const slideXml = `<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<p:sld xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships" xmlns:p="http://schemas.openxmlformats.org/presentationml/2006/main">
+  <p:cSld>
+    <p:bg><p:bgPr><a:solidFill><a:srgbClr val="${idx === 0 ? 'FAF8F5' : 'FFFFFF'}"/></a:solidFill><a:effectLst/></p:bgPr></p:bg>
+    <p:spTree>
+      <p:nvGrpSpPr><p:cNvPr id="1" name=""/><p:cNvGrpSpPr/><p:nvPr/></p:nvGrpSpPr>
+      <p:grpSpPr><a:xfrm><a:off x="0" y="0"/><a:ext cx="0" cy="0"/><a:chOff x="0" y="0"/><a:chExt cx="0" cy="0"/></a:xfrm></p:grpSpPr>
+      <p:sp>
+        <p:nvSpPr><p:cNvPr id="2" name="Title"/><p:cNvSpPr/><p:nvPr/></p:nvSpPr>
+        <p:spPr><a:xfrm><a:off x="685800" y="457200"/><a:ext cx="10820400" cy="914400"/></a:xfrm><a:prstGeom prst="rect"><a:avLst/></a:prstGeom></p:spPr>
+        <p:txBody><a:bodyPr/><a:lstStyle/><a:p><a:r><a:rPr lang="en-US" sz="${idx === 0 ? '3600' : '2800'}" b="1" dirty="0"><a:solidFill><a:srgbClr val="B54E2D"/></a:solidFill></a:rPr><a:t>${xmlEsc(sTitle)}</a:t></a:r></a:p></p:txBody>
+      </p:sp>
+      <p:sp>
+        <p:nvSpPr><p:cNvPr id="3" name="Content"/><p:cNvSpPr/><p:nvPr/></p:nvSpPr>
+        <p:spPr><a:xfrm><a:off x="685800" y="1524000"/><a:ext cx="10820400" cy="4800600"/></a:xfrm><a:prstGeom prst="rect"><a:avLst/></a:prstGeom></p:spPr>
+        <p:txBody><a:bodyPr wrap="square"/><a:lstStyle/>${bodyParas}</p:txBody>
+      </p:sp>
+    </p:spTree>
+  </p:cSld>
+</p:sld>`;
+
+    entries.push({ name: `ppt/slides/slide${n}.xml`, data: slideXml });
+    entries.push({
+      name: `ppt/slides/_rels/slide${n}.xml.rels`,
+      data: `<?xml version="1.0" encoding="UTF-8" standalone="yes"?><Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"/>`,
+    });
+    slideRelsXmlParts.push(`<Relationship Id="rId${n}" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/slide" Target="slides/slide${n}.xml"/>`);
+    slideIdListParts.push(`<p:sldId id="${255 + n}" r:id="rId${n}"/>`);
+    contentTypeOverrides.push(`<Override PartName="/ppt/slides/slide${n}.xml" ContentType="application/vnd.openxmlformats-officedocument.presentationml.slide+xml"/>`);
+  });
+
+  const presentationXml = `<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<p:presentation xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships" xmlns:p="http://schemas.openxmlformats.org/presentationml/2006/main">
+  <p:sldIdLst>${slideIdListParts.join('')}</p:sldIdLst>
+  <p:sldSz cx="12192000" cy="6858000"/>
+  <p:notesSz cx="6858000" cy="9144000"/>
+</p:presentation>`;
+
+  const presRels = `<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">
+  ${slideRelsXmlParts.join('\n  ')}
+</Relationships>`;
+
+  const rootRels = `<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">
+  <Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument" Target="ppt/presentation.xml"/>
+</Relationships>`;
+
+  const contentTypes = `<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types">
+  <Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/>
+  <Default Extension="xml" ContentType="application/xml"/>
+  <Override PartName="/ppt/presentation.xml" ContentType="application/vnd.openxmlformats-officedocument.presentationml.presentation.main+xml"/>
+  ${contentTypeOverrides.join('\n  ')}
+</Types>`;
+
+  return createZipBuffer([
+    { name: '[Content_Types].xml', data: contentTypes },
+    { name: '_rels/.rels', data: rootRels },
+    { name: 'ppt/presentation.xml', data: presentationXml },
+    { name: 'ppt/_rels/presentation.xml.rels', data: presRels },
+    ...entries,
+  ]);
+}
+
 function summarizeTable(rows = []) {
   if (!Array.isArray(rows) || !rows.length) return '';
   const headers = rows[0] || [];
@@ -1037,6 +1374,8 @@ function buildPrintableHtml(markdown, title = 'mx-Cowork Report') {
 module.exports = {
   createZipBuffer,
   buildDocxBuffer,
+  fillDocxTemplate,
+  buildPptxBuffer,
   buildXlsxBuffer,
   extractTablesFromMarkdown,
   parseCsvText,
@@ -1044,6 +1383,7 @@ module.exports = {
   parseXlsxBuffer,
   applyTableOperations,
   applyWorkbookOperations,
+  evaluateSheetFormulas,
   summarizeTable,
   colLetter,
   buildIcsText,

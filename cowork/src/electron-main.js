@@ -643,25 +643,68 @@ function registerIpc() {
           if (controller.signal.aborted) { anyStopped = true; break; }
           try {
             cr.execTarget = cr.execTarget || finalExecTarget;
+            // Command safety guardrail: never auto-run high-risk destructive host commands without explicit user approval
+            if (cr.execTarget === 'host' && cr.isServerOp !== 'stop') {
+              const risk = containerRunner.assessCommandRisk(cr.code, cr.command);
+              if (risk.highRisk) {
+                cr.status = 'pending';
+                cr.requiresApproval = true;
+                cr.riskReasons = risk.reasons;
+                cr.infraError = true;
+                cr.output = `Blocked from Auto-Run (requires manual approval): ${risk.reasons.join('; ')}`;
+                continue;
+              }
+            }
             cr.status = 'running';
             emit('code_runs', result.codeRuns);
-            const r = await containerRunner.runInContainer({
-              runId: cr.id,
-              title: cr.title,
-              language: cr.language,
-              code: cr.code,
-              command: cr.command,
-              cwd: cr.cwd,
-              timeoutSec: cr.timeoutSec,
-              image: cr.image,
-              network: cr.network,
-              mountMode: cr.mountMode,
-              execTarget: cr.execTarget,
-              workspace: activeProj?.path || localFiles.getWorkspace(),
-              onOutput: (o) => {
-                if (!event.sender.isDestroyed()) event.sender.send('container:output', o);
-              },
-            });
+            let r;
+            if (cr.isServerOp === 'start') {
+              const sv = await containerRunner.startServer({
+                serverId: cr.id,
+                title: cr.title,
+                language: cr.language,
+                command: cr.command || cr.code,
+                cwd: cr.cwd,
+                workspace: activeProj?.path || localFiles.getWorkspace(),
+                onOutput: (o) => {
+                  if (!event.sender.isDestroyed()) event.sender.send('container:output', o);
+                },
+              });
+              r = {
+                ok: sv.ok,
+                exitCode: sv.ok ? 0 : (sv.exitCode ?? 1),
+                elapsedMs: 0,
+                stdout: `Server ID: ${sv.id} (status: ${sv.status}, pid: ${sv.pid || '?'})${sv.urls.length ? `\nListening URLs: ${sv.urls.join(', ')}` : ''}\n${sv.logs || ''}`,
+                stderr: '',
+              };
+            } else if (cr.isServerOp === 'stop') {
+              const st = await containerRunner.stopServer(cr.serverId);
+              r = {
+                ok: st.ok,
+                exitCode: st.ok ? 0 : 1,
+                elapsedMs: 0,
+                stdout: st.ok ? `Stopped server ${cr.serverId}` : (st.error || 'Failed to stop server'),
+                stderr: '',
+              };
+            } else {
+              r = await containerRunner.runInContainer({
+                runId: cr.id,
+                title: cr.title,
+                language: cr.language,
+                code: cr.code,
+                command: cr.command,
+                cwd: cr.cwd,
+                timeoutSec: cr.timeoutSec,
+                image: cr.image,
+                network: cr.network,
+                mountMode: cr.mountMode,
+                execTarget: cr.execTarget,
+                workspace: activeProj?.path || localFiles.getWorkspace(),
+                onOutput: (o) => {
+                  if (!event.sender.isDestroyed()) event.sender.send('container:output', o);
+                },
+              });
+            }
             cr.status = r.ok ? 'done' : 'error';
             cr.exitCode = r.exitCode;
             cr.elapsedMs = r.elapsedMs;
@@ -1214,6 +1257,10 @@ app.whenReady().then(() => {
 app.on('will-quit', () => {
   try { globalShortcut.unregisterAll(); } catch {}
   try { automations.stopAllSchedulers(); } catch {}
+});
+
+app.on('before-quit', () => {
+  containerRunner.stopAllServers().catch(() => {});
 });
 
 app.on('window-all-closed', () => {
