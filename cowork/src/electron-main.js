@@ -579,6 +579,11 @@ function registerIpc() {
         onContainerOutput: (o) => {
           if (!event.sender.isDestroyed()) event.sender.send('container:output', o);
         },
+        onUiAction: async (action, data) => {
+          if (action === 'open_url' && data?.url && /^https?:\/\//i.test(data.url)) {
+            await shell.openExternal(data.url);
+          }
+        },
       });
 
       if (result.savedNotes?.length) {

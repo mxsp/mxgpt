@@ -788,7 +788,7 @@ async function boot() {
   S.projects = projData?.projects || [];
   S.activeProject = projData?.activeProject || null;
 
-  $('#appVersionBadge').textContent = `v${info.version || '1.8.10'}`;
+  $('#appVersionBadge').textContent = `v${info.version || '1.8.0'}`;
   applyThemeUI(S.settings.theme || 'light');
   setMode(S.settings.defaultMode || 'copilot');
   setThink(S.settings.think || 'low');
@@ -2303,17 +2303,18 @@ function renderMessages(forceScroll = true) {
       body.appendChild(th);
     }
 
+    // Tool calls, file/spreadsheet edits, code runs & harness activity render ABOVE final output text
+    const actGroup = renderStreamlinedActionGroup(m);
+    if (actGroup) body.appendChild(actGroup);
+    if (trailingHarness.length) {
+      for (const hm of trailingHarness) body.appendChild(renderHarnessMessage(hm));
+    }
+
     if (m.content) {
       const pr = document.createElement('div');
       pr.className = 'prose';
       pr.innerHTML = renderMd(m.content, { msgKey, isStreaming: Boolean(m.streaming) });
       body.appendChild(pr);
-    }
-
-    const actGroup = renderStreamlinedActionGroup(m);
-    if (actGroup) body.appendChild(actGroup);
-    if (trailingHarness.length) {
-      for (const hm of trailingHarness) body.appendChild(renderHarnessMessage(hm));
     }
     if (m.graphReady) {
       const gb = document.createElement('div');
@@ -2454,16 +2455,16 @@ function mountLiveAssistantDom(initialPhase) {
   thinkEl.append(thinkSummary, thinkPre);
   body.appendChild(thinkEl);
 
-  const proseEl = document.createElement('div');
-  proseEl.className = 'prose';
-  proseEl.hidden = true;
-  body.appendChild(proseEl);
-
   const cardsSlot = document.createElement('div');
   cardsSlot.style.display = 'flex';
   cardsSlot.style.flexDirection = 'column';
   cardsSlot.style.gap = '10px';
   body.appendChild(cardsSlot);
+
+  const proseEl = document.createElement('div');
+  proseEl.className = 'prose';
+  proseEl.hidden = true;
+  body.appendChild(proseEl);
 
   el.appendChild(body);
   wrap.appendChild(el);
@@ -2685,6 +2686,16 @@ function handleGlobalCoworkEvent({ streamId: sid, event: ev, data: d }) {
       const g = renderStreamlinedActionGroup(st.assistant);
       if (g) st.live.cardsSlot.appendChild(g);
       scrollFeedIfNearBottom(true);
+    }
+  } else if (ev === 'ui_action') {
+    if (viewing && d?.action === 'open_in_sidebar') {
+      const panel = d.panel || 'files';
+      openPanel(panel, false);
+      if (panel === 'files' && d.path) {
+        openFileInEditor(d.path);
+      }
+    } else if (viewing && d?.action === 'open_url' && d.url) {
+      toast(`Opened ${d.url} in browser`);
     }
   } else if (ev === 'graph_ready') {
     st.assistant.graphReady = d;

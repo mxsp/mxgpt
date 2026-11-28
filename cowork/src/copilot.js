@@ -202,6 +202,9 @@ const READ_ONLY_TOOL_NAMES = new Set([
   'inspect_spreadsheet',
   'list_servers',
   'read_server_logs',
+  'open_url',
+  'open_in_sidebar',
+  'create_task',
 ]);
 
 function buildNativeTools(toolsCfg, resolvedExecTarget = 'container') {
@@ -505,10 +508,58 @@ function buildNativeTools(toolsCfg, resolvedExecTarget = 'container') {
       },
     });
   }
+  // ---- Interconnected App & OS UI Tools (browser launch, sidebar navigation, tasks)
+  tools.push({
+    type: 'function',
+    function: {
+      name: 'open_url',
+      description: 'Open an http:// or https:// URL (such as a running local dev server http://127.0.0.1:5000) directly in the user default web browser.',
+      parameters: {
+        type: 'object',
+        properties: {
+          url: { type: 'string', description: 'Valid http:// or https:// URL to open' },
+          reason: { type: 'string', description: 'Why opening this URL' },
+        },
+        required: ['url'],
+      },
+    },
+  });
+  tools.push({
+    type: 'function',
+    function: {
+      name: 'open_in_sidebar',
+      description: 'Open a workspace file/spreadsheet or built-in panel (files, graph, tasks, notes, artifact) directly inside the mx-Cowork right sidebar.',
+      parameters: {
+        type: 'object',
+        properties: {
+          panel: { type: 'string', enum: ['files', 'graph', 'tasks', 'notes', 'artifact'], description: 'Sidebar panel to open' },
+          path: { type: 'string', description: 'Optional relative file/spreadsheet path to open in the editor/Data Desk when panel is "files"' },
+        },
+        required: ['panel'],
+      },
+    },
+  });
+  tools.push({
+    type: 'function',
+    function: {
+      name: 'create_task',
+      description: 'Create an actionable task directly in the mx-Cowork Project Tasks board.',
+      parameters: {
+        type: 'object',
+        properties: {
+          title: { type: 'string', description: 'Task title' },
+          owner: { type: 'string', description: 'Optional owner' },
+          due: { type: 'string', description: 'Optional due date (YYYY-MM-DD)' },
+          priority: { type: 'string', enum: ['high', 'med', 'low'] },
+        },
+        required: ['title'],
+      },
+    },
+  });
   return tools;
 }
 
-async function executeReadOnlyTool(tc, { workspace, unmask = (s) => s, onEvent }) {
+async function executeReadOnlyTool(tc, { workspace, unmask = (s) => s, onEvent, onUiAction }) {
   const name = String(tc?.name || '').toLowerCase();
   const rawArgs = tc?.args && typeof tc.args === 'object' ? tc.args : {};
   const args = maskDeep(rawArgs, unmask);
@@ -522,8 +573,11 @@ async function executeReadOnlyTool(tc, { workspace, unmask = (s) => s, onEvent }
     inspect_spreadsheet: 'Inspect Spreadsheet',
     list_servers: 'List Servers',
     read_server_logs: 'Server Logs',
+    open_url: 'Open Browser',
+    open_in_sidebar: 'Open Sidebar',
+    create_task: 'Create Task',
   };
-  const taskTitle = args.path || args.query || args.focus || args.server_id || labelMap[name] || name;
+  const taskTitle = args.path || args.url || args.title || args.panel || args.query || args.focus || args.server_id || labelMap[name] || name;
   onEvent?.('worker_start', {
     id,
     type: name,
@@ -571,6 +625,32 @@ async function executeReadOnlyTool(tc, { workspace, unmask = (s) => s, onEvent }
     } else if (name === 'read_server_logs') {
       const lg = containerRunner.readServerLogs(args.server_id || args.serverId || '');
       out = `[Server ${lg.id} "${lg.title}" status=${lg.status} urls=${lg.urls.join(', ') || '(none)'}]\n${lg.logs || '(no logs yet)'}`;
+    } else if (name === 'open_url') {
+      const u = String(args.url || '').trim();
+      if (!/^https?:\/\/[^\s]+$/i.test(u)) throw new Error(`Invalid URL (must start with http:// or https://): ${u}`);
+      if (typeof onUiAction === 'function') await onUiAction('open_url', { url: u });
+      onEvent?.('ui_action', { action: 'open_url', url: u });
+      out = `✓ Opened ${u} in the user's web browser.`;
+    } else if (name === 'open_in_sidebar') {
+      const panel = ['files', 'graph', 'tasks', 'notes', 'artifact'].includes(args.panel) ? args.panel : 'files';
+      const relPath = args.path ? String(args.path).trim() : '';
+      if (typeof onUiAction === 'function') await onUiAction('open_in_sidebar', { panel, path: relPath });
+      onEvent?.('ui_action', { action: 'open_in_sidebar', panel, path: relPath });
+      out = relPath
+        ? `✓ Opened "${relPath}" in mx-Cowork's ${panel} sidebar.`
+        : `✓ Opened the ${panel} panel in mx-Cowork's sidebar.`;
+    } else if (name === 'create_task') {
+      const title = String(args.title || '').trim().slice(0, 200);
+      if (!title) throw new Error('Task title is required');
+      const task = {
+        title,
+        owner: String(args.owner || '').trim().slice(0, 60),
+        due: String(args.due || '').trim().slice(0, 32),
+        priority: ['high', 'med', 'low'].includes(args.priority) ? args.priority : 'med',
+      };
+      const saved = storage.saveTask(task);
+      if (saved) onEvent?.('tasks_saved', [saved]);
+      out = `✓ Added task "${title}" (priority: ${task.priority}) to the Project Tasks board.`;
     } else if (name === 'git_inspect') {
       const g = await localTools.gitInspect(workspace, args.focus || '');
       out = g.text.slice(0, 10000);
@@ -691,6 +771,7 @@ async function runAgenticToolLoop({
   signal,
   onEvent,
   onContainerOutput,
+  onUiAction,
   maxRounds = 48,
 }) {
   const cfg = storage.getSettings();
@@ -803,7 +884,7 @@ async function runAgenticToolLoop({
 
       try {
         if (READ_ONLY_TOOL_NAMES.has(name)) {
-          toolResultText = await executeReadOnlyTool(tc, { workspace, unmask, onEvent });
+          toolResultText = await executeReadOnlyTool(tc, { workspace, unmask, onEvent, onUiAction });
           if (/^Tool error \(/i.test(toolResultText)) didFail = true;
         } else if (['write_file', 'edit_file', 'file_action', 'create_office_doc', 'fill_docx_template'].includes(name) && toolsCfg.osFiles) {
           const tmp = { fileActions: [], tableEdits: [], codeRuns: [], savedNotes: [], savedTasks: [] };
@@ -1321,6 +1402,7 @@ function buildSystemPrompt({
         ? '- Execute: run_code (one-shot), start_server / list_servers / read_server_logs / stop_server (background servers)'
         : '- Execute: run_code (isolated container at /workspace)') : '',
       toolsCfg.notes ? '- Memory: save_memory' : '',
+      '- App & OS Integration: open_url (launch http/https URLs directly in the browser), open_in_sidebar (open any file/spreadsheet/graph/tasks/artifact pane in the mx-Cowork sidebar), create_task (add tasks to the Project Tasks board)',
       'CRITICAL: Never duplicate native tool calls as fenced ```file-actions, ```code-run, or ```table-edits JSON blocks in Markdown.',
     ].filter(Boolean).join('\n');
   } else {
@@ -1681,6 +1763,7 @@ async function runCoworkTurn({
   signal,
   onEvent,
   onContainerOutput,
+  onUiAction,
 }) {
   const cfg = storage.getSettings();
   const toolsCfg = resolveEnabledTools(cfg, toolOverrides);
@@ -1923,6 +2006,7 @@ async function runCoworkTurn({
         signal,
         onEvent,
         onContainerOutput,
+        onUiAction,
       });
       res = loopOut.res;
       activeMsgs = loopOut.finalMessages;
@@ -2268,6 +2352,7 @@ Rules:
       signal,
       onEvent,
       onContainerOutput,
+      onUiAction,
       maxRounds: isPacific ? 96 : 48,
     });
     finalRes = loopOut.res;
