@@ -525,6 +525,24 @@ async function folderOverview(relPath = '', baseDir = getWorkspace()) {
   };
 }
 
+async function writeFileAtomic(absPath, data, encoding) {
+  await fsp.mkdir(path.dirname(absPath), { recursive: true });
+  const tmpPath = path.join(path.dirname(absPath), `.mxcw_tmp_${process.pid}_${Date.now()}_${Math.random().toString(36).slice(2, 7)}`);
+  try {
+    if (Buffer.isBuffer(data)) await fsp.writeFile(tmpPath, data);
+    else await fsp.writeFile(tmpPath, String(data ?? ''), encoding || 'utf8');
+    await fsp.rename(tmpPath, absPath);
+  } catch (err) {
+    try { await fsp.rm(tmpPath, { force: true }); } catch {}
+    if (err && (err.code === 'EPERM' || err.code === 'EACCES' || err.code === 'EXDEV')) {
+      if (Buffer.isBuffer(data)) await fsp.writeFile(absPath, data);
+      else await fsp.writeFile(absPath, String(data ?? ''), encoding || 'utf8');
+      return;
+    }
+    throw err;
+  }
+}
+
 // ---- Undoable file management operations
 async function executeFileAction(action, baseDir = getWorkspace()) {
   const type = String(action?.type || '').toLowerCase();
@@ -540,6 +558,10 @@ async function executeFileAction(action, baseDir = getWorkspace()) {
   if (type === 'patch' || type === 'edit') {
     const target = resolveSafe(action.path || action.to, root);
     if (!fs.existsSync(target.abs)) throw new Error(`File not found for patch: ${target.rel}`);
+    const ext = path.extname(target.abs).toLowerCase();
+    if (['.xlsx', '.docx', '.pptx', '.pdf', '.png', '.jpg', '.jpeg', '.gif', '.zip', '.exe', '.dll', '.bin'].includes(ext)) {
+      throw new Error(`Cannot text-patch binary file ${target.rel}. Use edit_table for .xlsx, fill_docx_template/create_office_doc for .docx/.pptx, or run_code.`);
+    }
     const oldText = String(action.oldText ?? action.old_text ?? action.target ?? '');
     const newText = String(action.newText ?? action.new_text ?? action.replacement ?? '');
     if (!oldText) throw new Error(`Patch on ${target.rel} requires non-empty oldText`);
@@ -556,23 +578,49 @@ async function executeFileAction(action, baseDir = getWorkspace()) {
       occurrences++;
       searchIdx += normOld.length;
     }
-    if (occurrences === 0) {
-      throw new Error(`Patch target text not found in ${target.rel}. Read the file first to copy exact lines.`);
-    }
-    if (occurrences > 1 && !action.replaceAll) {
-      throw new Error(`Patch target text matched ${occurrences} places in ${target.rel}. Include more surrounding context or set replaceAll: true.`);
-    }
 
-    const updatedNorm = action.replaceAll
-      ? normCur.split(normOld).join(normNew)
-      : normCur.replace(normOld, () => normNew);
+    let updatedNorm;
+    let fuzzyMatched = false;
+    if (occurrences === 0) {
+      // Whitespace-tolerant fallback: match trimmed lines uniquely when indentation/trailing spaces drifted
+      const curLines = normCur.split('\n');
+      const oldLines = normOld.split('\n');
+      const oldTrimmed = oldLines.map((l) => l.trim());
+      const fuzzyStarts = [];
+      for (let i = 0; i <= curLines.length - oldLines.length; i++) {
+        let match = true;
+        for (let j = 0; j < oldLines.length; j++) {
+          if (curLines[i + j].trim() !== oldTrimmed[j]) { match = false; break; }
+        }
+        if (match) fuzzyStarts.push(i);
+      }
+      if (fuzzyStarts.length === 1) {
+        const startLine = fuzzyStarts[0];
+        const nextLines = [
+          ...curLines.slice(0, startLine),
+          ...normNew.split('\n'),
+          ...curLines.slice(startLine + oldLines.length),
+        ];
+        updatedNorm = nextLines.join('\n');
+        occurrences = 1;
+        fuzzyMatched = true;
+      } else {
+        throw new Error(`Patch target text not found in ${target.rel}${fuzzyStarts.length > 1 ? ` (matched ${fuzzyStarts.length} blocks loosely — add surrounding lines)` : '. Read the file first with read_file to copy exact lines.'}`);
+      }
+    } else if (occurrences > 1 && !action.replaceAll) {
+      throw new Error(`Patch target text matched ${occurrences} places in ${target.rel}. Include more surrounding context or set replaceAll: true.`);
+    } else {
+      updatedNorm = action.replaceAll
+        ? normCur.split(normOld).join(normNew)
+        : normCur.replace(normOld, () => normNew);
+    }
     const updated = hasCrlf ? updatedNorm.replace(/\n/g, '\r\n') : updatedNorm;
 
     const trashDir = path.join(root, '.mx-cowork-trash');
     await fsp.mkdir(trashDir, { recursive: true });
     const prevBackup = path.join(trashDir, `bak_${Date.now()}_${path.basename(target.abs)}`);
     await fsp.copyFile(target.abs, prevBackup);
-    await fsp.writeFile(target.abs, updated, 'utf8');
+    await writeFileAtomic(target.abs, updated, 'utf8');
 
     const undo = storage.pushUndo({
       type: 'write',
@@ -584,7 +632,7 @@ async function executeFileAction(action, baseDir = getWorkspace()) {
     });
     return {
       ok: true,
-      summary: `Patched ${target.rel} (${occurrences} replacement${occurrences > 1 ? 's' : ''})`,
+      summary: `Patched ${target.rel} (${occurrences} replacement${occurrences > 1 ? 's' : ''}${fuzzyMatched ? ', whitespace-aligned' : ''})`,
       undoId: undo.id,
     };
   }
@@ -725,7 +773,7 @@ async function executeFileAction(action, baseDir = getWorkspace()) {
       prevBackup = path.join(trashDir, `bak_${Date.now()}_${path.basename(target.abs)}`);
       await fsp.copyFile(target.abs, prevBackup);
     }
-    await fsp.writeFile(target.abs, String(action.content ?? ''), 'utf8');
+    await writeFileAtomic(target.abs, String(action.content ?? ''), 'utf8');
     const undo = storage.pushUndo({
       type: 'write',
       path: target.rel,
@@ -1065,6 +1113,38 @@ async function saveTableFile({ path: relPath, rows, sheets, sheetIndex = 0, deli
   };
 }
 
+const { execFile } = require('child_process');
+
+function quickSyntaxCheck(absPath) {
+  return new Promise((resolve) => {
+    const ext = path.extname(absPath).toLowerCase();
+    if (ext === '.json') {
+      try {
+        JSON.parse(fs.readFileSync(absPath, 'utf8'));
+        return resolve({ checked: true, ok: true, summary: 'JSON syntax OK' });
+      } catch (e) {
+        return resolve({ checked: true, ok: false, summary: `JSON syntax error: ${e.message}` });
+      }
+    }
+    if (ext === '.js' || ext === '.cjs' || ext === '.mjs') {
+      execFile(process.execPath, ['--check', absPath], { timeout: 4000, windowsHide: true }, (err, _out, stderr) => {
+        if (!err) return resolve({ checked: true, ok: true, summary: 'JS syntax OK' });
+        return resolve({ checked: true, ok: false, summary: `JS syntax error:\n${String(stderr || err.message).trim().slice(0, 600)}` });
+      });
+      return;
+    }
+    if (ext === '.py') {
+      const pyBin = process.platform === 'win32' ? 'python' : 'python3';
+      execFile(pyBin, ['-m', 'py_compile', absPath], { timeout: 5000, windowsHide: true }, (err, _out, stderr) => {
+        if (!err) return resolve({ checked: true, ok: true, summary: 'Python syntax OK' });
+        return resolve({ checked: true, ok: false, summary: `Python syntax error:\n${String(stderr || err.message).trim().slice(0, 600)}` });
+      });
+      return;
+    }
+    resolve({ checked: false, ok: true, summary: '' });
+  });
+}
+
 async function applyTableEditToFile(te, baseDir = getWorkspace()) {
   if (!te?.path || !Array.isArray(te.operations)) throw new Error('Invalid table edit payload');
   const root = path.resolve(baseDir);
@@ -1088,15 +1168,31 @@ async function applyTableEditToFile(te, baseDir = getWorkspace()) {
     sheetIndex: finalIdx,
     delimiter,
   }, root);
+  const { displayRows, evaluatedCount } = officeExport.evaluateSheetFormulas(nextRows, nextSheets);
+  const formulaErrors = [];
+  for (let r = 0; r < displayRows.length; r++) {
+    for (let c = 0; c < (displayRows[r] || []).length; c++) {
+      const v = String(displayRows[r][c] ?? '');
+      if (/^#(REF|DIV\/0|VALUE|NAME|ERROR)!/i.test(v)) {
+        formulaErrors.push(`${officeExport.colLetter(c)}${r + 1}=${v}`);
+      }
+    }
+  }
   return {
     ok: true,
-    path: target.rel,
+    path: saved.path || target.rel,
+    lockedFallback: Boolean(saved.lockedFallback),
     rows: nextRows,
+    displayRows,
+    evaluatedCount,
+    formulaErrors,
     sheets: nextSheets,
     sheetIndex: finalIdx,
     applied,
     undoId: saved.undoId,
-    summary: `Applied ${applied.length} edit(s) to ${target.rel}`,
+    summary: saved.lockedFallback
+      ? `${saved.summary} (${applied.length} edit(s))`
+      : `Applied ${applied.length} edit(s) to ${target.rel}${evaluatedCount ? ` (${evaluatedCount} formula${evaluatedCount === 1 ? '' : 's'} evaluated)` : ''}${formulaErrors.length ? ` [WARNING: ${formulaErrors.join(', ')}]` : ''}`,
   };
 }
 
@@ -1155,6 +1251,7 @@ module.exports = {
   parseTableFile,
   saveTableFile,
   applyTableEditToFile,
+  quickSyntaxCheck,
   listOfficeFiles,
   searchFiles,
   folderOverview,

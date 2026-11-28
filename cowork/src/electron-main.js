@@ -576,6 +576,9 @@ function registerIpc() {
         think,
         signal: controller.signal,
         onEvent: emit,
+        onContainerOutput: (o) => {
+          if (!event.sender.isDestroyed()) event.sender.send('container:output', o);
+        },
       });
 
       if (result.savedNotes?.length) {
@@ -600,8 +603,11 @@ function registerIpc() {
       const autoRunContainer = activeProj ? Boolean(activeProj.autoRunContainer) : Boolean(curCfg.autoApproveContainerRuns);
       const finalExecTarget = (payload?.execTarget || activeProj?.codeExecutionTarget || curCfg.codeExecutionTarget || 'container') === 'host' ? 'host' : 'container';
 
+      let pendingFilesRan = false;
       if (result.fileActions?.length && autoAcceptEdits) {
         for (const act of result.fileActions) {
+          if (act.status !== 'pending') continue;
+          pendingFilesRan = true;
           try {
             const r = await localFiles.executeFileAction(act);
             act.status = 'applied';
@@ -612,12 +618,15 @@ function registerIpc() {
             act.result = e.message;
           }
         }
-        emit('file_actions', result.fileActions);
+        if (pendingFilesRan) emit('file_actions', result.fileActions);
       }
 
+      let pendingTablesRan = false;
       if (result.tableEdits?.length && autoAcceptEdits) {
         const curWs = activeProj?.path || localFiles.getWorkspace();
         for (const te of result.tableEdits) {
+          if (te.status !== 'pending') continue;
+          pendingTablesRan = true;
           try {
             const saved = await localFiles.applyTableEditToFile(te, curWs);
             te.status = 'applied';
@@ -629,7 +638,7 @@ function registerIpc() {
             te.result = e.message;
           }
         }
-        emit('table_edits', result.tableEdits);
+        if (pendingTablesRan) emit('table_edits', result.tableEdits);
       }
 
       const autoRound = Math.max(0, Number(payload?.autoRound) || 0);
@@ -637,9 +646,10 @@ function registerIpc() {
       let autoContinuePrompt = '';
       let autoContinueHarnessMeta = null;
 
-      if (result.codeRuns?.length && autoRunContainer) {
+      const pendingCodeRuns = (result.codeRuns || []).filter((cr) => cr.status === 'pending');
+      if (pendingCodeRuns.length && autoRunContainer) {
         let anyStopped = false;
-        for (const cr of result.codeRuns) {
+        for (const cr of pendingCodeRuns) {
           if (controller.signal.aborted) { anyStopped = true; break; }
           try {
             cr.execTarget = cr.execTarget || finalExecTarget;
@@ -719,7 +729,7 @@ function registerIpc() {
         }
         emit('code_runs', result.codeRuns);
 
-        const ranProcesses = result.codeRuns.filter((cr) => !cr.infraError);
+        const ranProcesses = pendingCodeRuns.filter((cr) => !cr.infraError);
         if (ranProcesses.length && !anyStopped && !controller.signal.aborted && autoRound < MAX_AUTO_ROUNDS) {
           const summaryBlocks = ranProcesses.map((cr) => {
             const tgt = (cr.execTarget || finalExecTarget) === 'host' ? 'Host (On-Machine)' : 'Container';
@@ -743,8 +753,8 @@ function registerIpc() {
         }
       } else if (
         autoAcceptEdits &&
-        ((result.fileActions?.length && (result.wasAutoSynthesized || result.fileActions.some((a) => a.status === 'error'))) ||
-         (result.tableEdits?.length && (result.wasAutoSynthesized || result.tableEdits.some((t) => t.status === 'error')))) &&
+        ((pendingFilesRan && (result.wasAutoSynthesized || result.fileActions.some((a) => a.status === 'error'))) ||
+         (pendingTablesRan && (result.wasAutoSynthesized || result.tableEdits.some((t) => t.status === 'error')))) &&
         !controller.signal.aborted &&
         autoRound < MAX_AUTO_ROUNDS
       ) {
@@ -774,6 +784,7 @@ function registerIpc() {
         model: result.model,
         usage: result.usage,
         plan: result.plan,
+        pacific: result.pacific || null,
         workers: result.workers,
         sources: result.sources,
         fileActions: result.fileActions || [],

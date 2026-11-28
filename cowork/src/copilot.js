@@ -22,6 +22,7 @@ const diffEngine = require('./diff-engine');
 const piiShield = require('./pii-shield');
 const docIndex = require('./doc-index');
 const officeExport = require('./office-export');
+const pacific = require('./pacific');
 
 const ROLE_META = {
   web_research: { role: 'researcher', label: 'Web Search' },
@@ -620,13 +621,68 @@ async function executeReadOnlyTool(tc, { workspace, unmask = (s) => s, onEvent }
   }
 }
 
-async function runChatWithReadTools({
+function formatHeadTail(text, headChars = 1500, tailChars = 3500) {
+  const s = String(text || '');
+  if (s.length <= headChars + tailChars + 80) return s;
+  const omitted = s.length - headChars - tailChars;
+  return `${s.slice(0, headChars)}\n\n… [${omitted.toLocaleString()} chars omitted] …\n\n${s.slice(-tailChars)}`;
+}
+
+function fmtElapsed(ms) {
+  const sec = Math.max(0, Math.floor((ms || 0) / 1000));
+  if (sec < 60) return `${sec}s`;
+  const m = Math.floor(sec / 60);
+  const s = sec % 60;
+  if (m < 60) return `${m}m ${s}s`;
+  const h = Math.floor(m / 60);
+  return `${h}h ${m % 60}m`;
+}
+
+function compactLoopMessages(curMessages, executedBlocks, mask) {
+  const totalChars = curMessages.reduce((acc, m) => acc + JSON.stringify(m).length, 0);
+  if (totalChars < 54000 && curMessages.length <= 22) return curMessages;
+
+  // Keep leading non-tool context (up to first assistant tool_calls) + last 8 messages aligned on a safe boundary
+  const firstToolIdx = curMessages.findIndex((m) => m.role === 'assistant' && Array.isArray(m.tool_calls));
+  if (firstToolIdx < 0 || curMessages.length - firstToolIdx <= 10) return curMessages;
+
+  let keepFrom = Math.max(firstToolIdx + 1, curMessages.length - 8);
+  // Advance keepFrom until we are NOT starting on an orphaned role:'tool' message
+  while (keepFrom < curMessages.length && curMessages[keepFrom]?.role === 'tool') keepFrom++;
+  if (keepFrom <= firstToolIdx + 1) return curMessages;
+
+  const head = curMessages.slice(0, firstToolIdx);
+  const tail = curMessages.slice(keepFrom);
+  const doneFiles = (executedBlocks.fileActions || []).map((a) => `${a.status === 'applied' ? '✓' : '✗'} ${a.type} ${a.path || a.to || ''}`).slice(-20);
+  const doneTables = (executedBlocks.tableEdits || []).map((t) => `${t.status === 'applied' ? '✓' : '✗'} table ${t.path} (${t.appliedCount || 0} ops)`).slice(-10);
+  const doneRuns = (executedBlocks.codeRuns || []).map((r) => `${r.status === 'done' ? '✓' : '✗'} ${r.title || r.language} (exit ${r.exitCode ?? '?'})`).slice(-15);
+
+  const checkpoint = [
+    `[Long-Horizon Progress Checkpoint — compacted ${keepFrom - firstToolIdx} earlier tool messages to keep context fresh]`,
+    doneFiles.length ? `Files touched:\n  ${doneFiles.join('\n  ')}` : '',
+    doneTables.length ? `Spreadsheets updated:\n  ${doneTables.join('\n  ')}` : '',
+    doneRuns.length ? `Commands/servers run:\n  ${doneRuns.join('\n  ')}` : '',
+    'Continue from the latest tool results below without redoing already-completed work.',
+  ].filter(Boolean).join('\n');
+
+  return [
+    ...head,
+    { role: 'user', content: mask(checkpoint) },
+    ...tail,
+  ];
+}
+
+async function runAgenticToolLoop({
   tier,
   model,
   systemPrompt,
   messages,
   images,
   tools,
+  toolsCfg,
+  resolvedExecTarget = 'container',
+  effAutoEdits = false,
+  effAutoCode = false,
   think,
   priority,
   workspace,
@@ -634,13 +690,31 @@ async function runChatWithReadTools({
   unmask = (s) => s,
   signal,
   onEvent,
-  maxReadRounds = 5,
+  onContainerOutput,
+  maxRounds = 48,
 }) {
+  const cfg = storage.getSettings();
+  const loopStartedAt = Date.now();
   let curMessages = [...messages];
   let totalElapsed = 0;
+  let totalPromptTokens = 0;
+  let totalEvalTokens = 0;
   let lastRes = null;
+  const failedSignatures = new Map();
+  const executedBlocks = {
+    fileActions: [],
+    tableEdits: [],
+    codeRuns: [],
+    savedNotes: [],
+    savedTasks: [],
+  };
 
-  for (let round = 0; round <= maxReadRounds; round++) {
+  for (let round = 0; round <= maxRounds; round++) {
+    if (signal?.aborted) break;
+    // Automatic in-loop context compaction so long-horizon runs can work for hours without context overflow
+    if (round > 0 && round % 3 === 0) {
+      curMessages = compactLoopMessages(curMessages, executedBlocks, mask);
+    }
     const res = await endpoint.chatCompletion({
       tier,
       model,
@@ -648,7 +722,7 @@ async function runChatWithReadTools({
       messages: curMessages,
       images: round === 0 ? images : [],
       tools,
-      think,
+      think: round === 0 ? think : (think === 'off' ? 'off' : 'low'),
       priority,
       signal,
       onEvent: (ev) => {
@@ -658,24 +732,54 @@ async function runChatWithReadTools({
       },
     });
     totalElapsed += res.elapsedMs || 0;
-    lastRes = { ...res, elapsedMs: totalElapsed };
+    totalPromptTokens += res.usage?.promptTokens || 0;
+    totalEvalTokens += res.usage?.evalTokens || 0;
+    lastRes = {
+      ...res,
+      elapsedMs: totalElapsed,
+      usage: {
+        ...(res.usage || {}),
+        promptTokens: totalPromptTokens || res.usage?.promptTokens || 0,
+        evalTokens: totalEvalTokens || res.usage?.evalTokens || 0,
+      },
+    };
 
     const calls = Array.isArray(res.toolCalls) ? res.toolCalls : [];
-    const readCalls = calls.filter((tc) => READ_ONLY_TOOL_NAMES.has(String(tc?.name || '').toLowerCase()));
-    const actionCalls = calls.filter((tc) => !READ_ONLY_TOOL_NAMES.has(String(tc?.name || '').toLowerCase()));
+    if (!calls.length || round >= maxRounds || signal?.aborted) {
+      return { res: lastRes, finalMessages: curMessages, executedBlocks, pendingCalls: [] };
+    }
 
-    // Only continue the inner read loop when the model called read-only tools and hasn't emitted action tools yet
-    if (!readCalls.length || actionCalls.length > 0 || round >= maxReadRounds || signal?.aborted) {
-      return { res: lastRes, finalMessages: curMessages };
+    // Check if any call requires manual user approval before we can continue the closed loop
+    const needsApproval = calls.some((tc) => {
+      const name = String(tc?.name || '').toLowerCase();
+      if (READ_ONLY_TOOL_NAMES.has(name) || name === 'save_memory') return false;
+      if (['write_file', 'edit_file', 'file_action', 'create_office_doc', 'fill_docx_template', 'edit_table'].includes(name)) {
+        return !effAutoEdits;
+      }
+      if (['run_code', 'start_server', 'stop_server'].includes(name)) {
+        if (!effAutoCode) return true;
+        if (resolvedExecTarget === 'host' && name !== 'stop_server') {
+          const rawArgs = maskDeep(tc?.args || {}, unmask);
+          const risk = containerRunner.assessCommandRisk(rawArgs.code || '', rawArgs.command || '');
+          if (risk.highRisk) return true;
+        }
+        return false;
+      }
+      return true;
+    });
+
+    if (needsApproval) {
+      // Execute any read-only calls first? No — return all calls to be materialized as pending approval cards cleanly.
+      return { res: lastRes, finalMessages: curMessages, executedBlocks, pendingCalls: calls };
     }
 
     onEvent('phase', {
       phase: 'delegating',
-      label: `Inspecting workspace (${readCalls.map((c) => c.name).join(', ')})…`,
+      label: `Step ${round + 1}/${maxRounds} · ${fmtElapsed(Date.now() - loopStartedAt)} · ${calls.map((c) => c.name).join(', ')}…`,
     });
 
-    const assistantToolCalls = readCalls.map((tc, idx) => ({
-      id: tc.id || `call_rt_${round}_${idx}`,
+    const assistantToolCalls = calls.map((tc, idx) => ({
+      id: tc.id || `call_loop_${round}_${idx}`,
       type: 'function',
       function: {
         name: tc.name,
@@ -688,18 +792,198 @@ async function runChatWithReadTools({
       tool_calls: assistantToolCalls,
     });
 
-    for (let i = 0; i < readCalls.length; i++) {
+    for (let i = 0; i < calls.length; i++) {
       if (signal?.aborted) break;
-      const resultText = await executeReadOnlyTool(readCalls[i], { workspace, unmask, onEvent });
+      const tc = calls[i];
+      const name = String(tc?.name || '').toLowerCase();
+      const args = maskDeep(tc?.args && typeof tc.args === 'object' ? tc.args : {}, unmask);
+      const sig = `${name}:${JSON.stringify(args).slice(0, 400)}`;
+      let toolResultText = '';
+      let didFail = false;
+
+      try {
+        if (READ_ONLY_TOOL_NAMES.has(name)) {
+          toolResultText = await executeReadOnlyTool(tc, { workspace, unmask, onEvent });
+          if (/^Tool error \(/i.test(toolResultText)) didFail = true;
+        } else if (['write_file', 'edit_file', 'file_action', 'create_office_doc', 'fill_docx_template'].includes(name) && toolsCfg.osFiles) {
+          const tmp = { fileActions: [], tableEdits: [], codeRuns: [], savedNotes: [], savedTasks: [] };
+          await mergeNativeToolCalls([tc], tmp, toolsCfg, resolvedExecTarget, unmask);
+          const act = tmp.fileActions[0];
+          if (!act) {
+            toolResultText = `Error: invalid arguments for ${name}`;
+            didFail = true;
+          } else {
+            try {
+              const r = await localFiles.executeFileAction(act, workspace);
+              act.status = 'applied';
+              act.result = r.summary;
+              act.undoId = r.undoId;
+              let syntaxNote = '';
+              if (['write', 'create', 'patch', 'edit'].includes(act.type) && (act.path || act.to)) {
+                try {
+                  const abs = localFiles.resolveSafe(act.path || act.to, workspace).abs;
+                  const syn = await localFiles.quickSyntaxCheck(abs);
+                  if (syn.checked) {
+                    syntaxNote = syn.ok ? `\n[${syn.summary}]` : `\n[SYNTAX CHECK FAILED — fix immediately before continuing]\n${syn.summary}`;
+                    if (!syn.ok) didFail = true;
+                  }
+                } catch {}
+              }
+              toolResultText = `✓ ${r.summary}${syntaxNote}`;
+            } catch (e) {
+              act.status = 'error';
+              act.result = e.message;
+              didFail = true;
+              toolResultText = `✗ File action failed (${act.type} ${act.path || act.to || ''}): ${e.message}`;
+            }
+            executedBlocks.fileActions.push(act);
+            onEvent('file_actions', executedBlocks.fileActions);
+          }
+        } else if (name === 'edit_table' && toolsCfg.osFiles) {
+          const tmp = { fileActions: [], tableEdits: [], codeRuns: [], savedNotes: [], savedTasks: [] };
+          await mergeNativeToolCalls([tc], tmp, toolsCfg, resolvedExecTarget, unmask);
+          const te = tmp.tableEdits[0];
+          if (!te) {
+            toolResultText = 'Error: invalid arguments for edit_table';
+            didFail = true;
+          } else {
+            try {
+              const saved = await localFiles.applyTableEditToFile(te, workspace);
+              te.status = 'applied';
+              te.appliedCount = saved.applied.length;
+              te.undoId = saved.undoId;
+              te.result = saved.summary;
+              const evalLines = [];
+              if (saved.evaluatedCount > 0 && Array.isArray(saved.displayRows)) {
+                for (let rIdx = 0; rIdx < saved.rows.length && evalLines.length < 10; rIdx++) {
+                  for (let cIdx = 0; cIdx < (saved.rows[rIdx] || []).length && evalLines.length < 10; cIdx++) {
+                    const raw = String(saved.rows[rIdx][cIdx] ?? '');
+                    if (raw.startsWith('=')) {
+                      evalLines.push(`${officeExport.colLetter(cIdx)}${rIdx + 1} (${raw}) = ${saved.displayRows[rIdx]?.[cIdx] ?? ''}`);
+                    }
+                  }
+                }
+              }
+              toolResultText = [
+                `✓ ${saved.summary}`,
+                evalLines.length ? `Evaluated formulas:\n  - ${evalLines.join('\n  - ')}` : '',
+                saved.formulaErrors?.length ? `WARNING: Formula errors detected (${saved.formulaErrors.join(', ')}) — inspect and fix.` : '',
+              ].filter(Boolean).join('\n');
+              if (saved.formulaErrors?.length) didFail = true;
+            } catch (e) {
+              te.status = 'error';
+              te.result = e.message;
+              didFail = true;
+              toolResultText = `✗ Spreadsheet edit failed (${te.path}): ${e.message}`;
+            }
+            executedBlocks.tableEdits.push(te);
+            onEvent('table_edits', executedBlocks.tableEdits);
+          }
+        } else if (['run_code', 'start_server', 'stop_server'].includes(name) && toolsCfg.container) {
+          const tmp = { fileActions: [], tableEdits: [], codeRuns: [], savedNotes: [], savedTasks: [] };
+          await mergeNativeToolCalls([tc], tmp, toolsCfg, resolvedExecTarget, unmask);
+          const cr = tmp.codeRuns[0];
+          if (!cr) {
+            toolResultText = `Error: invalid arguments for ${name}`;
+            didFail = true;
+          } else {
+            cr.status = 'running';
+            executedBlocks.codeRuns.push(cr);
+            onEvent('code_runs', executedBlocks.codeRuns);
+            try {
+              let r;
+              if (cr.isServerOp === 'start') {
+                const sv = await containerRunner.startServer({
+                  serverId: cr.id,
+                  title: cr.title,
+                  language: cr.language,
+                  command: cr.command || cr.code,
+                  cwd: cr.cwd,
+                  workspace,
+                  onOutput: onContainerOutput,
+                });
+                r = {
+                  ok: sv.ok,
+                  exitCode: sv.ok ? 0 : (sv.exitCode ?? 1),
+                  elapsedMs: 0,
+                  stdout: `Server ID: ${sv.id} | Status: ${sv.status} | PID: ${sv.pid || '?'}${sv.urls.length ? `\nListening URLs: ${sv.urls.join(', ')}` : ''}\n${sv.logs || '(no output yet)'}`,
+                  stderr: '',
+                };
+              } else if (cr.isServerOp === 'stop') {
+                const st = await containerRunner.stopServer(cr.serverId);
+                r = { ok: st.ok, exitCode: st.ok ? 0 : 1, elapsedMs: 0, stdout: st.ok ? `Stopped server ${cr.serverId}` : (st.error || 'Failed to stop'), stderr: '' };
+              } else {
+                r = await containerRunner.runInContainer({
+                  runId: cr.id,
+                  title: cr.title,
+                  language: cr.language,
+                  code: cr.code,
+                  command: cr.command,
+                  cwd: cr.cwd,
+                  timeoutSec: cr.timeoutSec,
+                  image: cr.image || containerRunner.defaultImageForLanguage(cr.language, cfg.containerImage),
+                  network: cr.network,
+                  mountMode: cr.mountMode,
+                  execTarget: cr.execTarget || resolvedExecTarget,
+                  workspace,
+                  onOutput: onContainerOutput,
+                });
+              }
+              cr.status = r.ok ? 'done' : 'error';
+              cr.exitCode = r.exitCode;
+              cr.elapsedMs = r.elapsedMs;
+              cr.stopped = Boolean(r.stopped);
+              cr.output = [r.stdout, r.stderr].filter(Boolean).join('\n').trim() || '(no output)';
+              if (!r.ok) didFail = true;
+              const statusTag = r.ok ? `Exit 0 · ${r.elapsedMs || 0}ms` : `Exit ${r.exitCode ?? 1} · ${r.elapsedMs || 0}ms — FAILED`;
+              toolResultText = `[${cr.title || cr.language} | ${statusTag}]\n${formatHeadTail(cr.output, 1500, 3500)}`;
+            } catch (e) {
+              cr.status = 'error';
+              cr.output = e.message;
+              didFail = true;
+              toolResultText = `✗ Execution error: ${e.message}`;
+            }
+            onEvent('code_runs', executedBlocks.codeRuns);
+          }
+        } else if (name === 'save_memory' && toolsCfg.notes) {
+          if (args.title || args.content) {
+            const note = {
+              title: String(args.title || 'Saved note').slice(0, 120),
+              content: String(args.content || '').trim(),
+              tags: Array.isArray(args.tags) ? args.tags : [],
+            };
+            executedBlocks.savedNotes.push(note);
+            toolResultText = `✓ Queued memory note: "${note.title}"`;
+          } else {
+            toolResultText = 'Error: title or content required for save_memory';
+            didFail = true;
+          }
+        } else {
+          toolResultText = `Tool "${name}" is disabled or unsupported in current settings.`;
+          didFail = true;
+        }
+      } catch (err) {
+        didFail = true;
+        toolResultText = `Tool error (${name}): ${err.message}`;
+      }
+
+      if (didFail) {
+        const prevFails = (failedSignatures.get(sig) || 0) + 1;
+        failedSignatures.set(sig, prevFails);
+        if (prevFails >= 2) {
+          toolResultText += `\n\n[LOOP GUARD: You already tried this exact ${name} call ${prevFails} times and it failed. Do NOT repeat the same call — inspect the file/logs with read_file/read_server_logs or take a different approach.]`;
+        }
+      }
+
       curMessages.push({
         role: 'tool',
         tool_call_id: assistantToolCalls[i].id,
-        content: mask(resultText.slice(0, 12000)),
+        content: mask(toolResultText.slice(0, 12000)),
       });
     }
   }
 
-  return { res: lastRes, finalMessages: curMessages };
+  return { res: lastRes, finalMessages: curMessages, executedBlocks, pendingCalls: [] };
 }
 
 async function mergeNativeToolCalls(toolCalls, blocks, toolsCfg, resolvedExecTarget = 'container', unmask = (s) => s) {
@@ -1003,43 +1287,50 @@ function buildSystemPrompt({
 }) {
   const isWin = process.platform === 'win32';
   const envLine = resolvedExecTarget === 'host'
-    ? `Execution Target: ON-MACHINE HOST (${isWin ? 'Windows / PowerShell + Python + Node' : 'Linux / bash + Python + Node'}, cwd=${workspace}; local .venv auto-detected for Python; do NOT hardcode /workspace).`
+    ? `Execution Target: ON-MACHINE HOST (${isWin ? 'Windows · PowerShell / Python / Node.js' : 'Linux · bash / Python / Node.js'} | cwd=${workspace} | workspace .venv auto-detected for Python | NEVER hardcode /workspace).`
     : `Execution Target: ISOLATED CONTAINER (Docker/Podman mounted at /workspace).`;
 
-  const operatingRules = [
-    '- Act decisively: when the user asks to create, edit, run, test, or update something, invoke the required tool(s) immediately in this turn. NEVER stop after narration like "I will now run..." or fake text like "Prepared 1 code run...".',
-    '- Coding workflow: inspect existing files first (read_file / search_files with regex & glob), make surgical edits with edit_file (prefer over write_file on existing files), then verify with run_code (tests/linters/syntax). For long-running web apps (Flask, FastAPI, Vite, Node), use start_server + read_server_logs instead of blocking run_code.',
-    '- Office & Excel workflow: for .xlsx/.csv spreadsheets, use real Excel formulas (=SUM, =AVERAGE, =IF, =ROUND, cross-sheet refs) instead of hardcoded totals; use edit_table (supports A1 refs, set_range, sort_rows, add_sheet, rename_sheet). Use fill_docx_template when an existing .docx template should keep its branding, and create_office_doc for fresh .docx, .pptx, or .ics files.',
-    '- Honesty & precision: never fabricate command output, test results, file contents, or URLs. Cite local files by relative path and web sources as Markdown links.',
+  const modeLine = (effAutoEdits || effAutoCode)
+    ? `Execution Mode: AUTONOMOUS CLOSED LOOP (${[effAutoCode ? `auto-run on ${resolvedExecTarget.toUpperCase()}` : '', effAutoEdits ? 'auto-apply file & Office edits with 1-click Undo + instant syntax/formula verification' : ''].filter(Boolean).join(' + ')}).`
+    : `Execution Mode: APPROVAL-GATED (read-only tools run immediately; file/table/code actions present approval cards).`;
+
+  const workflowProtocol = [
+    '1. INSPECT FIRST, NEVER GUESS: Before modifying existing code or spreadsheets, inspect them with read_file (exact line ranges), search_files (regex + glob), list_dir, git_inspect, or inspect_spreadsheet.',
+    '2. EXECUTE END-TO-END: Never stop halfway after creating a file when the user asked for a working app, script, analysis, or document. Complete the full loop: Inspect → Create/Patch → Verify syntax/dependencies → Run tests or start server & verify HTTP/output → Report.',
+    '3. SELF-HEAL ON ERRORS: Every file write/patch returns an automatic syntax check; every spreadsheet edit returns evaluated formula results; every code run returns exit code + stdout/stderr. If anything fails (syntax error, ImportError, failing test, #REF!, patch mismatch), diagnose from the tool output, fix the root cause, and re-verify before replying.',
+    '4. NEVER NARRATE WITHOUT ACTING: Do NOT stop with phrases like "I will now create app.py and run it" or fake text like "Prepared 1 code run...". Call the tool immediately. Do NOT repeat an identical failing tool call — inspect or change strategy.',
+    '5. USE THE RIGHT TOOL:',
+    '   - Existing code/config files → edit_file (surgical old_text → new_text patch, never rewrite whole large files).',
+    '   - New or small files → write_file.',
+    '   - One-shot scripts, installs, builds, tests → run_code (supports cwd & timeout_sec; on Linux PEP 668 use python3 -m venv .venv && .venv/bin/pip install ... — subsequent Python runs auto-use .venv).',
+    '   - Web apps & long-running servers (Flask, FastAPI, Vite, Node) → start_server (non-blocking, captures listening URL & logs) + read_server_logs, then verify the live endpoint with a quick run_code HTTP check.',
+    '   - Spreadsheets (.xlsx / .csv) → edit_table with real Excel formulas (=SUM, =AVERAGE, =IF, =ROUND, cross-sheet refs) instead of hardcoded totals; supports A1 refs, set_range, sort_rows, add_sheet, rename_sheet.',
+    '   - Branded Word templates → fill_docx_template (preserves logos/headers/styles). Fresh Word/Slides/Calendar → create_office_doc (docx / pptx / ics).',
+    '6. EVIDENCE-BACKED REPORTING: Never fabricate file contents, command outputs, test results, or URLs. In your final response, concisely list files created/modified (relative paths), commands/tests verified, live URLs (if running), and any follow-up options.',
   ];
-  if (effAutoEdits || effAutoCode) {
-    operatingRules.push(
-      `- Auto Mode is ACTIVE (${[effAutoCode ? `auto-run code on ${resolvedExecTarget.toUpperCase()}` : '', effAutoEdits ? 'auto-apply file & spreadsheet edits with 1-click Undo' : ''].filter(Boolean).join(' + ')}): emit executable actions directly; they run automatically right after your turn.`
-    );
-  }
 
   let toolingSection = '';
   if (useNativeTools) {
     toolingSection = [
       '[Tooling Protocol — Native Function Tools]',
-      'Use ONLY the attached native tools to inspect, edit, or execute:',
-      toolsCfg.osFiles ? '- Inspect: read_file (with start_line/end_line), list_dir, search_files (regex + glob), inspect_spreadsheet' : '',
+      'Call the attached native tools directly. You can chain multiple tool rounds automatically until the task is fully verified:',
+      toolsCfg.osFiles ? '- Inspect: read_file, list_dir, search_files (regex + glob), inspect_spreadsheet' : '',
       toolsCfg.git ? '- Git: git_inspect' : '',
-      toolsCfg.osFiles ? '- Edit & Office: edit_file (preferred for existing files), write_file (new/small files), file_action, edit_table, create_office_doc (docx/pptx/ics), fill_docx_template' : '',
+      toolsCfg.osFiles ? '- Edit & Office: edit_file, write_file, file_action, edit_table, create_office_doc (docx/pptx/ics), fill_docx_template' : '',
       toolsCfg.container ? (resolvedExecTarget === 'host'
-        ? '- Execute: run_code (one-shot scripts/tests, supports cwd & timeout_sec), start_server / list_servers / read_server_logs / stop_server (long-running dev servers)'
-        : '- Execute: run_code (isolated container mounted at /workspace)') : '',
-      toolsCfg.notes ? '- Memory: save_memory (when user asks to remember a preference or project note)' : '',
-      'Do NOT duplicate native tool calls as fenced ```file-actions, ```code-run, or ```table-edits JSON blocks in your Markdown reply.',
+        ? '- Execute: run_code (one-shot), start_server / list_servers / read_server_logs / stop_server (background servers)'
+        : '- Execute: run_code (isolated container at /workspace)') : '',
+      toolsCfg.notes ? '- Memory: save_memory' : '',
+      'CRITICAL: Never duplicate native tool calls as fenced ```file-actions, ```code-run, or ```table-edits JSON blocks in Markdown.',
     ].filter(Boolean).join('\n');
   } else {
     const fencedBlocks = [
       '[Tooling Protocol — Fenced JSON Blocks]',
-      'No native function tools are attached. Output your complete Markdown answer and any executable fenced JSON blocks directly in one response:',
+      'No native function tools are attached. Emit your Markdown reply and any executable fenced JSON blocks directly in one response:',
     ];
     if (toolsCfg.osFiles) {
       fencedBlocks.push(
-        '- File edits (```file-actions JSON array): prefer {"type":"patch","path":"...","oldText":"exact snippet","newText":"replacement","reason":"..."} for existing files; also supports "write", "write_docx" (title + Markdown content), "write_pptx" (title + slides/content), "fill_docx_template" (templatePath + path + replacements), "write_ics", "mkdir", "move", "rename", "copy", "delete".',
+        '- File edits (```file-actions JSON array): prefer {"type":"patch","path":"...","oldText":"exact snippet","newText":"replacement","reason":"..."} for existing files; also supports "write", "write_docx", "write_pptx", "fill_docx_template", "write_ics", "mkdir", "move", "rename", "copy", "delete".',
         '- Spreadsheets (```table-edits JSON): {"path":"file.xlsx","sheetIndex":0,"summary":"...","operations":[{"op":"set_cell","cell":"C2","value":"=SUM(B2:B9)"}]} (ops: set_cell, set_formula, set_range, add_column, rename_column, delete_column, add_row, insert_row, delete_row, sort_rows, add_sheet, rename_sheet).'
       );
     }
@@ -1057,14 +1348,14 @@ function buildSystemPrompt({
   }
 
   return [
-    `[Identity & Environment]\nYou are ${roleTitle}, a local desktop AI coding & office coworker.\nDate: ${today} | Workspace: ${workspace}\n${toolsCfg.container ? envLine : ''}`.trim(),
+    `[Role & Environment]\nYou are ${roleTitle}, a senior full-stack software engineer and executive Office/data coworker operating directly on the user's workstation.\nDate: ${today} | Workspace: ${workspace}\n${toolsCfg.container ? envLine : ''}\n${modeLine}`.trim(),
     blueprint
       ? `[Project Structure & Stack]\n${blueprint}`
       : (wsSnapshot ? `[Workspace Top-Level Items]\n${wsSnapshot}` : ''),
     globalCustomInstr ? `[User Custom Instructions]\n${globalCustomInstr}` : '',
     projectContextBlock ? `[Project & Workspace Rules]\n${projectContextBlock}` : '',
     activeViewContextBlock,
-    `[Operating Rules]\n${operatingRules.join('\n')}${isCopilotSynthesis ? '\n- Synthesize the retrieved local tool & worker evidence below into a crisp, accurate, actionable Markdown response.' : ''}`,
+    `[Closed-Loop Execution Protocol]\n${workflowProtocol.join('\n')}${isCopilotSynthesis ? '\n7. SYNTHESIS: Ground your actions and final answer in the retrieved local tool & worker evidence below.' : ''}`,
     toolingSection,
     `[Interactive Artifacts]\nFor standalone interactive dashboards, charts, diagrams, or UI mockups, output a self-contained fenced \`\`\`html, \`\`\`svg, \`\`\`jsx, or \`\`\`mermaid block to open the live Artifact Preview Canvas.`,
   ].filter(Boolean).join('\n\n');
@@ -1389,6 +1680,7 @@ async function runCoworkTurn({
   think = 'low',
   signal,
   onEvent,
+  onContainerOutput,
 }) {
   const cfg = storage.getSettings();
   const toolsCfg = resolveEnabledTools(cfg, toolOverrides);
@@ -1609,14 +1901,20 @@ async function runCoworkTurn({
 
     let res;
     let activeMsgs = msgs;
+    let loopExecutedBlocks = null;
+    let loopPendingCalls = [];
     if (useNativeTools && nativeTools.length) {
-      const loopOut = await runChatWithReadTools({
+      const loopOut = await runAgenticToolLoop({
         tier: mode,
         model: chosenModel,
         systemPrompt: maskedSys,
         messages: msgs,
         images,
         tools: nativeTools,
+        toolsCfg,
+        resolvedExecTarget,
+        effAutoEdits,
+        effAutoCode,
         think: mode === 'fast' ? 'off' : think,
         priority: mode,
         workspace,
@@ -1624,9 +1922,12 @@ async function runCoworkTurn({
         unmask,
         signal,
         onEvent,
+        onContainerOutput,
       });
       res = loopOut.res;
       activeMsgs = loopOut.finalMessages;
+      loopExecutedBlocks = loopOut.executedBlocks;
+      loopPendingCalls = loopOut.pendingCalls || [];
     } else {
       res = await endpoint.chatCompletion({
         tier: mode,
@@ -1701,7 +2002,14 @@ async function runCoworkTurn({
     });
 
     const blocks = await extractSpecialBlocks(finalContent, toolsCfg, resolvedExecTarget);
-    await mergeNativeToolCalls(res.toolCalls, blocks, toolsCfg, resolvedExecTarget, unmask);
+    if (loopExecutedBlocks) {
+      blocks.fileActions = [...loopExecutedBlocks.fileActions, ...blocks.fileActions];
+      blocks.tableEdits = [...loopExecutedBlocks.tableEdits, ...blocks.tableEdits];
+      blocks.codeRuns = [...loopExecutedBlocks.codeRuns, ...blocks.codeRuns];
+      blocks.savedNotes = [...loopExecutedBlocks.savedNotes, ...blocks.savedNotes];
+    }
+    const callsToMaterialize = loopExecutedBlocks ? loopPendingCalls : res.toolCalls;
+    await mergeNativeToolCalls(callsToMaterialize, blocks, toolsCfg, resolvedExecTarget, unmask);
     const { fileActions, tableEdits, codeRuns, savedNotes, savedTasks } = blocks;
     let wasAutoSynthesized = false;
     if (!finalContent.trim() && (fileActions.length || codeRuns.length || tableEdits.length)) {
@@ -1732,14 +2040,17 @@ async function runCoworkTurn({
     };
   }
 
-  // ---- COPILOT (Smart) or COPILOT (B) (nemotron-3.5-lightning) Orchestrator -> Fast Workers -> Synthesis
+  // ---- COPILOT (Smart), COPILOT (B), or PACIFIC COUNCIL (up to 6 arguing agents + Chief ×3 votes + long-horizon loop)
+  const isPacific = mode === 'pacific';
   const isCopilotB = mode === 'copilot_b';
   const orchestratorModel = isCopilotB
     ? guardModel(cfg.copilotBModel, 'nemotron-3.5-lightning')
     : guardModel(cfg.smartModel, 'inkling-2-mini:latest');
-  const orchestratorLabel = isCopilotB
-    ? `Copilot (B) · ${orchestratorModel.replace(/:latest$/, '')}`
-    : `Copilot · ${orchestratorModel.replace(/:latest$/, '')}`;
+  const orchestratorLabel = isPacific
+    ? `Pacific Chief · ${orchestratorModel.replace(/:latest$/, '')}`
+    : isCopilotB
+      ? `Copilot (B) · ${orchestratorModel.replace(/:latest$/, '')}`
+      : `Copilot · ${orchestratorModel.replace(/:latest$/, '')}`;
 
   onEvent('phase', { phase: 'planning', label: `${orchestratorLabel} planning…` });
 
@@ -1864,8 +2175,33 @@ Rules:
 
   if (signal?.aborted) throw Object.assign(new Error('Aborted'), { name: 'AbortError' });
 
-  // Stage 3: Orchestrator synthesizes final response + action cards
-  onEvent('phase', { phase: 'synthesizing', label: `${orchestratorLabel} synthesizing…` });
+  // ---- Pacific Council Stage: up to 6 arguing specialist agents (1 vote each) + Chief (3 votes)
+  let pacificCouncil = null;
+  let pacificMandate = '';
+  if (isPacific && !isHarness && !trivial) {
+    const pacRes = await pacific.runPacificCouncil({
+      prompt,
+      workspace,
+      blueprint: wsBlueprint,
+      activeViewContextBlock,
+      chiefModel: orchestratorModel,
+      workerModel,
+      maxAgents: pacific.MAX_ARGUING_AGENTS,
+      chatId,
+      chatTitle,
+      mask,
+      unmask,
+      signal,
+      onEvent,
+    });
+    pacificCouncil = pacRes.council;
+    pacificMandate = pacRes.winningPlanPrompt || '';
+  }
+
+  if (signal?.aborted) throw Object.assign(new Error('Aborted'), { name: 'AbortError' });
+
+  // Stage 3: Orchestrator / Pacific Chief synthesizes & executes closed-loop plan
+  onEvent('phase', { phase: 'synthesizing', label: isPacific ? `${orchestratorLabel} executing winning mandate…` : `${orchestratorLabel} synthesizing…` });
   const useNativeTools = supportsNativeTools(orchestratorModel);
   const nativeTools = useNativeTools ? buildNativeTools(toolsCfg, resolvedExecTarget) : [];
 
@@ -1894,6 +2230,9 @@ Rules:
   if (briefBlocks) {
     synthPromptParts.push(`[Retrieved Evidence from Local Tools & Fast Workers]\n${briefBlocks}`);
   }
+  if (pacificMandate) {
+    synthPromptParts.push(pacificMandate);
+  }
   synthPromptParts.push(`[User Request]\n${prompt}`);
 
   const synthMessages = [
@@ -1907,14 +2246,20 @@ Rules:
 
   let finalRes;
   let activeSynthMsgs = synthMessages;
+  let synthExecutedBlocks = null;
+  let synthPendingCalls = [];
   if (useNativeTools && nativeTools.length) {
-    const loopOut = await runChatWithReadTools({
+    const loopOut = await runAgenticToolLoop({
       tier: 'smart',
       model: orchestratorModel,
       systemPrompt: maskedSynthSys,
       messages: synthMessages,
       images,
       tools: nativeTools,
+      toolsCfg,
+      resolvedExecTarget,
+      effAutoEdits,
+      effAutoCode,
       think,
       priority: 'smart',
       workspace,
@@ -1922,9 +2267,13 @@ Rules:
       unmask,
       signal,
       onEvent,
+      onContainerOutput,
+      maxRounds: isPacific ? 96 : 48,
     });
     finalRes = loopOut.res;
     activeSynthMsgs = loopOut.finalMessages;
+    synthExecutedBlocks = loopOut.executedBlocks;
+    synthPendingCalls = loopOut.pendingCalls || [];
   } else {
     finalRes = await endpoint.chatCompletion({
       tier: 'smart',
@@ -1999,7 +2348,14 @@ Rules:
   });
 
   const blocks = await extractSpecialBlocks(finalContent, toolsCfg, resolvedExecTarget);
-  await mergeNativeToolCalls(finalRes.toolCalls, blocks, toolsCfg, resolvedExecTarget, unmask);
+  if (synthExecutedBlocks) {
+    blocks.fileActions = [...synthExecutedBlocks.fileActions, ...blocks.fileActions];
+    blocks.tableEdits = [...synthExecutedBlocks.tableEdits, ...blocks.tableEdits];
+    blocks.codeRuns = [...synthExecutedBlocks.codeRuns, ...blocks.codeRuns];
+    blocks.savedNotes = [...synthExecutedBlocks.savedNotes, ...blocks.savedNotes];
+  }
+  const synthCallsToMaterialize = synthExecutedBlocks ? synthPendingCalls : finalRes.toolCalls;
+  await mergeNativeToolCalls(synthCallsToMaterialize, blocks, toolsCfg, resolvedExecTarget, unmask);
   const { fileActions, tableEdits, codeRuns, savedNotes, savedTasks } = blocks;
   let wasAutoSynthesized = false;
   if (!finalContent.trim() && (fileActions.length || codeRuns.length || tableEdits.length)) {
@@ -2020,6 +2376,7 @@ Rules:
     usage: finalRes.usage,
     shieldSummary: shield ? shield.summary() : null,
     plan,
+    pacific: pacificCouncil,
     workers: workerResults,
     sources: allSources,
     fileActions,
@@ -2033,6 +2390,7 @@ Rules:
 
 module.exports = {
   runCoworkTurn,
+  runAgenticToolLoop,
   buildSystemPrompt,
   buildNativeTools,
   buildHistoryMessages,

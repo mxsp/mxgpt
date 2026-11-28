@@ -504,6 +504,7 @@ function modeHintText(m) {
   if (m === 'fast') return `Fast: ${fast} direct`;
   if (m === 'smart') return `Smart: ${smart} direct`;
   if (m === 'copilot_b') return `Copilot (B): ${copB} orchestrates · ${agent} workers & local tools`;
+  if (m === 'pacific') return `Pacific Council: up to 6 arguing agents (1 vote) + Chief ${smart} (3 votes) · long-horizon loop`;
   return `Copilot: ${smart} orchestrates · ${agent} workers & local tools`;
 }
 
@@ -603,7 +604,7 @@ function setMode(m) {
     b.setAttribute('aria-checked', String(on));
   });
   $('#modeHint').textContent = modeHintText(m);
-  $('#topModel').textContent = m === 'fast' ? 'Fast' : m === 'smart' ? 'Smart' : m === 'copilot_b' ? 'Copilot (B)' : 'Copilot';
+  $('#topModel').textContent = m === 'fast' ? 'Fast' : m === 'smart' ? 'Smart' : m === 'copilot_b' ? 'Copilot (B)' : m === 'pacific' ? 'Pacific' : 'Copilot';
   renderAvailableModelsDropdown();
 }
 
@@ -787,7 +788,7 @@ async function boot() {
   S.projects = projData?.projects || [];
   S.activeProject = projData?.activeProject || null;
 
-  $('#appVersionBadge').textContent = `v${info.version || '1.8.9'}`;
+  $('#appVersionBadge').textContent = `v${info.version || '1.8.10'}`;
   applyThemeUI(S.settings.theme || 'light');
   setMode(S.settings.defaultMode || 'copilot');
   setThink(S.settings.think || 'low');
@@ -2108,6 +2109,128 @@ function renderAgentTraceGroup(steps) {
   return details;
 }
 
+function renderPacificCouncilCard(council, isLive = false) {
+  const det = document.createElement('details');
+  det.className = 'pacific-card';
+  if (isLive || council.phase !== 'executing') det.open = true;
+
+  const winner = council.tally?.winner;
+  const totalVotes = council.tally?.totalVotes || 0;
+  const statusLbl = council.phase === 'proposals'
+    ? 'Debating proposals…'
+    : council.phase === 'voting'
+      ? 'Cross-examining & voting…'
+      : winner
+        ? `Winner: ${winner.optionTitle} (${winner.votes}/${totalVotes} votes)`
+        : 'Executing mandate';
+
+  const sum = document.createElement('summary');
+  sum.innerHTML = `
+    <span class="pacific-head-left">
+      <span class="pacific-badge">Pacific Council</span>
+      <span>${esc(statusLbl)}</span>
+    </span>
+    <span class="pacific-chief-pill">${council.agentCount || (council.agents?.length || 0)} Agents · Chief ×${council.chiefWeight || 3}</span>`;
+  det.appendChild(sum);
+
+  const body = document.createElement('div');
+  body.className = 'pacific-body';
+
+  if (council.tally?.ranked?.length) {
+    const tallyEl = document.createElement('div');
+    tallyEl.className = 'pacific-tally';
+    for (const r of council.tally.ranked.filter((x) => x.votes > 0)) {
+      const pct = totalVotes > 0 ? Math.round((r.votes / totalVotes) * 100) : 0;
+      const isWin = r.id === winner?.id;
+      const hasChief = (r.voters || []).some((v) => v.isChief);
+      const row = document.createElement('div');
+      row.className = 'pacific-tally-row';
+      row.innerHTML = `
+        <span><strong>${esc(r.optionTitle)}</strong>${hasChief ? ' · <span class="pacific-chief-pill">Chief ×3</span>' : ''}</span>
+        <span><strong>${r.votes}</strong>/${totalVotes} (${pct}%)</span>
+        <div class="pacific-bar-track"><div class="pacific-bar-fill${isWin ? ' winner' : ''}" style="width:${pct}%"></div></div>`;
+      tallyEl.appendChild(row);
+    }
+    body.appendChild(tallyEl);
+  }
+
+  if (council.chief?.rationale) {
+    const vd = document.createElement('div');
+    vd.className = 'pacific-verdict';
+    vd.innerHTML = `<strong>Pacific Chief (3 votes → ${esc(council.chief.voteFor)}):</strong> ${esc(council.chief.rationale)}`;
+    body.appendChild(vd);
+  }
+
+  if (Array.isArray(council.agents) && council.agents.length) {
+    const grid = document.createElement('div');
+    grid.className = 'pacific-grid';
+    for (const a of council.agents) {
+      const card = document.createElement('div');
+      card.className = 'pacific-agent';
+      const voteBadge = a.voteFor ? `1v → ${a.voteFor}` : (a.status || 'thinking');
+      card.innerHTML = `
+        <div class="pacific-agent-head">
+          <span>${esc(a.name)}</span>
+          <span class="exec-pill">${esc(voteBadge)}</span>
+        </div>
+        ${a.optionTitle ? `<div><strong>${esc(a.optionTitle)}</strong></div>` : ''}
+        ${a.proposal ? `<div class="pacific-agent-crit">${esc(a.proposal.slice(0, 150))}</div>` : ''}
+        ${a.critique ? `<div class="pacific-agent-crit"><em>Critique:</em> ${esc(a.critique.slice(0, 130))}</div>` : ''}`;
+      grid.appendChild(card);
+    }
+    body.appendChild(grid);
+  }
+
+  det.appendChild(body);
+  return det;
+}
+
+function renderStreamlinedActionGroup(m) {
+  const fCount = m.fileActions?.length || 0;
+  const tCount = m.tableEdits?.length || 0;
+  const rCount = m.codeRuns?.length || 0;
+  const total = fCount + tCount + rCount;
+  if (!total) return null;
+
+  const hasPending = (m.fileActions || []).some((a) => a.status === 'pending')
+    || (m.tableEdits || []).some((t) => t.status === 'pending')
+    || (m.codeRuns || []).some((r) => r.status === 'pending' || r.status === 'running');
+  const hasErrors = (m.fileActions || []).some((a) => a.status === 'error')
+    || (m.tableEdits || []).some((t) => t.status === 'error')
+    || (m.codeRuns || []).some((r) => r.status === 'error');
+
+  if (total <= 2 && hasPending) {
+    const frag = document.createDocumentFragment();
+    if (fCount) frag.appendChild(renderFileActionsCard(m.fileActions));
+    if (tCount) frag.appendChild(renderTableEditsCard(m.tableEdits));
+    if (rCount) frag.appendChild(renderCodeRunsCard(m.codeRuns));
+    return frag;
+  }
+
+  const det = document.createElement('details');
+  det.className = 'exec-activity';
+  if (hasPending || hasErrors) det.open = true;
+
+  const pills = [];
+  if (fCount) pills.push(`<span class="exec-pill">${fCount} file${fCount > 1 ? 's' : ''}</span>`);
+  if (tCount) pills.push(`<span class="exec-pill">${tCount} sheet${tCount > 1 ? 's' : ''}</span>`);
+  if (rCount) pills.push(`<span class="exec-pill${hasErrors ? ' err' : ''}">${rCount} run${rCount > 1 ? 's' : ''}</span>`);
+
+  const sum = document.createElement('summary');
+  sum.innerHTML = `
+    <span>${hasPending ? 'Action Approval / Live Activity' : (hasErrors ? 'Execution Activity (with errors)' : 'Execution Activity')}</span>
+    <span class="exec-activity-pills">${pills.join('')}</span>`;
+  det.appendChild(sum);
+
+  const inner = document.createElement('div');
+  inner.className = 'exec-activity-body';
+  if (fCount) inner.appendChild(renderFileActionsCard(m.fileActions));
+  if (tCount) inner.appendChild(renderTableEditsCard(m.tableEdits));
+  if (rCount) inner.appendChild(renderCodeRunsCard(m.codeRuns));
+  det.appendChild(inner);
+  return det;
+}
+
 function renderMessages(forceScroll = true) {
   const wrap = $('#messages');
   $('#welcome').classList.toggle('hidden', S.messages.length > 0);
@@ -2172,6 +2295,7 @@ function renderMessages(forceScroll = true) {
     const cp = renderCopilotPanel(m);
     if (cp) body.appendChild(cp);
 
+    if (m.pacific) body.appendChild(renderPacificCouncilCard(m.pacific, Boolean(m.streaming)));
     if (m.thinking) {
       const th = document.createElement('details');
       th.className = 'think-box';
@@ -2186,9 +2310,8 @@ function renderMessages(forceScroll = true) {
       body.appendChild(pr);
     }
 
-    if (m.fileActions?.length) body.appendChild(renderFileActionsCard(m.fileActions));
-    if (m.tableEdits?.length) body.appendChild(renderTableEditsCard(m.tableEdits));
-    if (m.codeRuns?.length) body.appendChild(renderCodeRunsCard(m.codeRuns));
+    const actGroup = renderStreamlinedActionGroup(m);
+    if (actGroup) body.appendChild(actGroup);
     if (trailingHarness.length) {
       for (const hm of trailingHarness) body.appendChild(renderHarnessMessage(hm));
     }
@@ -2237,7 +2360,7 @@ function renderMessages(forceScroll = true) {
       const foot = document.createElement('div');
       foot.className = 'msg-foot-bar';
       const spd = m.usage?.tokensPerSec ? `${m.usage.tokensPerSec} t/s` : '';
-      const modeLbl = m.mode === 'copilot_b' ? 'Copilot (B)' : (m.mode || 'copilot');
+      const modeLbl = m.mode === 'copilot_b' ? 'Copilot (B)' : m.mode === 'pacific' ? 'Pacific Council' : (m.mode || 'copilot');
       const info = [modeLbl, m.model ? m.model.replace(/:latest$/, '') : '', spd].filter(Boolean).join(' · ');
       const span = document.createElement('span');
       span.textContent = info;
@@ -2484,6 +2607,13 @@ function handleGlobalCoworkEvent({ streamId: sid, event: ev, data: d }) {
     if (viewing && d?.total > 0) {
       toast(`Privacy Shield masked ${d.total} sensitive item${d.total === 1 ? '' : 's'} locally`);
     }
+  } else if (ev === 'pacific_state') {
+    st.assistant.pacific = d;
+    if (live?.planSlot?.isConnected) {
+      live.planSlot.innerHTML = '';
+      live.planSlot.appendChild(renderPacificCouncilCard(d, true));
+      scrollFeedIfNearBottom(true);
+    }
   } else if (ev === 'copilot_plan') {
     st.assistant.plan = d;
     refreshStreamPlanPanel(st);
@@ -2523,6 +2653,12 @@ function handleGlobalCoworkEvent({ streamId: sid, event: ev, data: d }) {
     if (!st.proseTimer) st.proseTimer = setTimeout(() => flushStreamProse(st), 75);
   } else if (ev === 'file_actions') {
     st.assistant.fileActions = d;
+    if (isViewingStream(st) && st.live?.cardsSlot?.isConnected) {
+      st.live.cardsSlot.innerHTML = '';
+      const g = renderStreamlinedActionGroup(st.assistant);
+      if (g) st.live.cardsSlot.appendChild(g);
+      scrollFeedIfNearBottom(true);
+    }
   } else if (ev === 'table_edits') {
     st.assistant.tableEdits = d;
     if (viewing && Array.isArray(d) && d.length) {
@@ -2530,6 +2666,11 @@ function handleGlobalCoworkEvent({ streamId: sid, event: ev, data: d }) {
       if (first.status === 'applied') {
         playCopilotTableEditsLive(first, { applyToDisk: false });
       }
+    }
+    if (isViewingStream(st) && st.live?.cardsSlot?.isConnected) {
+      st.live.cardsSlot.innerHTML = '';
+      const g = renderStreamlinedActionGroup(st.assistant);
+      if (g) st.live.cardsSlot.appendChild(g);
     }
   } else if (ev === 'code_runs') {
     st.assistant.codeRuns = d;
@@ -2541,10 +2682,9 @@ function handleGlobalCoworkEvent({ streamId: sid, event: ev, data: d }) {
         st.live.phaseTxt.textContent = `Auto-running ${running.language || 'code'} on ${tgt}…`;
       }
       st.live.cardsSlot.innerHTML = '';
-      if (d?.length) {
-        st.live.cardsSlot.appendChild(renderCodeRunsCard(d));
-        scrollFeedIfNearBottom(true);
-      }
+      const g = renderStreamlinedActionGroup(st.assistant);
+      if (g) st.live.cardsSlot.appendChild(g);
+      scrollFeedIfNearBottom(true);
     }
   } else if (ev === 'graph_ready') {
     st.assistant.graphReady = d;
