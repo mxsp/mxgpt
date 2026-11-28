@@ -32,7 +32,7 @@ const TASKS_FILE = path.join(DATA_DIR, 'tasks.json');
 
 fs.mkdirSync(CHATS_DIR, { recursive: true });
 fs.mkdirSync(GRAPHS_DIR, { recursive: true });
-
+ 
 function defaultWorkspace() {
   const docs = path.join(os.homedir(), 'Documents');
   try {

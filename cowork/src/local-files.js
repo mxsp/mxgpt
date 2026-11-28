@@ -330,10 +330,26 @@ async function listDir(relPath = '', baseDir = getWorkspace()) {
   return { workspace: root, path: rel, items };
 }
 
-async function searchFiles({ query = '', relPath = '', maxResults = 35, includeContent = true } = {}, baseDir = getWorkspace()) {
+function globToRegExp(glob) {
+  const esc = String(glob || '').trim()
+    .replace(/[.+^${}()|[\]\\]/g, '\\$&')
+    .replace(/\*\*/g, '___DOUBLE_STAR___')
+    .replace(/\*/g, '[^/]*')
+    .replace(/___DOUBLE_STAR___/g, '.*')
+    .replace(/\?/g, '.');
+  return new RegExp(`(^|/)${esc}$`, 'i');
+}
+
+async function searchFiles({ query = '', relPath = '', maxResults = 35, includeContent = true, regex = false, glob = '' } = {}, baseDir = getWorkspace()) {
   const { root, abs } = resolveSafe(relPath, baseDir);
-  const q = String(query || '').trim().toLowerCase();
+  const rawQ = String(query || '').trim();
+  const q = rawQ.toLowerCase();
   const terms = q.split(/\s+/).filter((t) => t.length >= 2);
+  let compiledRe = null;
+  if (regex && rawQ) {
+    try { compiledRe = new RegExp(rawQ, 'i'); } catch (e) { throw new Error(`Invalid regex "${rawQ}": ${e.message}`); }
+  }
+  const globRe = glob && String(glob).trim() ? globToRegExp(glob) : null;
   const hits = [];
   let scanned = 0;
   const MAX_SCAN = 1800;
@@ -353,41 +369,64 @@ async function searchFiles({ query = '', relPath = '', maxResults = 35, includeC
       scanned++;
       const full = path.join(dir, d.name);
       const rel = path.relative(root, full).replace(/\\/g, '/');
+      if (globRe && !globRe.test(rel)) continue;
       const ext = path.extname(d.name).toLowerCase();
       let st;
       try { st = await fsp.stat(full); } catch { continue; }
 
       let score = 0;
       let snippet = '';
+      const lineMatches = [];
       const lowerRel = rel.toLowerCase();
-      if (!q) {
+      if (!rawQ) {
         score = 1;
       } else {
-        if (lowerRel.includes(q)) score += 10;
-        for (const t of terms) {
-          if (lowerRel.includes(t)) score += 4;
+        if (compiledRe ? compiledRe.test(rel) : lowerRel.includes(q)) score += 10;
+        if (!compiledRe) {
+          for (const t of terms) {
+            if (lowerRel.includes(t)) score += 4;
+          }
         }
         const canSearchText = includeContent && st.size <= 3 * 1024 * 1024 && (TEXT_EXTS.has(ext) || OFFICE_EXTS.has(ext) || ext === '.pdf');
         if (canSearchText) {
           try {
             const text = await readTextContent(full, 60000);
-            const lower = text.toLowerCase();
-            let firstIdx = -1;
-            if (lower.includes(q)) {
-              score += 12;
-              firstIdx = lower.indexOf(q);
-            }
-            for (const t of terms) {
-              const idx = lower.indexOf(t);
-              if (idx >= 0) {
-                score += 3;
-                if (firstIdx < 0) firstIdx = idx;
+            const lines = text.replace(/\r\n/g, '\n').split('\n');
+            if (compiledRe) {
+              for (let i = 0; i < lines.length; i++) {
+                if (compiledRe.test(lines[i])) {
+                  score += 12;
+                  if (lineMatches.length < 5) lineMatches.push({ line: i + 1, text: lines[i].trim().slice(0, 180) });
+                }
+              }
+            } else {
+              const lower = text.toLowerCase();
+              let firstIdx = -1;
+              if (lower.includes(q)) {
+                score += 12;
+                firstIdx = lower.indexOf(q);
+              }
+              for (const t of terms) {
+                const idx = lower.indexOf(t);
+                if (idx >= 0) {
+                  score += 3;
+                  if (firstIdx < 0) firstIdx = idx;
+                }
+              }
+              if (firstIdx >= 0) {
+                for (let i = 0; i < lines.length && lineMatches.length < 5; i++) {
+                  const ll = lines[i].toLowerCase();
+                  if (ll.includes(q) || (terms.length && terms.every((t) => ll.includes(t)))) {
+                    lineMatches.push({ line: i + 1, text: lines[i].trim().slice(0, 180) });
+                  }
+                }
+                const start = Math.max(0, firstIdx - 90);
+                const end = Math.min(text.length, firstIdx + 220);
+                snippet = text.slice(start, end).replace(/\s+/g, ' ').trim();
               }
             }
-            if (firstIdx >= 0) {
-              const start = Math.max(0, firstIdx - 90);
-              const end = Math.min(text.length, firstIdx + 220);
-              snippet = text.slice(start, end).replace(/\s+/g, ' ').trim();
+            if (!snippet && lineMatches.length) {
+              snippet = lineMatches.map((m) => `L${m.line}: ${m.text}`).join(' | ');
             }
           } catch {}
         }
@@ -403,6 +442,7 @@ async function searchFiles({ query = '', relPath = '', maxResults = 35, includeC
           mtime: st.mtimeMs,
           score,
           snippet,
+          matches: lineMatches,
         });
       }
     }
@@ -495,6 +535,182 @@ async function executeFileAction(action, baseDir = getWorkspace()) {
     await fsp.mkdir(target.abs, { recursive: true });
     const undo = storage.pushUndo({ type: 'mkdir', path: target.rel, workspace: root, summary: `Created folder ${target.rel}` });
     return { ok: true, summary: `Created folder ${target.rel}`, undoId: undo.id };
+  }
+
+  if (type === 'patch' || type === 'edit') {
+    const target = resolveSafe(action.path || action.to, root);
+    if (!fs.existsSync(target.abs)) throw new Error(`File not found for patch: ${target.rel}`);
+    const oldText = String(action.oldText ?? action.old_text ?? action.target ?? '');
+    const newText = String(action.newText ?? action.new_text ?? action.replacement ?? '');
+    if (!oldText) throw new Error(`Patch on ${target.rel} requires non-empty oldText`);
+    const cur = await fsp.readFile(target.abs, 'utf8');
+    // Normalize CRLF for matching if needed, preserving original line endings
+    const hasCrlf = cur.includes('\r\n');
+    const normCur = hasCrlf ? cur.replace(/\r\n/g, '\n') : cur;
+    const normOld = oldText.replace(/\r\n/g, '\n');
+    const normNew = newText.replace(/\r\n/g, '\n');
+
+    let occurrences = 0;
+    let searchIdx = 0;
+    while ((searchIdx = normCur.indexOf(normOld, searchIdx)) !== -1) {
+      occurrences++;
+      searchIdx += normOld.length;
+    }
+    if (occurrences === 0) {
+      throw new Error(`Patch target text not found in ${target.rel}. Read the file first to copy exact lines.`);
+    }
+    if (occurrences > 1 && !action.replaceAll) {
+      throw new Error(`Patch target text matched ${occurrences} places in ${target.rel}. Include more surrounding context or set replaceAll: true.`);
+    }
+
+    const updatedNorm = action.replaceAll
+      ? normCur.split(normOld).join(normNew)
+      : normCur.replace(normOld, () => normNew);
+    const updated = hasCrlf ? updatedNorm.replace(/\n/g, '\r\n') : updatedNorm;
+
+    const trashDir = path.join(root, '.mx-cowork-trash');
+    await fsp.mkdir(trashDir, { recursive: true });
+    const prevBackup = path.join(trashDir, `bak_${Date.now()}_${path.basename(target.abs)}`);
+    await fsp.copyFile(target.abs, prevBackup);
+    await fsp.writeFile(target.abs, updated, 'utf8');
+
+    const undo = storage.pushUndo({
+      type: 'write',
+      path: target.rel,
+      hadPrev: true,
+      prevBackup,
+      workspace: root,
+      summary: `Patched ${target.rel}`,
+    });
+    return {
+      ok: true,
+      summary: `Patched ${target.rel} (${occurrences} replacement${occurrences > 1 ? 's' : ''})`,
+      undoId: undo.id,
+    };
+  }
+
+  if (type === 'write_docx') {
+    const rawRel = action.path || action.to || 'document.docx';
+    const relWithExt = /\.docx$/i.test(rawRel) ? rawRel : `${rawRel}.docx`;
+    const target = resolveSafe(relWithExt, root);
+    await fsp.mkdir(path.dirname(target.abs), { recursive: true });
+    let hadPrev = false;
+    let prevBackup = '';
+    if (fs.existsSync(target.abs)) {
+      hadPrev = true;
+      const trashDir = path.join(root, '.mx-cowork-trash');
+      await fsp.mkdir(trashDir, { recursive: true });
+      prevBackup = path.join(trashDir, `bak_${Date.now()}_${path.basename(target.abs)}`);
+      await fsp.copyFile(target.abs, prevBackup);
+    }
+    const buf = officeExport.buildDocxBuffer(String(action.content ?? ''), String(action.title || path.basename(target.abs, '.docx')));
+    await fsp.writeFile(target.abs, buf);
+    const undo = storage.pushUndo({
+      type: 'write',
+      path: target.rel,
+      hadPrev,
+      prevBackup,
+      workspace: root,
+      summary: `${hadPrev ? 'Updated' : 'Created'} Word doc ${target.rel}`,
+    });
+    return { ok: true, summary: `${hadPrev ? 'Updated' : 'Created'} Word document ${target.rel}`, undoId: undo.id };
+  }
+
+  if (type === 'fill_docx_template') {
+    const srcRel = action.templatePath || action.from || '';
+    if (!srcRel) throw new Error('fill_docx_template requires templatePath/from');
+    const src = resolveSafe(srcRel, root);
+    if (!fs.existsSync(src.abs)) throw new Error(`DOCX template not found: ${src.rel}`);
+    const outRelRaw = action.path || action.to || src.rel;
+    const outRel = /\.docx$/i.test(outRelRaw) ? outRelRaw : `${outRelRaw}.docx`;
+    const target = resolveSafe(outRel, root);
+    await fsp.mkdir(path.dirname(target.abs), { recursive: true });
+    let hadPrev = false;
+    let prevBackup = '';
+    if (fs.existsSync(target.abs)) {
+      hadPrev = true;
+      const trashDir = path.join(root, '.mx-cowork-trash');
+      await fsp.mkdir(trashDir, { recursive: true });
+      prevBackup = path.join(trashDir, `bak_${Date.now()}_${path.basename(target.abs)}`);
+      await fsp.copyFile(target.abs, prevBackup);
+    }
+    const tplBuf = await fsp.readFile(src.abs);
+    const { buffer, replacedCount } = officeExport.fillDocxTemplate(tplBuf, action.replacements || {});
+    await fsp.writeFile(target.abs, buffer);
+    const undo = storage.pushUndo({
+      type: 'write',
+      path: target.rel,
+      hadPrev,
+      prevBackup,
+      workspace: root,
+      summary: `Filled DOCX template → ${target.rel}`,
+    });
+    return { ok: true, summary: `Filled DOCX template → ${target.rel} (${replacedCount} placeholder replacement${replacedCount === 1 ? '' : 's'})`, undoId: undo.id };
+  }
+
+  if (type === 'write_pptx') {
+    const rawRel = action.path || action.to || 'presentation.pptx';
+    const relWithExt = /\.pptx$/i.test(rawRel) ? rawRel : `${rawRel}.pptx`;
+    const target = resolveSafe(relWithExt, root);
+    await fsp.mkdir(path.dirname(target.abs), { recursive: true });
+    let hadPrev = false;
+    let prevBackup = '';
+    if (fs.existsSync(target.abs)) {
+      hadPrev = true;
+      const trashDir = path.join(root, '.mx-cowork-trash');
+      await fsp.mkdir(trashDir, { recursive: true });
+      prevBackup = path.join(trashDir, `bak_${Date.now()}_${path.basename(target.abs)}`);
+      await fsp.copyFile(target.abs, prevBackup);
+    }
+    const buf = officeExport.buildPptxBuffer({
+      title: String(action.title || path.basename(target.abs, '.pptx')),
+      subtitle: String(action.subtitle || ''),
+      slides: Array.isArray(action.slides) ? action.slides : undefined,
+      markdown: typeof action.content === 'string' ? action.content : '',
+    });
+    await fsp.writeFile(target.abs, buf);
+    const undo = storage.pushUndo({
+      type: 'write',
+      path: target.rel,
+      hadPrev,
+      prevBackup,
+      workspace: root,
+      summary: `${hadPrev ? 'Updated' : 'Created'} PowerPoint ${target.rel}`,
+    });
+    return { ok: true, summary: `${hadPrev ? 'Updated' : 'Created'} PowerPoint deck ${target.rel}`, undoId: undo.id };
+  }
+
+  if (type === 'write_ics') {
+    const rawRel = action.path || action.to || 'event.ics';
+    const relWithExt = /\.ics$/i.test(rawRel) ? rawRel : `${rawRel}.ics`;
+    const target = resolveSafe(relWithExt, root);
+    await fsp.mkdir(path.dirname(target.abs), { recursive: true });
+    let hadPrev = false;
+    let prevBackup = '';
+    if (fs.existsSync(target.abs)) {
+      hadPrev = true;
+      const trashDir = path.join(root, '.mx-cowork-trash');
+      await fsp.mkdir(trashDir, { recursive: true });
+      prevBackup = path.join(trashDir, `bak_${Date.now()}_${path.basename(target.abs)}`);
+      await fsp.copyFile(target.abs, prevBackup);
+    }
+    const ics = officeExport.buildIcsText({
+      title: action.title || 'Event',
+      description: action.content || action.description || '',
+      start: action.start || null,
+      durationMin: action.durationMin || 30,
+      location: action.location || '',
+    });
+    await fsp.writeFile(target.abs, ics, 'utf8');
+    const undo = storage.pushUndo({
+      type: 'write',
+      path: target.rel,
+      hadPrev,
+      prevBackup,
+      workspace: root,
+      summary: `${hadPrev ? 'Updated' : 'Created'} calendar invite ${target.rel}`,
+    });
+    return { ok: true, summary: `${hadPrev ? 'Updated' : 'Created'} calendar invite ${target.rel}`, undoId: undo.id };
   }
 
   if (type === 'write' || type === 'create') {
@@ -627,13 +843,120 @@ async function readFileContent(relPath, maxChars = 120000, baseDir = getWorkspac
   };
 }
 
-async function parseTableFile(relPath, baseDir = getWorkspace()) {
+async function readFileLines(relPath, { startLine = 1, endLine = 200, maxChars = 24000 } = {}, baseDir = getWorkspace()) {
+  const { abs, rel } = resolveSafe(relPath, baseDir);
+  const st = await fsp.stat(abs);
+  const raw = await readTextContent(abs, 250000);
+  const allLines = String(raw || '').replace(/\r\n/g, '\n').split('\n');
+  const totalLines = allLines.length;
+  const s = Math.max(1, Math.min(totalLines, Number(startLine) || 1));
+  const e = Math.max(s, Math.min(totalLines, Number(endLine) || (s + 199)));
+  const slice = allLines.slice(s - 1, e);
+  const numbered = slice.map((line, idx) => `${s + idx}: ${line}`).join('\n');
+  const truncated = numbered.length > maxChars;
+  return {
+    path: rel,
+    size: st.size,
+    sizeLabel: formatBytes(st.size),
+    totalLines,
+    startLine: s,
+    endLine: e,
+    truncated,
+    content: truncated ? numbered.slice(0, maxChars) + '\n… [truncated]' : numbered,
+  };
+}
+
+async function loadWorkspaceRules(baseDir = getWorkspace()) {
+  const root = path.resolve(baseDir);
+  const candidates = ['COWORK.md', '.coworkrules', 'AGENTS.md'];
+  for (const name of candidates) {
+    const full = path.join(root, name);
+    if (fs.existsSync(full)) {
+      try {
+        const st = await fsp.stat(full);
+        if (st.isFile() && st.size <= 64 * 1024) {
+          const content = (await fsp.readFile(full, 'utf8')).trim();
+          if (content) return { file: name, content: content.slice(0, 8000) };
+        }
+      } catch {}
+    }
+  }
+  return null;
+}
+
+async function projectBlueprint(baseDir = getWorkspace()) {
+  const root = path.resolve(baseDir);
+  const treeLines = [];
+  let entryCount = 0;
+  const MAX_ENTRIES = 90;
+
+  async function walkTree(dir, depth, prefix) {
+    if (depth > 2 || entryCount >= MAX_ENTRIES) return;
+    let entries;
+    try { entries = await fsp.readdir(dir, { withFileTypes: true }); } catch { return; }
+    entries.sort((a, b) => {
+      if (a.isDirectory() !== b.isDirectory()) return a.isDirectory() ? -1 : 1;
+      return a.name.localeCompare(b.name);
+    });
+    for (const d of entries) {
+      if (entryCount >= MAX_ENTRIES) break;
+      if (d.name.startsWith('.') && !['.env.example', '.github', '.gitignore'].includes(d.name)) continue;
+      if (d.isDirectory() && IGNORE_DIRS.has(d.name)) continue;
+      entryCount++;
+      treeLines.push(`${prefix}${d.isDirectory() ? d.name + '/' : d.name}`);
+      if (d.isDirectory() && depth < 2) {
+        await walkTree(path.join(dir, d.name), depth + 1, prefix + '  ');
+      }
+    }
+  }
+
+  await walkTree(root, 0, '');
+
+  const stack = [];
+  const scripts = [];
+  const pkgPath = path.join(root, 'package.json');
+  if (fs.existsSync(pkgPath)) {
+    try {
+      const pkg = JSON.parse(await fsp.readFile(pkgPath, 'utf8'));
+      const deps = Object.keys({ ...(pkg.dependencies || {}), ...(pkg.devDependencies || {}) });
+      const notable = deps.filter((d) => /^(react|next|vue|svelte|vite|electron|express|fastify|typescript|tailwindcss|prisma|jest|vitest|playwright|xlsx|exceljs|docx)$/i.test(d)).slice(0, 10);
+      stack.push(`Node.js (${pkg.name || 'app'}${notable.length ? ': ' + notable.join(', ') : ''})`);
+      if (pkg.scripts && typeof pkg.scripts === 'object') {
+        for (const [k, v] of Object.entries(pkg.scripts).slice(0, 8)) {
+          scripts.push(`npm run ${k} -> ${String(v).slice(0, 60)}`);
+        }
+      }
+    } catch { stack.push('Node.js (package.json)'); }
+  }
+  if (fs.existsSync(path.join(root, 'pyproject.toml')) || fs.existsSync(path.join(root, 'requirements.txt'))) {
+    const hasVenv = fs.existsSync(path.join(root, '.venv')) || fs.existsSync(path.join(root, 'venv'));
+    stack.push(`Python${hasVenv ? ' (local venv active)' : ''}`);
+  }
+  if (fs.existsSync(path.join(root, 'Cargo.toml'))) stack.push('Rust (Cargo)');
+  if (fs.existsSync(path.join(root, 'go.mod'))) stack.push('Go');
+  if (fs.existsSync(path.join(root, 'Dockerfile')) || fs.existsSync(path.join(root, 'docker-compose.yml'))) stack.push('Docker');
+  if (fs.existsSync(path.join(root, '.git'))) stack.push('Git repo');
+
+  const lines = [];
+  if (stack.length) lines.push(`Detected Stack: ${stack.join(' · ')}`);
+  if (scripts.length) lines.push(`Scripts:\n${scripts.map((s) => `  - ${s}`).join('\n')}`);
+  if (treeLines.length) lines.push(`Project Tree (depth <= 2):\n${treeLines.join('\n')}${entryCount >= MAX_ENTRIES ? '\n  … (more files; use list_dir or search_files)' : ''}`);
+  return {
+    workspace: root,
+    stack,
+    scripts,
+    treeLines,
+    text: lines.join('\n'),
+  };
+}
+
+async function parseTableFile(relPath, baseDir = getWorkspace(), { preserveFormulas = false } = {}) {
   const { abs, rel } = resolveSafe(relPath, baseDir);
   const name = path.basename(abs);
   const ext = path.extname(name).toLowerCase();
   if (ext === '.xlsx') {
     const buf = await fsp.readFile(abs);
-    const parsed = officeExport.parseXlsxBuffer(buf);
+    const parsed = officeExport.parseXlsxBuffer(buf, { preserveFormulas });
     const sheets = parsed.sheets || [{ name: 'Sheet1', rows: [['']] }];
     return {
       path: rel,
@@ -676,37 +999,99 @@ async function saveTableFile({ path: relPath, rows, sheets, sheetIndex = 0, deli
   }
 
   const ext = path.extname(target.abs).toLowerCase();
-  if (ext === '.xlsx') {
-    let allSheets = Array.isArray(sheets) && sheets.length
-      ? sheets.map((s) => ({ name: s.name || 'Sheet1', rows: s.rows || [['']] }))
-      : null;
-    if (!allSheets && hadPrev) {
-      try {
-        const prevParsed = officeExport.parseXlsxBuffer(await fsp.readFile(target.abs));
-        allSheets = prevParsed.sheets;
-      } catch {}
+  let finalTarget = target;
+  let lockedFallback = false;
+  const writePayload = async (destAbs) => {
+    if (ext === '.xlsx') {
+      let allSheets = Array.isArray(sheets) && sheets.length
+        ? sheets.map((s) => ({ name: s.name || 'Sheet1', rows: s.rows || [['']] }))
+        : null;
+      if (!allSheets && hadPrev) {
+        try {
+          const prevParsed = officeExport.parseXlsxBuffer(await fsp.readFile(target.abs), { preserveFormulas: true });
+          allSheets = prevParsed.sheets;
+        } catch {}
+      }
+      if (!allSheets || !allSheets.length) allSheets = [{ name: 'Sheet1', rows: rows || [['']] }];
+      if (Array.isArray(rows)) {
+        const idx = Math.max(0, Math.min(allSheets.length - 1, Number(sheetIndex) || 0));
+        allSheets[idx] = { name: allSheets[idx].name || `Sheet${idx + 1}`, rows };
+      }
+      const buf = officeExport.buildXlsxBuffer(allSheets);
+      await fsp.writeFile(destAbs, buf);
+    } else {
+      const csvStr = officeExport.serializeCsv(rows || [], ext === '.tsv' ? '\t' : (delimiter || ','));
+      await fsp.writeFile(destAbs, csvStr, 'utf8');
     }
-    if (!allSheets || !allSheets.length) allSheets = [{ name: 'Sheet1', rows: rows || [['']] }];
-    if (Array.isArray(rows)) {
-      const idx = Math.max(0, Math.min(allSheets.length - 1, Number(sheetIndex) || 0));
-      allSheets[idx] = { name: allSheets[idx].name || `Sheet${idx + 1}`, rows };
+  };
+
+  try {
+    await writePayload(target.abs);
+  } catch (err) {
+    if (err && (err.code === 'EBUSY' || err.code === 'EPERM' || err.code === 'EACCES')) {
+      const base = target.rel.slice(0, target.rel.length - ext.length);
+      finalTarget = resolveSafe(`${base}_updated${ext}`, root);
+      await writePayload(finalTarget.abs);
+      lockedFallback = true;
+    } else {
+      throw err;
     }
-    const buf = officeExport.buildXlsxBuffer(allSheets);
-    await fsp.writeFile(target.abs, buf);
-  } else {
-    const csvStr = officeExport.serializeCsv(rows || [], ext === '.tsv' ? '\t' : (delimiter || ','));
-    await fsp.writeFile(target.abs, csvStr, 'utf8');
   }
 
   const undo = storage.pushUndo({
     type: 'write',
-    path: target.rel,
-    hadPrev,
-    prevBackup,
+    path: finalTarget.rel,
+    hadPrev: lockedFallback ? false : hadPrev,
+    prevBackup: lockedFallback ? '' : prevBackup,
     workspace: root,
-    summary: `Updated spreadsheet ${target.rel}`,
+    summary: lockedFallback
+      ? `Saved ${finalTarget.rel} (original file was locked by Excel)`
+      : `Updated spreadsheet ${finalTarget.rel}`,
   });
-  return { ok: true, path: target.rel, summary: `Saved ${target.rel}`, undoId: undo.id };
+  return {
+    ok: true,
+    path: finalTarget.rel,
+    lockedFallback,
+    summary: lockedFallback
+      ? `Original ${target.rel} was locked (likely open in Excel) — saved changes to ${finalTarget.rel}`
+      : `Saved ${finalTarget.rel}`,
+    undoId: undo.id,
+  };
+}
+
+async function applyTableEditToFile(te, baseDir = getWorkspace()) {
+  if (!te?.path || !Array.isArray(te.operations)) throw new Error('Invalid table edit payload');
+  const root = path.resolve(baseDir);
+  const target = resolveSafe(te.path, root);
+  let sheets;
+  let delimiter = ',';
+  if (fs.existsSync(target.abs)) {
+    const parsed = await parseTableFile(target.rel, root, { preserveFormulas: true });
+    sheets = parsed.sheets || [{ name: 'Sheet1', rows: parsed.rows || [['']] }];
+    delimiter = parsed.delimiter || ',';
+  } else {
+    sheets = [{ name: String(te.sheetName || 'Sheet1').slice(0, 31), rows: [] }];
+  }
+  const sIdx = Math.max(0, Math.min(sheets.length - 1, Number(te.sheetIndex) || 0));
+  const { sheets: nextSheets, sheetIndex: finalIdx, rows: nextRows, applied } =
+    officeExport.applyWorkbookOperations(sheets, sIdx, te.operations);
+  const saved = await saveTableFile({
+    path: target.rel,
+    rows: nextRows,
+    sheets: nextSheets,
+    sheetIndex: finalIdx,
+    delimiter,
+  }, root);
+  return {
+    ok: true,
+    path: target.rel,
+    rows: nextRows,
+    sheets: nextSheets,
+    sheetIndex: finalIdx,
+    applied,
+    undoId: saved.undoId,
+    summary: `Applied ${applied.length} edit(s) to ${target.rel}`,
+  };
 }
 
 async function listOfficeFiles(baseDir = getWorkspace(), maxFiles = 40) {
@@ -757,9 +1142,13 @@ module.exports = {
   listDir,
   readTextContent,
   readFileContent,
+  readFileLines,
   readFileForEdit,
+  loadWorkspaceRules,
+  projectBlueprint,
   parseTableFile,
   saveTableFile,
+  applyTableEditToFile,
   listOfficeFiles,
   searchFiles,
   folderOverview,

@@ -233,7 +233,7 @@ async function compareWorkspaceFiles(leftRelPath, rightRelPath) {
 async function previewFileActionDiff(action) {
   const type = String(action?.type || '').toLowerCase();
   const relPath = action?.path || action?.to || '';
-  if (!relPath || !['write', 'append', 'create'].includes(type)) {
+  if (!relPath || !['write', 'append', 'create', 'patch', 'edit'].includes(type)) {
     return null;
   }
   let before = '';
@@ -246,9 +246,20 @@ async function previewFileActionDiff(action) {
     before = '';
     exists = false;
   }
-  const after = type === 'append'
-    ? (before ? `${before.replace(/\n*$/, '')}\n${String(action.content || '')}` : String(action.content || ''))
-    : String(action.content || '');
+  let after;
+  if (type === 'patch' || type === 'edit') {
+    const oldText = String(action.oldText ?? action.old_text ?? action.target ?? '').replace(/\r\n/g, '\n');
+    const newText = String(action.newText ?? action.new_text ?? action.replacement ?? '').replace(/\r\n/g, '\n');
+    const normBefore = before.replace(/\r\n/g, '\n');
+    if (!oldText || !normBefore.includes(oldText)) return null;
+    after = action.replaceAll
+      ? normBefore.split(oldText).join(newText)
+      : normBefore.replace(oldText, () => newText);
+  } else {
+    after = type === 'append'
+      ? (before ? `${before.replace(/\n*$/, '')}\n${String(action.content || '')}` : String(action.content || ''))
+      : String(action.content || '');
+  }
   const diff = computeLineDiff(before, after, { context: 2 });
   return {
     path: relPath,

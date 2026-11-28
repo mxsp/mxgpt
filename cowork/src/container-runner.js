@@ -13,6 +13,7 @@
  */
 
 const { execFile, spawn } = require('child_process');
+const fs = require('fs');
 const path = require('path');
 const storage = require('./storage');
 const localFiles = require('./local-files');
@@ -26,8 +27,31 @@ const IMAGE_PRESETS = [
 ];
 
 const ACTIVE_CONTAINERS = new Map(); // runId -> { child, runtime, cname }
+const ACTIVE_SERVERS = new Map(); // serverId -> { id, title, command, language, cwd, child, pid, startedAt, logs, urls, status, exitCode }
 let statusCache = null;
 let statusCacheAt = 0;
+
+const HIGH_RISK_PATTERNS = [
+  { re: /\brm\s+-[a-zA-Z]*r[a-zA-Z]*f\b[^\n]*(\s+\/(\s|$)|\s+~|\s+\$HOME|\s+\*)/i, reason: 'Recursive force-delete on broad path' },
+  { re: /\bgit\s+push\b[^\n]*(--force|-f\b)/i, reason: 'Force-pushing Git history' },
+  { re: /\bgit\s+reset\s+--hard\b/i, reason: 'Hard-resetting Git working tree' },
+  { re: /\b(mkfs|fdisk|parted|dd\s+if=.*of=\/dev\/|wipefs)\b/i, reason: 'Low-level disk/filesystem modification' },
+  { re: /\b(Format-Volume|Clear-Disk|Remove-Item\s+[^\n]*-Recurse[^\n]*-Force[^\n]*[A-Z]:\\(\s|$))/i, reason: 'Destructive Windows disk/folder operation' },
+  { re: /\b(DROP\s+DATABASE|DROP\s+SCHEMA|TRUNCATE\s+TABLE)\b/i, reason: 'Destructive database command' },
+  { re: /\b(shutdown|reboot|poweroff|halt)\b/i, reason: 'System power/shutdown command' },
+];
+
+function assessCommandRisk(code = '', command = '') {
+  const combined = `${String(code || '')}\n${String(command || '')}`;
+  const reasons = [];
+  for (const p of HIGH_RISK_PATTERNS) {
+    if (p.re.test(combined)) reasons.push(p.reason);
+  }
+  return {
+    highRisk: reasons.length > 0,
+    reasons,
+  };
+}
 
 function execFileAsync(bin, args, timeoutMs = 6000) {
   return new Promise((resolve) => {
@@ -123,6 +147,7 @@ async function runInContainer({
   memoryMb = 0,
   cpus = '',
   workspace = '',
+  cwd = '',
   onOutput,
 } = {}) {
   const cfg = storage.getSettings();
@@ -136,6 +161,7 @@ async function runInContainer({
       command,
       timeoutSec,
       workspace,
+      cwd,
       onOutput,
     });
   }
@@ -280,6 +306,29 @@ async function runInContainer({
   });
 }
 
+function detectWorkspaceVenv(ws) {
+  const isWin = process.platform === 'win32';
+  const candidates = isWin
+    ? [
+        path.join(ws, '.venv', 'Scripts', 'python.exe'),
+        path.join(ws, 'venv', 'Scripts', 'python.exe'),
+      ]
+    : [
+        path.join(ws, '.venv', 'bin', 'python3'),
+        path.join(ws, '.venv', 'bin', 'python'),
+        path.join(ws, 'venv', 'bin', 'python3'),
+        path.join(ws, 'venv', 'bin', 'python'),
+      ];
+  for (const py of candidates) {
+    if (fs.existsSync(py)) {
+      const binDir = path.dirname(py);
+      const venvDir = path.dirname(binDir);
+      return { pythonBin: py, binDir, venvDir };
+    }
+  }
+  return null;
+}
+
 async function runOnHost({
   runId = storage.newId('hrun'),
   title = '',
@@ -288,25 +337,47 @@ async function runOnHost({
   command = '',
   timeoutSec = 0,
   workspace = '',
+  cwd = '',
   onOutput,
 } = {}) {
   const cfg = storage.getSettings();
   const ws = path.resolve(workspace || localFiles.getWorkspace());
-  const maxTime = Math.max(5, Math.min(180, Number(timeoutSec || cfg.containerTimeoutSec || 30)));
+  let runCwd = ws;
+  if (cwd && String(cwd).trim()) {
+    try {
+      const resolved = localFiles.resolveSafe(String(cwd).trim(), ws);
+      if (fs.existsSync(resolved.abs) && fs.statSync(resolved.abs).isDirectory()) {
+        runCwd = resolved.abs;
+      }
+    } catch {}
+  }
+  const defaultHostTimeout = Math.max(60, Number(cfg.containerTimeoutSec || 60));
+  const maxTime = Math.max(5, Math.min(300, Number(timeoutSec || defaultHostTimeout)));
   const l = String(language || 'bash').toLowerCase();
   const isWin = process.platform === 'win32';
   const script = String(code || command || '').trim();
   if (!script) throw new Error('No code or command provided');
 
+  const venv = detectWorkspaceVenv(ws) || (runCwd !== ws ? detectWorkspaceVenv(runCwd) : null);
+  const env = { ...process.env };
+  if (venv) {
+    env.VIRTUAL_ENV = venv.venvDir;
+    env.PATH = `${venv.binDir}${path.delimiter}${env.PATH || ''}`;
+  }
+
   let bin;
   let args;
   let stdinPayload = script + '\n';
   if (l === 'python' || l === 'py' || l === 'python3') {
-    bin = isWin ? 'python' : 'python3';
+    bin = venv ? venv.pythonBin : (isWin ? 'python' : 'python3');
     args = ['-u', '-'];
   } else if (l === 'javascript' || l === 'js' || l === 'node') {
     bin = 'node';
     args = ['-'];
+  } else if (l === 'powershell' || l === 'ps1' || (isWin && (l === 'bash' || l === 'sh' || l === 'shell'))) {
+    bin = isWin ? 'powershell.exe' : 'pwsh';
+    args = ['-NoProfile', '-NonInteractive', '-Command', script];
+    stdinPayload = '';
   } else {
     if (isWin) {
       bin = 'powershell.exe';
@@ -325,15 +396,17 @@ async function runOnHost({
   let stopped = false;
   const MAX_OUT = 120000;
 
+  const venvNote = venv ? ` · venv=${path.basename(venv.venvDir)}` : '';
   onOutput?.({
     runId,
     stream: 'meta',
-    chunk: `▶ HOST (${bin} · cwd=${ws})\n`,
+    chunk: `▶ HOST (${path.basename(bin)}${venvNote} · cwd=${runCwd})\n`,
   });
 
   return new Promise((resolve) => {
     const child = spawn(bin, args, {
-      cwd: ws,
+      cwd: runCwd,
+      env,
       stdio: ['pipe', 'pipe', 'pipe'],
       windowsHide: true,
     });
@@ -427,16 +500,204 @@ async function stopContainerRun(runId) {
       await execFileAsync(entry.runtime, ['rm', '-f', entry.cname], 4000);
     } catch {}
   }
+  if (entry.runtime === 'host' && process.platform === 'win32' && entry.child?.pid) {
+    try {
+      await execFileAsync('taskkill', ['/pid', String(entry.child.pid), '/T', '/F'], 4000);
+    } catch {}
+  }
   try { entry.child.kill('SIGKILL'); } catch {}
   ACTIVE_CONTAINERS.delete(runId);
   return { ok: true };
 }
 
+async function startServer({
+  serverId = storage.newId('srv'),
+  title = '',
+  language = 'bash',
+  command = '',
+  code = '',
+  cwd = '',
+  workspace = '',
+  waitReadyMs = 1800,
+  onOutput,
+} = {}) {
+  const ws = path.resolve(workspace || localFiles.getWorkspace());
+  let runCwd = ws;
+  if (cwd && String(cwd).trim()) {
+    try {
+      const resolved = localFiles.resolveSafe(String(cwd).trim(), ws);
+      if (fs.existsSync(resolved.abs) && fs.statSync(resolved.abs).isDirectory()) {
+        runCwd = resolved.abs;
+      }
+    } catch {}
+  }
+  const script = String(command || code || '').trim();
+  if (!script) throw new Error('Command or code is required to start a background server');
+  const l = String(language || 'bash').toLowerCase();
+  const isWin = process.platform === 'win32';
+  const venv = detectWorkspaceVenv(ws) || (runCwd !== ws ? detectWorkspaceVenv(runCwd) : null);
+  const env = { ...process.env };
+  if (venv) {
+    env.VIRTUAL_ENV = venv.venvDir;
+    env.PATH = `${venv.binDir}${path.delimiter}${env.PATH || ''}`;
+  }
+
+  let bin;
+  let args;
+  let stdinPayload = '';
+  if (l === 'python' || l === 'py' || l === 'python3') {
+    bin = venv ? venv.pythonBin : (isWin ? 'python' : 'python3');
+    args = ['-u', '-'];
+    stdinPayload = script + '\n';
+  } else if (l === 'javascript' || l === 'js' || l === 'node') {
+    bin = 'node';
+    args = ['-'];
+    stdinPayload = script + '\n';
+  } else if (isWin) {
+    bin = 'powershell.exe';
+    args = ['-NoProfile', '-NonInteractive', '-Command', script];
+  } else {
+    bin = 'bash';
+    args = ['-c', script];
+  }
+
+  const entry = {
+    id: serverId,
+    title: String(title || script.slice(0, 60)),
+    command: script,
+    language: l,
+    cwd: runCwd,
+    pid: null,
+    startedAt: Date.now(),
+    status: 'running',
+    exitCode: null,
+    logs: '',
+    urls: [],
+    child: null,
+  };
+
+  const MAX_LOG = 24000;
+  const appendLog = (chunk) => {
+    entry.logs += chunk;
+    if (entry.logs.length > MAX_LOG) entry.logs = entry.logs.slice(-MAX_LOG);
+    for (const m of chunk.matchAll(/https?:\/\/(?:localhost|127\.0\.0\.1|0\.0\.0\.0|\[::1\]):\d+[^\s"'<>)]*/gi)) {
+      const u = m[0].replace('0.0.0.0', 'localhost');
+      if (!entry.urls.includes(u)) entry.urls.push(u);
+    }
+    onOutput?.({ runId: serverId, stream: 'stdout', chunk });
+  };
+
+  const child = spawn(bin, args, {
+    cwd: runCwd,
+    env,
+    stdio: ['pipe', 'pipe', 'pipe'],
+    windowsHide: true,
+    detached: !isWin,
+  });
+  entry.child = child;
+  entry.pid = child.pid || null;
+  ACTIVE_SERVERS.set(serverId, entry);
+
+  child.stdout.on('data', (b) => appendLog(b.toString('utf8')));
+  child.stderr.on('data', (b) => appendLog(b.toString('utf8')));
+  child.on('error', (err) => {
+    appendLog(`\n[server error: ${err.message}]\n`);
+    entry.status = 'error';
+  });
+  child.on('close', (code) => {
+    entry.exitCode = typeof code === 'number' ? code : -1;
+    if (entry.status === 'running') entry.status = code === 0 ? 'stopped' : 'error';
+  });
+
+  if (stdinPayload) {
+    try {
+      child.stdin.write(stdinPayload);
+      child.stdin.end();
+    } catch {}
+  }
+
+  // Wait briefly for initial startup logs / listening URL (or early crash)
+  const deadline = Date.now() + Math.max(300, Math.min(5000, Number(waitReadyMs) || 1800));
+  while (Date.now() < deadline && entry.status === 'running' && entry.urls.length === 0) {
+    await new Promise((r) => setTimeout(r, 150));
+  }
+
+  return {
+    ok: entry.status === 'running',
+    id: entry.id,
+    title: entry.title,
+    pid: entry.pid,
+    cwd: entry.cwd,
+    status: entry.status,
+    exitCode: entry.exitCode,
+    urls: [...entry.urls],
+    logs: entry.logs.slice(-4000),
+  };
+}
+
+function listServers() {
+  return [...ACTIVE_SERVERS.values()].map((s) => ({
+    id: s.id,
+    title: s.title,
+    pid: s.pid,
+    cwd: s.cwd,
+    status: s.status,
+    exitCode: s.exitCode,
+    urls: [...s.urls],
+    startedAt: s.startedAt,
+    logBytes: s.logs.length,
+  }));
+}
+
+function readServerLogs(serverId, tailChars = 6000) {
+  const entry = ACTIVE_SERVERS.get(serverId);
+  if (!entry) throw new Error(`Background server not found: ${serverId}`);
+  return {
+    id: entry.id,
+    title: entry.title,
+    pid: entry.pid,
+    status: entry.status,
+    exitCode: entry.exitCode,
+    urls: [...entry.urls],
+    logs: entry.logs.slice(-Math.max(500, Math.min(20000, Number(tailChars) || 6000))),
+  };
+}
+
+async function stopServer(serverId) {
+  const entry = ACTIVE_SERVERS.get(serverId);
+  if (!entry) return { ok: false, error: `Server not found: ${serverId}` };
+  entry.status = 'stopped';
+  if (entry.child?.pid) {
+    if (process.platform === 'win32') {
+      try { await execFileAsync('taskkill', ['/pid', String(entry.child.pid), '/T', '/F'], 4000); } catch {}
+    } else {
+      try { process.kill(-entry.child.pid, 'SIGTERM'); } catch {}
+      try { entry.child.kill('SIGKILL'); } catch {}
+    }
+  }
+  return { ok: true, id: serverId, title: entry.title, status: 'stopped' };
+}
+
+async function stopAllServers() {
+  const ids = [...ACTIVE_SERVERS.keys()];
+  for (const id of ids) {
+    try { await stopServer(id); } catch {}
+  }
+  ACTIVE_SERVERS.clear();
+}
+
 module.exports = {
   IMAGE_PRESETS,
   detectRuntimes,
+  detectWorkspaceVenv,
+  assessCommandRisk,
   defaultImageForLanguage,
   runInContainer,
   runOnHost,
   stopContainerRun,
+  startServer,
+  listServers,
+  readServerLogs,
+  stopServer,
+  stopAllServers,
 };

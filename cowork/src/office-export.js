@@ -380,16 +380,39 @@ function buildXlsxBuffer(sheetsInput) {
     const colWidths = [];
 
     const rowXml = rows.map((r, rIdx) => {
-      const cellsXml = (Array.isArray(r) ? r : [r]).map((val, cIdx) => {
+      const rowArr = Array.isArray(r) ? r : [r];
+      const firstCell = String(rowArr[0] ?? '').trim();
+      const isTotalRow = rIdx > 0 && /^(total|sum|subtotal|gesamt|summe)\b/i.test(firstCell);
+      const cellsXml = rowArr.map((val, cIdx) => {
         const str = String(val ?? '');
         colWidths[cIdx] = Math.min(52, Math.max(colWidths[cIdx] || 10, str.length + 3));
         const ref = `${colLetter(cIdx)}${rIdx + 1}`;
-        const styleAttr = rIdx === 0 ? ' s="1"' : '';
-        const numClean = str.replace(/,/g, '');
-        if (rIdx > 0 && /^-?\d+(?:\.\d+)?$/.test(numClean) && numClean.length <= 15) {
-          return `<c r="${ref}"${styleAttr}><v>${numClean}</v></c>`;
+        const baseStyle = rIdx === 0 ? 1 : (isTotalRow ? 2 : 0);
+        if (str.startsWith('=') && str.length > 1) {
+          return `<c r="${ref}" s="${baseStyle}"><f>${xmlEsc(str.slice(1))}</f></c>`;
         }
-        return `<c r="${ref}" t="inlineStr"${styleAttr}><is><t xml:space="preserve">${xmlEsc(str)}</t></is></c>`;
+        if (rIdx > 0) {
+          const eurM = str.match(/^€\s*(-?\d[\d,]*(?:\.\d+)?)$/) || str.match(/^(-?\d[\d,]*(?:\.\d+)?)\s*€$/);
+          if (eurM) {
+            const n = eurM[1].replace(/,/g, '');
+            return `<c r="${ref}" s="${isTotalRow ? 6 : 3}"><v>${n}</v></c>`;
+          }
+          const usdM = str.match(/^\$\s*(-?\d[\d,]*(?:\.\d+)?)$/);
+          if (usdM) {
+            const n = usdM[1].replace(/,/g, '');
+            return `<c r="${ref}" s="${isTotalRow ? 7 : 4}"><v>${n}</v></c>`;
+          }
+          const pctM = str.match(/^(-?\d+(?:\.\d+)?)\s*%$/);
+          if (pctM) {
+            const n = (Number(pctM[1]) / 100).toString();
+            return `<c r="${ref}" s="5"><v>${n}</v></c>`;
+          }
+          const numClean = str.replace(/,/g, '');
+          if (/^-?\d+(?:\.\d+)?$/.test(numClean) && numClean.length <= 15) {
+            return `<c r="${ref}" s="${baseStyle}"><v>${numClean}</v></c>`;
+          }
+        }
+        return `<c r="${ref}" t="inlineStr" s="${baseStyle}"><is><t xml:space="preserve">${xmlEsc(str)}</t></is></c>`;
       }).join('');
       return `<row r="${rIdx + 1}">${cellsXml}</row>`;
     }).join('');
@@ -397,11 +420,19 @@ function buildXlsxBuffer(sheetsInput) {
     const colsXml = colWidths.length
       ? `<cols>${colWidths.map((w, i) => `<col min="${i + 1}" max="${i + 1}" width="${w}" customWidth="1"/>`).join('')}</cols>`
       : '';
+    const sheetViewsXml = rows.length > 1
+      ? `<sheetViews><sheetView${idx === 0 ? ' tabSelected="1"' : ''} workbookViewId="0"><pane ySplit="1" topLeftCell="A2" activePane="bottomLeft" state="frozen"/></sheetView></sheetViews>`
+      : '';
+    const autoFilterXml = rows.length > 1 && colWidths.length > 0
+      ? `<autoFilter ref="A1:${colLetter(colWidths.length - 1)}1"/>`
+      : '';
 
     const wsXml = `<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
 <worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main">
+  ${sheetViewsXml}
   ${colsXml}
   <sheetData>${rowXml}</sheetData>
+  ${autoFilterXml}
 </worksheet>`;
 
     const sheetId = idx + 1;
@@ -424,20 +455,36 @@ function buildXlsxBuffer(sheetsInput) {
 
   const stylesXml = `<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
 <styleSheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main">
+  <numFmts count="3">
+    <numFmt numFmtId="164" formatCode="€#,##0.00"/>
+    <numFmt numFmtId="165" formatCode="$#,##0.00"/>
+    <numFmt numFmtId="166" formatCode="0.0%"/>
+  </numFmts>
   <fonts count="2">
     <font><sz val="11"/><name val="Calibri"/></font>
     <font><b/><sz val="11"/><color rgb="FF1F1E1C"/><name val="Calibri"/></font>
   </fonts>
-  <fills count="3">
+  <fills count="4">
     <fill><patternFill patternType="none"/></fill>
     <fill><patternFill patternType="gray125"/></fill>
     <fill><patternFill patternType="solid"><fgColor rgb="FFF3ECE6"/></patternFill></fill>
+    <fill><patternFill patternType="solid"><fgColor rgb="FFF7F4EE"/></patternFill></fill>
   </fills>
-  <borders count="1"><border><left/><right/><top/><bottom/><diagonal/></border></borders>
+  <borders count="3">
+    <border><left/><right/><top/><bottom/><diagonal/></border>
+    <border><left style="thin"><color rgb="FFE6E2D8"/></left><right style="thin"><color rgb="FFE6E2D8"/></right><top style="thin"><color rgb="FFE6E2D8"/></top><bottom style="thin"><color rgb="FFE6E2D8"/></bottom><diagonal/></border>
+    <border><left/><right/><top style="thin"><color rgb="FFB54E2D"/></top><bottom style="double"><color rgb="FFB54E2D"/></bottom><diagonal/></border>
+  </borders>
   <cellStyleXfs count="1"><xf numFmtId="0" fontId="0" fillId="0" borderId="0"/></cellStyleXfs>
-  <cellXfs count="2">
-    <xf numFmtId="0" fontId="0" fillId="0" borderId="0" xfId="0"/>
-    <xf numFmtId="0" fontId="1" fillId="2" borderId="0" xfId="0" applyFont="1" applyFill="1"/>
+  <cellXfs count="8">
+    <xf numFmtId="0" fontId="0" fillId="0" borderId="1" xfId="0" applyBorder="1"/>
+    <xf numFmtId="0" fontId="1" fillId="2" borderId="1" xfId="0" applyFont="1" applyFill="1" applyBorder="1"/>
+    <xf numFmtId="0" fontId="1" fillId="3" borderId="2" xfId="0" applyFont="1" applyFill="1" applyBorder="1"/>
+    <xf numFmtId="164" fontId="0" fillId="0" borderId="1" xfId="0" applyNumberFormat="1" applyBorder="1"/>
+    <xf numFmtId="165" fontId="0" fillId="0" borderId="1" xfId="0" applyNumberFormat="1" applyBorder="1"/>
+    <xf numFmtId="166" fontId="0" fillId="0" borderId="1" xfId="0" applyNumberFormat="1" applyBorder="1"/>
+    <xf numFmtId="164" fontId="1" fillId="3" borderId="2" xfId="0" applyNumberFormat="1" applyFont="1" applyFill="1" applyBorder="1"/>
+    <xf numFmtId="165" fontId="1" fillId="3" borderId="2" xfId="0" applyNumberFormat="1" applyFont="1" applyFill="1" applyBorder="1"/>
   </cellXfs>
 </styleSheet>`;
 
@@ -524,7 +571,7 @@ function colLettersToIndex(letters) {
   return Math.max(0, idx - 1);
 }
 
-function parseXlsxBuffer(buf) {
+function parseXlsxBuffer(buf, { preserveFormulas = false } = {}) {
   const entries = readZipEntries(buf);
   const sharedStrings = [];
   const ssBuf = entries.get('xl/sharedStrings.xml');
@@ -578,8 +625,12 @@ function parseXlsxBuffer(buf) {
 
         const tM = cAttr.match(/\bt="([^"]+)"/i);
         const cellType = tM ? tM[1] : '';
+        const fM = cBody.match(/<f(?:\s[^>]*)?>([\s\S]*?)<\/f>/i);
+        const formulaStr = fM ? `=${xmlUnesc(fM[1]).trim()}` : '';
         let val = '';
-        if (cellType === 'inlineStr') {
+        if (preserveFormulas && formulaStr) {
+          val = formulaStr;
+        } else if (cellType === 'inlineStr') {
           val = [...cBody.matchAll(/<t(?:\s[^>]*)?>([\s\S]*?)<\/t>/gi)].map((x) => xmlUnesc(x[1])).join('');
         } else {
           const vM = cBody.match(/<v[^>]*>([\s\S]*?)<\/v>/i);
@@ -591,6 +642,7 @@ function parseXlsxBuffer(buf) {
           } else {
             val = rawV;
           }
+          if (!val && formulaStr) val = formulaStr;
         }
         cells[colIdx] = val;
       }
@@ -629,6 +681,25 @@ function serializeCsv(rows, delimiter = ',') {
   ).join('\n') + '\n';
 }
 
+function parseCellRef(ref) {
+  const m = String(ref || '').trim().match(/^([A-Z]+)(\d+)$/i);
+  if (!m) return null;
+  return { row: Math.max(0, Number(m[2]) - 1), col: colLettersToIndex(m[1]) };
+}
+
+function resolveColIndex(col, headers = []) {
+  if (typeof col === 'number' && Number.isFinite(col)) return Math.max(0, Math.floor(col));
+  const s = String(col ?? '').trim();
+  if (/^\d+$/.test(s)) return Math.max(0, Number(s));
+  if (/^[A-Z]{1,3}$/i.test(s)) {
+    const byHeader = headers.findIndex((h) => String(h || '').trim().toLowerCase() === s.toLowerCase());
+    if (byHeader >= 0) return byHeader;
+    return colLettersToIndex(s);
+  }
+  const byHeader = headers.findIndex((h) => String(h || '').trim().toLowerCase() === s.toLowerCase());
+  return byHeader >= 0 ? byHeader : 0;
+}
+
 function applyTableOperations(rowsInput, operations = []) {
   const rows = (rowsInput || []).map((r) => [...r]);
   const applied = [];
@@ -644,15 +715,31 @@ function applyTableOperations(rowsInput, operations = []) {
   for (const op of operations || []) {
     if (!op || !op.op) continue;
     const kind = String(op.op).toLowerCase();
-    if (kind === 'set_cell' || kind === 'update_cell') {
-      const rIdx = Math.max(0, Number(op.row) || 0);
-      const cIdx = typeof op.col === 'string' && /^[A-Z]+$/i.test(op.col)
-        ? colLettersToIndex(op.col)
-        : Math.max(0, Number(op.col) || 0);
+    if (kind === 'set_cell' || kind === 'update_cell' || kind === 'set_formula') {
+      const refParsed = op.cell ? parseCellRef(op.cell) : null;
+      const rIdx = refParsed ? refParsed.row : Math.max(0, Number(op.row) || 0);
+      const cIdx = refParsed ? refParsed.col : resolveColIndex(op.col, rows[0] || []);
       ensureSize(rIdx, cIdx);
       const prev = rows[rIdx][cIdx];
-      rows[rIdx][cIdx] = String(op.value ?? '');
+      let val = String(op.formula ?? op.value ?? '');
+      if (kind === 'set_formula' && val && !val.startsWith('=')) val = '=' + val;
+      rows[rIdx][cIdx] = val;
       applied.push({ op: 'set_cell', row: rIdx, col: cIdx, prev, value: rows[rIdx][cIdx], note: op.note || '' });
+    } else if (kind === 'set_range') {
+      const refParsed = op.cell ? parseCellRef(op.cell) : null;
+      const startRow = refParsed ? refParsed.row : Math.max(0, Number(op.startRow ?? op.row) || 0);
+      const startCol = refParsed ? refParsed.col : resolveColIndex(op.startCol ?? op.col ?? 0, rows[0] || []);
+      const grid = Array.isArray(op.values) ? op.values : [];
+      let count = 0;
+      for (let dr = 0; dr < grid.length; dr++) {
+        const rowVals = Array.isArray(grid[dr]) ? grid[dr] : [grid[dr]];
+        for (let dc = 0; dc < rowVals.length; dc++) {
+          ensureSize(startRow + dr, startCol + dc);
+          rows[startRow + dr][startCol + dc] = String(rowVals[dc] ?? '');
+          count++;
+        }
+      }
+      applied.push({ op: 'set_range', row: startRow, col: startCol, count, note: op.note || '' });
     } else if (kind === 'add_column') {
       const colIdx = rows[0]?.length || 0;
       const header = String(op.header || `Column ${colIdx + 1}`);
@@ -665,6 +752,23 @@ function applyTableOperations(rowsInput, operations = []) {
         rows[r][colIdx] = String(vals[r - 1] ?? '');
       }
       applied.push({ op: 'add_column', col: colIdx, header, count: vals.length, note: op.note || '' });
+    } else if (kind === 'rename_column') {
+      if (rows.length) {
+        const cIdx = resolveColIndex(op.col, rows[0] || []);
+        ensureSize(0, cIdx);
+        rows[0][cIdx] = String(op.header ?? op.value ?? '');
+        applied.push({ op: 'rename_column', col: cIdx, header: rows[0][cIdx], note: op.note || '' });
+      }
+    } else if (kind === 'delete_column') {
+      if (rows.length) {
+        const cIdx = resolveColIndex(op.col, rows[0] || []);
+        if (cIdx >= 0 && cIdx < (rows[0]?.length || 0)) {
+          for (const r of rows) {
+            if (cIdx < r.length) r.splice(cIdx, 1);
+          }
+          applied.push({ op: 'delete_column', col: cIdx, note: op.note || '' });
+        }
+      }
     } else if (kind === 'add_row') {
       const vals = Array.isArray(op.values) ? op.values.map((v) => String(v ?? '')) : [];
       const rIdx = rows.length;
@@ -673,15 +777,130 @@ function applyTableOperations(rowsInput, operations = []) {
       vals.forEach((v, i) => { newRow[i] = v; });
       rows.push(newRow);
       applied.push({ op: 'add_row', row: rIdx, values: newRow, note: op.note || '' });
+    } else if (kind === 'insert_row') {
+      const vals = Array.isArray(op.values) ? op.values.map((v) => String(v ?? '')) : [];
+      const rIdx = Math.max(0, Math.min(rows.length, Number(op.row) || rows.length));
+      const cols = Math.max(rows[0]?.length || 0, vals.length);
+      const newRow = new Array(cols).fill('');
+      vals.forEach((v, i) => { newRow[i] = v; });
+      rows.splice(rIdx, 0, newRow);
+      applied.push({ op: 'insert_row', row: rIdx, values: newRow, note: op.note || '' });
     } else if (kind === 'delete_row') {
       const rIdx = Number(op.row);
       if (rIdx >= 1 && rIdx < rows.length) {
         rows.splice(rIdx, 1);
         applied.push({ op: 'delete_row', row: rIdx, note: op.note || '' });
       }
+    } else if (kind === 'sort_rows') {
+      if (rows.length > 2) {
+        const cIdx = resolveColIndex(op.col, rows[0] || []);
+        const desc = String(op.direction || 'asc').toLowerCase() === 'desc';
+        const header = rows[0];
+        const body = rows.slice(1);
+        const parseNum = (v) => {
+          const clean = String(v ?? '').replace(/[€$£,\s%]/g, '');
+          return clean !== '' && /^-?\d+(?:\.\d+)?$/.test(clean) ? Number(clean) : NaN;
+        };
+        body.sort((a, b) => {
+          const av = a[cIdx] ?? '';
+          const bv = b[cIdx] ?? '';
+          const an = parseNum(av);
+          const bn = parseNum(bv);
+          let cmp;
+          if (!Number.isNaN(an) && !Number.isNaN(bn)) cmp = an - bn;
+          else cmp = String(av).localeCompare(String(bv), undefined, { numeric: true, sensitivity: 'base' });
+          return desc ? -cmp : cmp;
+        });
+        rows.splice(0, rows.length, header, ...body);
+        applied.push({ op: 'sort_rows', col: cIdx, direction: desc ? 'desc' : 'asc', note: op.note || '' });
+      }
     }
   }
   return { rows, applied };
+}
+
+function applyWorkbookOperations(sheetsInput, defaultSheetIndex = 0, operations = []) {
+  const sheets = (Array.isArray(sheetsInput) && sheetsInput.length
+    ? sheetsInput
+    : [{ name: 'Sheet1', rows: [['']] }]
+  ).map((s, i) => ({
+    name: s.name || `Sheet${i + 1}`,
+    rows: (s.rows || []).map((r) => [...r]),
+  }));
+  let activeIdx = Math.max(0, Math.min(sheets.length - 1, Number(defaultSheetIndex) || 0));
+  const applied = [];
+
+  for (const op of operations || []) {
+    if (!op || !op.op) continue;
+    const kind = String(op.op).toLowerCase();
+    if (kind === 'add_sheet') {
+      const name = String(op.name || `Sheet${sheets.length + 1}`).trim().slice(0, 31) || `Sheet${sheets.length + 1}`;
+      const initRows = Array.isArray(op.rows) && op.rows.length
+        ? op.rows.map((r) => (Array.isArray(r) ? r.map((v) => String(v ?? '')) : [String(r ?? '')]))
+        : [['']];
+      sheets.push({ name, rows: initRows });
+      activeIdx = sheets.length - 1;
+      applied.push({ op: 'add_sheet', sheetIndex: activeIdx, name, note: op.note || '' });
+    } else if (kind === 'rename_sheet') {
+      const idx = op.sheetIndex !== undefined
+        ? Math.max(0, Math.min(sheets.length - 1, Number(op.sheetIndex) || 0))
+        : activeIdx;
+      const name = String(op.name || sheets[idx].name).trim().slice(0, 31);
+      if (name) {
+        sheets[idx].name = name;
+        applied.push({ op: 'rename_sheet', sheetIndex: idx, name, note: op.note || '' });
+      }
+    } else {
+      let targetIdx = activeIdx;
+      if (op.sheetName) {
+        const found = sheets.findIndex((s) => s.name.toLowerCase() === String(op.sheetName).toLowerCase());
+        if (found >= 0) targetIdx = found;
+      } else if (op.sheetIndex !== undefined) {
+        targetIdx = Math.max(0, Math.min(sheets.length - 1, Number(op.sheetIndex) || 0));
+      }
+      const res = applyTableOperations(sheets[targetIdx].rows, [op]);
+      sheets[targetIdx].rows = res.rows;
+      applied.push(...res.applied);
+    }
+  }
+
+  return {
+    sheets,
+    sheetIndex: activeIdx,
+    rows: sheets[activeIdx].rows,
+    applied,
+  };
+}
+
+function summarizeTable(rows = []) {
+  if (!Array.isArray(rows) || !rows.length) return '';
+  const headers = rows[0] || [];
+  const dataRows = rows.slice(1);
+  if (!dataRows.length) return `Columns (${headers.length}): ${headers.join(', ')}`;
+  const colSummaries = headers.slice(0, 20).map((h, cIdx) => {
+    const nums = [];
+    let nonEmpty = 0;
+    let formulaCount = 0;
+    for (const r of dataRows) {
+      const raw = String(r[cIdx] ?? '').trim();
+      if (!raw) continue;
+      nonEmpty++;
+      if (raw.startsWith('=')) { formulaCount++; continue; }
+      const clean = raw.replace(/[€$£,\s%]/g, '');
+      if (clean && /^-?\d+(?:\.\d+)?$/.test(clean)) nums.push(Number(clean));
+    }
+    const label = `${colLetter(cIdx)} ("${String(h || `Col${cIdx + 1}`).slice(0, 24)}")`;
+    if (nums.length >= Math.max(2, Math.floor(nonEmpty * 0.6))) {
+      const sum = nums.reduce((a, b) => a + b, 0);
+      const min = Math.min(...nums);
+      const max = Math.max(...nums);
+      const avg = sum / nums.length;
+      const fmt = (n) => Number.isInteger(n) ? n.toString() : n.toFixed(2);
+      return `${label}: numeric n=${nums.length}, sum=${fmt(sum)}, avg=${fmt(avg)}, min=${fmt(min)}, max=${fmt(max)}${formulaCount ? `, formulas=${formulaCount}` : ''}`;
+    }
+    return `${label}: text/mixed nonEmpty=${nonEmpty}${formulaCount ? `, formulas=${formulaCount}` : ''}`;
+  });
+  return `Table Summary (${dataRows.length} data rows × ${headers.length} cols):\n  - ` + colSummaries.join('\n  - ');
 }
 
 // ---- RFC-5545 Calendar Invite (.ics) Generator
@@ -824,6 +1043,8 @@ module.exports = {
   serializeCsv,
   parseXlsxBuffer,
   applyTableOperations,
+  applyWorkbookOperations,
+  summarizeTable,
   colLetter,
   buildIcsText,
   buildPrintableHtml,

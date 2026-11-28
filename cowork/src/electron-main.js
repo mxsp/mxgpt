@@ -616,23 +616,14 @@ function registerIpc() {
       }
 
       if (result.tableEdits?.length && autoAcceptEdits) {
+        const curWs = activeProj?.path || localFiles.getWorkspace();
         for (const te of result.tableEdits) {
           try {
-            const parsed = await localFiles.parseTableFile(te.path);
-            const sIdx = Math.max(0, Math.min((parsed.sheets?.length || 1) - 1, Number(te.sheetIndex) || 0));
-            const sheetRows = parsed.sheets?.[sIdx]?.rows || parsed.rows || [];
-            const { rows: nextRows, applied } = officeExport.applyTableOperations(sheetRows, te.operations || []);
-            const saved = await localFiles.saveTableFile({
-              path: te.path,
-              rows: nextRows,
-              sheets: parsed.sheets,
-              sheetIndex: sIdx,
-              delimiter: parsed.delimiter,
-            });
+            const saved = await localFiles.applyTableEditToFile(te, curWs);
             te.status = 'applied';
-            te.appliedCount = applied.length;
+            te.appliedCount = saved.applied.length;
             te.undoId = saved.undoId;
-            te.result = `Applied ${applied.length} edit(s) to ${te.path}`;
+            te.result = saved.summary;
           } catch (e) {
             te.status = 'error';
             te.result = e.message;
@@ -642,7 +633,7 @@ function registerIpc() {
       }
 
       const autoRound = Math.max(0, Number(payload?.autoRound) || 0);
-      const MAX_AUTO_ROUNDS = 8;
+      const MAX_AUTO_ROUNDS = 10;
       let autoContinuePrompt = '';
       let autoContinueHarnessMeta = null;
 
@@ -660,6 +651,8 @@ function registerIpc() {
               language: cr.language,
               code: cr.code,
               command: cr.command,
+              cwd: cr.cwd,
+              timeoutSec: cr.timeoutSec,
               image: cr.image,
               network: cr.network,
               mountMode: cr.mountMode,
@@ -706,21 +699,27 @@ function registerIpc() {
             : `Code execution finished successfully:\n\n${summaryBlocks}\n\nContinue from this output — present the final result clearly or perform the next needed step (do not re-run the same script if the task is complete).`;
         }
       } else if (
-        autoAcceptEdits && autoRunContainer &&
-        result.fileActions?.length &&
-        result.wasAutoSynthesized &&
+        autoAcceptEdits &&
+        ((result.fileActions?.length && (result.wasAutoSynthesized || result.fileActions.some((a) => a.status === 'error'))) ||
+         (result.tableEdits?.length && (result.wasAutoSynthesized || result.tableEdits.some((t) => t.status === 'error')))) &&
         !controller.signal.aborted &&
         autoRound < MAX_AUTO_ROUNDS
       ) {
-        const appliedList = result.fileActions.map((a) => `${a.status === 'applied' ? '✓' : '✗'} ${a.type} ${a.path || a.to || a.from}${a.result ? ` (${a.result})` : ''}`).join('\n');
-        const anyFail = result.fileActions.some((a) => a.status === 'error');
+        const appliedLines = [
+          ...(result.fileActions || []).map((a) => `${a.status === 'applied' ? '✓' : '✗'} ${a.type} ${a.path || a.to || a.from}${a.result ? ` (${a.result})` : ''}`),
+          ...(result.tableEdits || []).map((t) => `${t.status === 'applied' ? '✓' : '✗'} table ${t.path}${t.result ? ` (${t.result})` : ''}`),
+        ].join('\n');
+        const totalOps = (result.fileActions?.length || 0) + (result.tableEdits?.length || 0);
+        const anyFail = (result.fileActions || []).some((a) => a.status === 'error') || (result.tableEdits || []).some((t) => t.status === 'error');
         autoContinueHarnessMeta = {
           status: anyFail ? 'error' : 'ok',
-          label: anyFail ? 'File Actions Had Errors' : 'File Actions Applied',
-          title: `${result.fileActions.length} file action${result.fileActions.length > 1 ? 's' : ''}`,
-          output: appliedList,
+          label: anyFail ? 'Edits Had Errors' : 'Edits Applied',
+          title: `${totalOps} edit${totalOps > 1 ? 's' : ''}`,
+          output: appliedLines,
         };
-        autoContinuePrompt = `File actions applied automatically:\n\`\`\`\n${appliedList}\n\`\`\`\nContinue with the next step (e.g. launch, run, or verify via run_code if requested), or present the final summary if everything requested is complete.`;
+        autoContinuePrompt = anyFail
+          ? `Some file/spreadsheet edits failed:\n\`\`\`\n${appliedLines}\n\`\`\`\nInspect the file (read_file / inspect_spreadsheet), fix the failed edit, and continue.`
+          : `Edits applied automatically:\n\`\`\`\n${appliedLines}\n\`\`\`\nContinue with the next step (e.g. run tests or verify via run_code if requested), or present the final summary if everything requested is complete.`;
       }
 
       const assistantMsg = {
@@ -923,19 +922,7 @@ function registerIpc() {
   ipcMain.handle('files:parseTable', (_, relPath) => localFiles.parseTableFile(relPath || ''));
   ipcMain.handle('files:saveTable', (_, opts) => localFiles.saveTableFile(opts || {}));
   ipcMain.handle('files:applyTableEdits', async (_, te) => {
-    if (!te?.path || !Array.isArray(te.operations)) throw new Error('Invalid table edit payload');
-    const parsed = await localFiles.parseTableFile(te.path);
-    const sIdx = Math.max(0, Math.min((parsed.sheets?.length || 1) - 1, Number(te.sheetIndex) || 0));
-    const sheetRows = parsed.sheets?.[sIdx]?.rows || parsed.rows || [];
-    const { rows: nextRows, applied } = officeExport.applyTableOperations(sheetRows, te.operations);
-    const saved = await localFiles.saveTableFile({
-      path: te.path,
-      rows: nextRows,
-      sheets: parsed.sheets,
-      sheetIndex: sIdx,
-      delimiter: parsed.delimiter,
-    });
-    return { ok: true, rows: nextRows, applied, undoId: saved.undoId, summary: `Applied ${applied.length} edit(s) to ${te.path}` };
+    return localFiles.applyTableEditToFile(te);
   });
   ipcMain.handle('files:officeList', async () => ({ files: await localFiles.listOfficeFiles() }));
 

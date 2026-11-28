@@ -21,6 +21,7 @@ const localTools = require('./local-tools');
 const diffEngine = require('./diff-engine');
 const piiShield = require('./pii-shield');
 const docIndex = require('./doc-index');
+const officeExport = require('./office-export');
 
 const ROLE_META = {
   web_research: { role: 'researcher', label: 'Web Search' },
@@ -69,7 +70,7 @@ async function extractSpecialBlocks(markdown, toolsCfg, stdExecTarget = '') {
         const arr = JSON.parse(actionsMatch[1].trim());
         if (Array.isArray(arr)) {
           const rawActs = arr
-            .filter((a) => a && a.type && ['mkdir', 'write', 'create', 'move', 'rename', 'copy', 'delete'].includes(String(a.type).toLowerCase()))
+            .filter((a) => a && a.type && ['mkdir', 'write', 'create', 'patch', 'edit', 'write_docx', 'write_ics', 'move', 'rename', 'copy', 'delete'].includes(String(a.type).toLowerCase()))
             .slice(0, 30);
           for (let i = 0; i < rawActs.length; i++) {
             const a = rawActs[i];
@@ -80,6 +81,13 @@ async function extractSpecialBlocks(markdown, toolsCfg, stdExecTarget = '') {
               from: a.from ? String(a.from) : '',
               to: a.to ? String(a.to) : '',
               content: typeof a.content === 'string' ? a.content : undefined,
+              oldText: typeof (a.oldText ?? a.old_text) === 'string' ? String(a.oldText ?? a.old_text) : undefined,
+              newText: typeof (a.newText ?? a.new_text) === 'string' ? String(a.newText ?? a.new_text) : undefined,
+              replaceAll: Boolean(a.replaceAll || a.replace_all),
+              title: a.title ? String(a.title) : undefined,
+              start: a.start ? String(a.start) : undefined,
+              durationMin: a.durationMin ? Number(a.durationMin) : undefined,
+              location: a.location ? String(a.location) : undefined,
               reason: String(a.reason || '').slice(0, 180),
               status: 'pending',
             };
@@ -127,6 +135,8 @@ async function extractSpecialBlocks(markdown, toolsCfg, stdExecTarget = '') {
             image: String(item.image || containerRunner.defaultImageForLanguage(lang, cfg.containerImage)),
             code: typeof item.code === 'string' ? item.code : '',
             command: typeof item.command === 'string' ? item.command : '',
+            cwd: item.cwd ? String(item.cwd).trim() : '',
+            timeoutSec: item.timeoutSec || item.timeout_sec ? Number(item.timeoutSec || item.timeout_sec) : 0,
             network: item.network === 'bridge' ? 'bridge' : (cfg.containerNetwork || 'none'),
             mountMode: item.mountMode === 'ro' ? 'ro' : (cfg.containerMountMode || 'rw'),
             execTarget: resolvedTarget,
@@ -183,14 +193,104 @@ async function extractSpecialBlocks(markdown, toolsCfg, stdExecTarget = '') {
   };
 }
 
+const READ_ONLY_TOOL_NAMES = new Set([
+  'read_file',
+  'list_dir',
+  'search_files',
+  'git_inspect',
+  'inspect_spreadsheet',
+]);
+
 function buildNativeTools(toolsCfg, resolvedExecTarget = 'container') {
   const tools = [];
   if (toolsCfg.osFiles) {
+    // ---- Read-only inspection tools (executed automatically in-turn)
+    tools.push({
+      type: 'function',
+      function: {
+        name: 'read_file',
+        description: 'Read a file in the active workspace with line numbers (supports line ranges for large source files). Always read before patching.',
+        parameters: {
+          type: 'object',
+          properties: {
+            path: { type: 'string', description: 'Relative path inside the workspace, e.g. src/app.js' },
+            start_line: { type: 'integer', description: '1-based start line (default 1)' },
+            end_line: { type: 'integer', description: '1-based end line (default start_line + 199)' },
+          },
+          required: ['path'],
+        },
+      },
+    });
+    tools.push({
+      type: 'function',
+      function: {
+        name: 'list_dir',
+        description: 'List files and folders inside a workspace directory.',
+        parameters: {
+          type: 'object',
+          properties: {
+            path: { type: 'string', description: 'Relative subdirectory path (empty string for workspace root)' },
+          },
+        },
+      },
+    });
+    tools.push({
+      type: 'function',
+      function: {
+        name: 'search_files',
+        description: 'Search filenames and file contents across the workspace (supports code, markdown, CSV, XLSX, DOCX, PDF).',
+        parameters: {
+          type: 'object',
+          properties: {
+            query: { type: 'string', description: 'Search text or symbol name' },
+            path: { type: 'string', description: 'Optional relative subfolder to scope the search' },
+          },
+          required: ['query'],
+        },
+      },
+    });
+    tools.push({
+      type: 'function',
+      function: {
+        name: 'inspect_spreadsheet',
+        description: 'Inspect an .xlsx or .csv file: returns all sheet names, column statistics (sum/avg/min/max), Excel formulas, and a row slice.',
+        parameters: {
+          type: 'object',
+          properties: {
+            path: { type: 'string', description: 'Relative path to .xlsx or .csv file' },
+            sheet_index: { type: 'integer', description: '0-based sheet index (default 0)' },
+            start_row: { type: 'integer', description: '0-based start row (default 0)' },
+            max_rows: { type: 'integer', description: 'Max rows to return (default 60, max 150)' },
+          },
+          required: ['path'],
+        },
+      },
+    });
+
+    // ---- Surgical coding & Office write tools (recorded with 1-click Undo)
+    tools.push({
+      type: 'function',
+      function: {
+        name: 'edit_file',
+        description: 'Surgically edit an existing text/code file by replacing an exact snippet (old_text -> new_text). Prefer this over write_file for existing files.',
+        parameters: {
+          type: 'object',
+          properties: {
+            path: { type: 'string', description: 'Relative path to existing file' },
+            old_text: { type: 'string', description: 'Exact existing snippet to replace (include enough lines to be unique)' },
+            new_text: { type: 'string', description: 'Replacement text' },
+            replace_all: { type: 'boolean', description: 'Replace all occurrences (default false)' },
+            reason: { type: 'string', description: 'Short explanation of the edit' },
+          },
+          required: ['path', 'old_text', 'new_text'],
+        },
+      },
+    });
     tools.push({
       type: 'function',
       function: {
         name: 'write_file',
-        description: 'Create or overwrite a text/code/config file in the active workspace (recorded with 1-click Undo).',
+        description: 'Create a new text/code/config file or fully rewrite a small file in the active workspace (recorded with 1-click Undo).',
         parameters: {
           type: 'object',
           properties: {
@@ -206,15 +306,18 @@ function buildNativeTools(toolsCfg, resolvedExecTarget = 'container') {
       type: 'function',
       function: {
         name: 'file_action',
-        description: 'Perform a workspace filesystem action (mkdir, write, move, rename, copy, or delete).',
+        description: 'Perform a workspace filesystem action (mkdir, write, patch, write_docx, write_ics, move, rename, copy, or delete).',
         parameters: {
           type: 'object',
           properties: {
-            type: { type: 'string', enum: ['mkdir', 'write', 'move', 'rename', 'copy', 'delete'] },
-            path: { type: 'string', description: 'Target relative path (for mkdir/write/delete)' },
+            type: { type: 'string', enum: ['mkdir', 'write', 'patch', 'write_docx', 'write_ics', 'move', 'rename', 'copy', 'delete'] },
+            path: { type: 'string', description: 'Target relative path (for mkdir/write/patch/write_docx/write_ics/delete)' },
             from: { type: 'string', description: 'Source relative path (for move/rename/copy)' },
             to: { type: 'string', description: 'Destination relative path (for move/rename/copy)' },
-            content: { type: 'string', description: 'File contents (for write)' },
+            content: { type: 'string', description: 'File or Markdown contents (for write/write_docx/write_ics)' },
+            old_text: { type: 'string', description: 'Exact text to replace (for patch)' },
+            new_text: { type: 'string', description: 'Replacement text (for patch)' },
+            title: { type: 'string', description: 'Document/event title (for write_docx/write_ics)' },
             reason: { type: 'string' },
           },
           required: ['type'],
@@ -225,20 +328,57 @@ function buildNativeTools(toolsCfg, resolvedExecTarget = 'container') {
       type: 'function',
       function: {
         name: 'edit_table',
-        description: 'Update cells, rows, or columns in an .xlsx or .csv spreadsheet in the workspace.',
+        description: 'Create or edit an .xlsx or .csv spreadsheet in the workspace. Supports Excel formulas (=SUM, =AVERAGE, =IF), A1 cell refs, set_range, add/rename/delete column, add/insert/delete row, sort_rows, and multi-sheet ops (add_sheet, rename_sheet).',
         parameters: {
           type: 'object',
           properties: {
-            path: { type: 'string', description: 'Relative path to .xlsx or .csv file' },
-            sheetIndex: { type: 'integer', description: '0-based sheet index' },
+            path: { type: 'string', description: 'Relative path to .xlsx or .csv file (created automatically if it does not exist)' },
+            sheetIndex: { type: 'integer', description: '0-based sheet index (default 0)' },
+            sheetName: { type: 'string', description: 'Initial sheet name when creating a new workbook' },
             summary: { type: 'string' },
             operations: {
               type: 'array',
               items: { type: 'object' },
-              description: 'List of set_cell / add_column / add_row operations',
+              description: 'Operations: set_cell/set_formula ({op,cell|row,col,value}), set_range ({op,cell|startRow,startCol,values:[[]]}), add_column ({op,header,values}), rename_column ({op,col,header}), delete_column ({op,col}), add_row ({op,values}), insert_row ({op,row,values}), delete_row ({op,row}), sort_rows ({op,col,direction}), add_sheet ({op,name,rows}), rename_sheet ({op,sheetIndex,name})',
             },
           },
           required: ['path', 'operations'],
+        },
+      },
+    });
+    tools.push({
+      type: 'function',
+      function: {
+        name: 'create_office_doc',
+        description: 'Create or update a real Word document (.docx from Markdown) or Calendar Invite (.ics) directly in the workspace (with 1-click Undo).',
+        parameters: {
+          type: 'object',
+          properties: {
+            format: { type: 'string', enum: ['docx', 'ics'], description: 'Office file format' },
+            path: { type: 'string', description: 'Relative output path, e.g. reports/Q1-Summary.docx or invite.ics' },
+            title: { type: 'string', description: 'Document or meeting title' },
+            content: { type: 'string', description: 'Markdown body (headings, tables, bullets, bold) for .docx, or description for .ics' },
+            start: { type: 'string', description: 'ISO start datetime for .ics (optional)' },
+            duration_min: { type: 'integer', description: 'Duration in minutes for .ics (default 30)' },
+            location: { type: 'string', description: 'Meeting location or URL for .ics (optional)' },
+            reason: { type: 'string' },
+          },
+          required: ['format', 'path', 'content'],
+        },
+      },
+    });
+  }
+  if (toolsCfg.git) {
+    tools.push({
+      type: 'function',
+      function: {
+        name: 'git_inspect',
+        description: 'Inspect local Git branch, status, recent commits, and diff in the active workspace.',
+        parameters: {
+          type: 'object',
+          properties: {
+            focus: { type: 'string', description: 'Optional focus, e.g. "diff" to include unified diff patch' },
+          },
         },
       },
     });
@@ -248,13 +388,15 @@ function buildNativeTools(toolsCfg, resolvedExecTarget = 'container') {
       type: 'function',
       function: {
         name: 'run_code',
-        description: `Execute Python, JavaScript (Node.js), or Bash code on the preselected ${resolvedExecTarget === 'host' ? 'On-Machine Host' : 'Isolated Container'} environment in the workspace.`,
+        description: `Execute Python (auto-uses workspace .venv if present), JavaScript (Node.js), Bash, or PowerShell on the preselected ${resolvedExecTarget === 'host' ? 'On-Machine Host' : 'Isolated Container'} environment in the workspace.`,
         parameters: {
           type: 'object',
           properties: {
             title: { type: 'string', description: 'Short label for this execution' },
-            language: { type: 'string', enum: ['python', 'javascript', 'bash'] },
+            language: { type: 'string', enum: ['python', 'javascript', 'bash', 'powershell'] },
             code: { type: 'string', description: 'Executable script or command' },
+            cwd: { type: 'string', description: 'Optional relative subdirectory inside the workspace' },
+            timeout_sec: { type: 'integer', description: 'Optional timeout in seconds (5-300, default 60 on host)' },
             reason: { type: 'string', description: 'Why this code should run' },
           },
           required: ['language', 'code'],
@@ -283,6 +425,178 @@ function buildNativeTools(toolsCfg, resolvedExecTarget = 'container') {
   return tools;
 }
 
+async function executeReadOnlyTool(tc, { workspace, onEvent }) {
+  const name = String(tc?.name || '').toLowerCase();
+  const args = tc?.args && typeof tc.args === 'object' ? tc.args : {};
+  const id = storage.newId('rt');
+  const startedAt = Date.now();
+  const labelMap = {
+    read_file: 'Read File',
+    list_dir: 'List Folder',
+    search_files: 'Search Workspace',
+    git_inspect: 'Git Inspect',
+    inspect_spreadsheet: 'Inspect Spreadsheet',
+  };
+  const taskTitle = args.path || args.query || args.focus || labelMap[name] || name;
+  onEvent?.('worker_start', {
+    id,
+    type: name,
+    role: name === 'git_inspect' ? 'coder' : 'reader',
+    label: labelMap[name] || name,
+    model: 'local',
+    task: String(taskTitle).slice(0, 180),
+    startedAt,
+  });
+
+  try {
+    let out = '';
+    if (name === 'read_file') {
+      const r = await localFiles.readFileLines(args.path || '', {
+        startLine: args.start_line || args.startLine || 1,
+        endLine: args.end_line || args.endLine || ((Number(args.start_line || args.startLine) || 1) + 199),
+      }, workspace);
+      out = `[File: ${r.path} | lines ${r.startLine}-${r.endLine} of ${r.totalLines} | ${r.sizeLabel}]\n${r.content}`;
+    } else if (name === 'list_dir') {
+      const r = await localFiles.listDir(args.path || '', workspace);
+      out = `[Directory: ${r.path || '.'} (${r.items.length} items)]\n` +
+        r.items.slice(0, 80).map((it) => `${it.isDir ? '[DIR] ' : '[FILE]'} ${it.relPath}${it.isDir ? '' : ` (${it.sizeLabel})`}`).join('\n');
+    } else if (name === 'search_files') {
+      const r = await localFiles.searchFiles({ query: args.query || '', relPath: args.path || '', maxResults: 15 }, workspace);
+      out = `[Search "${args.query || ''}": ${r.results.length} matches across ${r.scanned} files]\n` +
+        (r.results.length
+          ? r.results.map((h) => `- ${h.relPath} (${h.sizeLabel})${h.snippet ? ` — ${h.snippet}` : ''}`).join('\n')
+          : '(no matches)');
+    } else if (name === 'git_inspect') {
+      const g = await localTools.gitInspect(workspace, args.focus || '');
+      out = g.text.slice(0, 10000);
+    } else if (name === 'inspect_spreadsheet') {
+      const parsed = await localFiles.parseTableFile(args.path || '', workspace, { preserveFormulas: true });
+      const sIdx = Math.max(0, Math.min((parsed.sheets?.length || 1) - 1, Number(args.sheet_index ?? args.sheetIndex) || 0));
+      const sheet = parsed.sheets?.[sIdx] || { name: 'Sheet1', rows: parsed.rows || [] };
+      const allSheetsList = (parsed.sheets || []).map((s, idx) => `[${idx}] "${s.name}" (${s.totalRows || s.rows?.length || 0} rows)`).join(', ');
+      const startRow = Math.max(0, Number(args.start_row ?? args.startRow) || 0);
+      const maxRows = Math.max(10, Math.min(150, Number(args.max_rows ?? args.maxRows) || 60));
+      const slice = (sheet.rows || []).slice(startRow, startRow + maxRows);
+      const colLetters = (sheet.rows?.[0] || slice[0] || []).map((_, i) => officeExport.colLetter(i));
+      const formatted = slice.map((r, i) => {
+        const rIdx = startRow + i;
+        return `Row ${rIdx}${rIdx === 0 ? ' (Header)' : ''}: ` + r.map((v, cIdx) => `${colLetters[cIdx] || cIdx}${rIdx + 1}=${JSON.stringify(String(v ?? ''))}`).join(' | ');
+      }).join('\n');
+      const summary = officeExport.summarizeTable(sheet.rows || []);
+      out = [
+        `[Spreadsheet: ${parsed.path} | Sheets: ${allSheetsList}]`,
+        `Active Sheet [${sIdx}] "${sheet.name}" (showing rows ${startRow}..${startRow + slice.length - 1} of ${sheet.totalRows || sheet.rows.length})`,
+        summary,
+        formatted.slice(0, 9500),
+      ].filter(Boolean).join('\n\n');
+    } else {
+      out = `Unsupported read-only tool: ${name}`;
+    }
+
+    onEvent?.('worker_done', {
+      id,
+      ok: true,
+      elapsedMs: Date.now() - startedAt,
+      tokensPerSec: 0,
+      summary: `${labelMap[name] || name}: ${String(taskTitle).slice(0, 80)}`,
+      brief: out.slice(0, 600),
+      citations: args.path ? [{ type: 'file', title: args.path, path: args.path }] : [],
+    });
+    return out;
+  } catch (err) {
+    onEvent?.('worker_done', {
+      id,
+      ok: false,
+      elapsedMs: Date.now() - startedAt,
+      error: err.message,
+      summary: `${labelMap[name] || name} failed`,
+      citations: [],
+    });
+    return `Tool error (${name}): ${err.message}`;
+  }
+}
+
+async function runChatWithReadTools({
+  tier,
+  model,
+  systemPrompt,
+  messages,
+  images,
+  tools,
+  think,
+  priority,
+  workspace,
+  mask,
+  signal,
+  onEvent,
+  maxReadRounds = 5,
+}) {
+  let curMessages = [...messages];
+  let totalElapsed = 0;
+  let lastRes = null;
+
+  for (let round = 0; round <= maxReadRounds; round++) {
+    const res = await endpoint.chatCompletion({
+      tier,
+      model,
+      systemPrompt,
+      messages: curMessages,
+      images: round === 0 ? images : [],
+      tools,
+      think,
+      priority,
+      signal,
+      onEvent: (ev) => {
+        if (ev.type === 'queue') onEvent('queue', ev);
+        else if (ev.type === 'thinking') onEvent('thinking', { delta: ev.delta });
+        else if (ev.type === 'text') onEvent('text', { delta: ev.delta });
+      },
+    });
+    totalElapsed += res.elapsedMs || 0;
+    lastRes = { ...res, elapsedMs: totalElapsed };
+
+    const calls = Array.isArray(res.toolCalls) ? res.toolCalls : [];
+    const readCalls = calls.filter((tc) => READ_ONLY_TOOL_NAMES.has(String(tc?.name || '').toLowerCase()));
+    const actionCalls = calls.filter((tc) => !READ_ONLY_TOOL_NAMES.has(String(tc?.name || '').toLowerCase()));
+
+    // Only continue the inner read loop when the model called read-only tools and hasn't emitted action tools yet
+    if (!readCalls.length || actionCalls.length > 0 || round >= maxReadRounds || signal?.aborted) {
+      return { res: lastRes, finalMessages: curMessages };
+    }
+
+    onEvent('phase', {
+      phase: 'delegating',
+      label: `Inspecting workspace (${readCalls.map((c) => c.name).join(', ')})…`,
+    });
+
+    const assistantToolCalls = readCalls.map((tc, idx) => ({
+      id: tc.id || `call_rt_${round}_${idx}`,
+      type: 'function',
+      function: {
+        name: tc.name,
+        arguments: JSON.stringify(tc.args || {}),
+      },
+    }));
+    curMessages.push({
+      role: 'assistant',
+      content: res.content ? mask(res.content) : null,
+      tool_calls: assistantToolCalls,
+    });
+
+    for (let i = 0; i < readCalls.length; i++) {
+      if (signal?.aborted) break;
+      const resultText = await executeReadOnlyTool(readCalls[i], { workspace, onEvent });
+      curMessages.push({
+        role: 'tool',
+        tool_call_id: assistantToolCalls[i].id,
+        content: mask(resultText.slice(0, 12000)),
+      });
+    }
+  }
+
+  return { res: lastRes, finalMessages: curMessages };
+}
+
 async function mergeNativeToolCalls(toolCalls, blocks, toolsCfg, resolvedExecTarget = 'container') {
   if (!Array.isArray(toolCalls) || !toolCalls.length) return blocks;
   const cfg = storage.getSettings();
@@ -291,9 +605,13 @@ async function mergeNativeToolCalls(toolCalls, blocks, toolsCfg, resolvedExecTar
     const name = String(tc?.name || '').toLowerCase();
     const args = tc?.args && typeof tc.args === 'object' ? tc.args : {};
 
-    if ((name === 'write_file' || name === 'file_action') && toolsCfg.osFiles) {
-      const type = name === 'write_file' ? 'write' : String(args.type || 'write').toLowerCase();
-      if (!['mkdir', 'write', 'create', 'move', 'rename', 'copy', 'delete'].includes(type)) continue;
+    if ((name === 'write_file' || name === 'edit_file' || name === 'file_action' || name === 'create_office_doc') && toolsCfg.osFiles) {
+      let type;
+      if (name === 'write_file') type = 'write';
+      else if (name === 'edit_file') type = 'patch';
+      else if (name === 'create_office_doc') type = String(args.format || 'docx').toLowerCase() === 'ics' ? 'write_ics' : 'write_docx';
+      else type = String(args.type || 'write').toLowerCase();
+      if (!['mkdir', 'write', 'create', 'patch', 'edit', 'write_docx', 'write_ics', 'move', 'rename', 'copy', 'delete'].includes(type)) continue;
       const act = {
         id: `act_${Date.now().toString(36)}_tc${i}`,
         type,
@@ -301,6 +619,13 @@ async function mergeNativeToolCalls(toolCalls, blocks, toolsCfg, resolvedExecTar
         from: args.from ? String(args.from) : '',
         to: args.to ? String(args.to) : '',
         content: typeof args.content === 'string' ? args.content : undefined,
+        oldText: typeof (args.old_text ?? args.oldText) === 'string' ? String(args.old_text ?? args.oldText) : undefined,
+        newText: typeof (args.new_text ?? args.newText) === 'string' ? String(args.new_text ?? args.newText) : undefined,
+        replaceAll: Boolean(args.replace_all || args.replaceAll),
+        title: args.title ? String(args.title) : undefined,
+        start: args.start ? String(args.start) : undefined,
+        durationMin: args.duration_min || args.durationMin ? Number(args.duration_min || args.durationMin) : undefined,
+        location: args.location ? String(args.location) : undefined,
         reason: String(args.reason || '').slice(0, 180),
         status: 'pending',
       };
@@ -320,6 +645,8 @@ async function mergeNativeToolCalls(toolCalls, blocks, toolsCfg, resolvedExecTar
         image: String(args.image || containerRunner.defaultImageForLanguage(lang, cfg.containerImage)),
         code,
         command: '',
+        cwd: args.cwd ? String(args.cwd).trim() : '',
+        timeoutSec: args.timeout_sec || args.timeoutSec ? Number(args.timeout_sec || args.timeoutSec) : 0,
         network: cfg.containerNetwork || 'none',
         mountMode: cfg.containerMountMode || 'rw',
         execTarget: resolvedExecTarget,
@@ -333,8 +660,9 @@ async function mergeNativeToolCalls(toolCalls, blocks, toolsCfg, resolvedExecTar
         id: `tbl_${Date.now().toString(36)}_tc${i}`,
         path: String(args.path).trim(),
         sheetIndex: Math.max(0, Number(args.sheetIndex) || 0),
+        sheetName: args.sheetName ? String(args.sheetName).trim() : undefined,
         summary: String(args.summary || `${args.operations.length} spreadsheet edit(s)`).slice(0, 160),
-        operations: args.operations.slice(0, 80),
+        operations: args.operations.slice(0, 100),
         status: 'pending',
       });
     } else if (name === 'save_memory' && toolsCfg.notes) {
@@ -389,10 +717,21 @@ function buildHistoryMessages(history, useNativeTools, mask) {
 
       for (const a of m.fileActions || []) {
         const callId = `call_hist_${++seq}`;
-        const fnName = a.type === 'write' ? 'write_file' : 'file_action';
-        const args = fnName === 'write_file'
-          ? { path: a.path || '', content: a.content || '', reason: a.reason || '' }
-          : { type: a.type, path: a.path || '', from: a.from || '', to: a.to || '', content: a.content, reason: a.reason || '' };
+        let fnName;
+        let args;
+        if (a.type === 'write') {
+          fnName = 'write_file';
+          args = { path: a.path || '', content: a.content || '', reason: a.reason || '' };
+        } else if (a.type === 'patch' || a.type === 'edit') {
+          fnName = 'edit_file';
+          args = { path: a.path || '', old_text: a.oldText || '', new_text: a.newText || '', reason: a.reason || '' };
+        } else if (a.type === 'write_docx' || a.type === 'write_ics') {
+          fnName = 'create_office_doc';
+          args = { format: a.type === 'write_ics' ? 'ics' : 'docx', path: a.path || '', title: a.title || '', content: a.content || '' };
+        } else {
+          fnName = 'file_action';
+          args = { type: a.type, path: a.path || '', from: a.from || '', to: a.to || '', content: a.content, reason: a.reason || '' };
+        }
         toolCalls.push({ id: callId, type: 'function', function: { name: fnName, arguments: mask(JSON.stringify(args)) } });
         toolResults.push({ role: 'tool', tool_call_id: callId, content: mask(`${a.status || 'applied'}: ${a.result || a.path || a.to || 'done'}`) });
       }
@@ -860,25 +1199,24 @@ async function runCoworkTurn({
       const isTab = /\.(xlsx|csv|tsv)$/i.test(openFile.path);
       if (isTab) {
         try {
-          const parsed = await localFiles.parseTableFile(openFile.path, workspace);
+          const parsed = await localFiles.parseTableFile(openFile.path, workspace, { preserveFormulas: true });
           const sIdx = Math.max(0, Math.min((parsed.sheets?.length || 1) - 1, Number(openFile.sheetIndex) || 0));
           const sheet = parsed.sheets?.[sIdx] || { name: 'Sheet1', rows: parsed.rows || [] };
+          const allSheetsList = (parsed.sheets || []).map((s, idx) => `[${idx}] "${s.name}" (${s.totalRows || s.rows?.length || 0} rows)`).join(', ');
           const sampleRows = (sheet.rows || []).slice(0, 45);
-          const colLetters = (sampleRows[0] || []).map((_, i) => {
-            let s = ''; let n = i + 1;
-            while (n > 0) { const rem = (n - 1) % 26; s = String.fromCharCode(65 + rem) + s; n = Math.floor((n - 1) / 26); }
-            return s;
-          });
+          const colLetters = (sampleRows[0] || []).map((_, i) => officeExport.colLetter(i));
           const formatted = sampleRows.map((r, rIdx) =>
             `Row ${rIdx}${rIdx === 0 ? ' (Header)' : ''}: ` + r.map((v, cIdx) => `${colLetters[cIdx] || cIdx}${rIdx + 1}=${JSON.stringify(String(v ?? ''))}`).join(' | ')
           ).join('\n');
+          const tableSummary = officeExport.summarizeTable(sheet.rows || []);
           const sel = openFile.selectedCell
             ? `User currently selected cell: ${openFile.selectedCell.colLetter || ''}${(openFile.selectedCell.row ?? 0) + 1} (row=${openFile.selectedCell.row}, col=${openFile.selectedCell.col}, value=${JSON.stringify(openFile.selectedCell.value ?? '')})`
             : '';
           viewParts.push([
-            `CURRENTLY OPEN SPREADSHEET IN SIDEBAR: "${openFile.path}" (sheet "${sheet.name}", sheetIndex=${sIdx}, ${sheet.rows.length} rows × ${(sampleRows[0] || []).length} cols)`,
+            `CURRENTLY OPEN SPREADSHEET IN SIDEBAR: "${openFile.path}" (active sheet [${sIdx}] "${sheet.name}", ${sheet.totalRows || sheet.rows.length} rows × ${(sampleRows[0] || []).length} cols | All sheets: ${allSheetsList})`,
             sel,
-            `Spreadsheet contents (0-based row & col indices for table-edits):\n${formatted.slice(0, 7500)}`,
+            tableSummary,
+            `Spreadsheet contents (first ${sampleRows.length} rows; 0-based row & col indices or A1 refs for edit_table):\n${formatted.slice(0, 7500)}`,
           ].filter(Boolean).join('\n'));
         } catch {}
       } else {
@@ -895,10 +1233,10 @@ async function runCoworkTurn({
   }
 
   const fileActionsHint = toolsCfg.osFiles
-    ? `If proposing local OS file edits/creates/moves/renames/deletes, include a \`\`\`file-actions JSON array: [{"type":"mkdir"|"write"|"move"|"rename"|"copy"|"delete","path":"...","from":"...","to":"...","content":"...","reason":"..."}].`
+    ? `If proposing local OS file edits/creates/moves/renames/deletes, include a \`\`\`file-actions JSON array. Prefer {"type":"patch","path":"...","oldText":"exact snippet","newText":"replacement","reason":"..."} for surgical edits to existing code files; use "write" for new files, "write_docx" (with "title" & Markdown "content") for real Word .docx documents, "write_ics" for calendar invites, or "mkdir"|"move"|"rename"|"copy"|"delete".`
     : '';
   const tableEditsHint = toolsCfg.osFiles
-    ? `When updating or adding cells, rows, or columns in an .xlsx or .csv spreadsheet (especially the currently open spreadsheet in sidebar), output a \`\`\`table-edits JSON block so mx-Cowork animates your live cursor editing each cell directly in the sidebar:\n\`\`\`table-edits\n{"path":"relative/file.xlsx","sheetIndex":0,"summary":"short description","operations":[{"op":"set_cell","row":1,"col":2,"value":"1450","note":"Fixed Q1"},{"op":"add_column","header":"Margin %","values":["32%","28%"],"note":"Computed margin"},{"op":"add_row","values":["Total","","4200","30%"],"note":"Added totals"}]}\n\`\`\` (row=0 is header row, col=0 is column A).`
+    ? `When creating or updating .xlsx or .csv spreadsheets (especially the currently open spreadsheet in sidebar), output a \`\`\`table-edits JSON block so mx-Cowork animates your live cursor editing directly in the sidebar. Real Excel formulas starting with "=" (e.g. "=SUM(B2:B10)", "=AVERAGE(C2:C10)", "=IF(B2>100,\\"High\\",\\"Low\\")") are written as native Excel formulas!\n\`\`\`table-edits\n{"path":"relative/file.xlsx","sheetIndex":0,"summary":"short description","operations":[{"op":"set_cell","cell":"C2","value":"1450","note":"Fixed Q1"},{"op":"set_range","cell":"A10","values":[["Total","","=SUM(C2:C9)"]]},{"op":"add_column","header":"Margin %","values":["=ROUND((B2-C2)/B2*100,1)"]},{"op":"sort_rows","col":"C","direction":"desc"},{"op":"add_sheet","name":"Summary","rows":[["Metric","Value"],["Total","=SUM(Sheet1!C2:C9)"]]}]}\n\`\`\` (supported ops: set_cell, set_formula, set_range, add_column, rename_column, delete_column, add_row, insert_row, delete_row, sort_rows, add_sheet, rename_sheet).`
     : '';
   const resolvedExecTarget = (stdExecTarget === 'host' || stdExecTarget === 'container')
     ? stdExecTarget
@@ -912,7 +1250,7 @@ async function runCoworkTurn({
 
   const codeRunHint = toolsCfg.container
     ? (resolvedExecTarget === 'host'
-      ? `Code execution is ENABLED on the user's preselected standard environment: ON-MACHINE HOST (runs directly in ${workspace} via local python3, node, or ${process.platform === 'win32' ? 'PowerShell' : 'bash'}). When executing Python, Node.js, or Shell code on the workspace helps verify, test, compute, create .xlsx/.pdf/.docx files, or automate, include a \`\`\`code-run JSON block: {"title":"short label","language":"python"|"javascript"|"bash","code":"...","reason":"why"}. Use paths relative to the working directory (${workspace}); do NOT hardcode /workspace. On Linux with PEP 668 externally-managed Python, use a local venv (python3 -m venv .venv && .venv/bin/pip install ...) or pip install --break-system-packages.`
+      ? `Code execution is ENABLED on the user's preselected standard environment: ON-MACHINE HOST (runs directly in ${workspace} via local python3 — auto-using workspace .venv if present — node, or ${process.platform === 'win32' ? 'PowerShell' : 'bash'}). When coding on the machine, verify edits by running tests, linters, typechecks, or scripts via \`\`\`code-run JSON block: {"title":"short label","language":"python"|"javascript"|"bash"|"powershell","cwd":"optional/subdir","timeoutSec":60,"code":"...","reason":"why"}. Use paths relative to ${workspace}; do NOT hardcode /workspace. On Linux with PEP 668 externally-managed Python, create a local venv (python3 -m venv .venv && .venv/bin/pip install ...) — subsequent python runs will automatically use .venv.`
       : `Code execution is ENABLED on the user's preselected standard environment: ISOLATED CONTAINER (Docker/Podman mounted at /workspace; default image ${cfg.containerImage || 'python:3.12-slim'}). When executing Python, Node.js, or Shell code on the workspace helps verify, test, compute, create .xlsx/.pdf/.docx files, or automate, include a \`\`\`code-run JSON block: {"title":"short label","language":"python"|"javascript"|"bash","image":"python:3.12-slim","code":"...","reason":"why"}.`)
     : '';
   const noNativeToolHint = `CRITICAL: Do NOT call native function tools (none are attached) and NEVER stop after internal reasoning with an empty reply. Always output your complete final Markdown answer and any fenced \`\`\`code-run, \`\`\`file-actions, or \`\`\`table-edits blocks directly in one response.`;
@@ -940,11 +1278,11 @@ async function runCoworkTurn({
     const useNativeTools = supportsNativeTools(chosenModel);
     const nativeTools = useNativeTools ? buildNativeTools(toolsCfg, resolvedExecTarget) : [];
     onEvent('phase', { phase: 'preparing', label: `${mode === 'fast' ? 'Fast' : 'Smart'} · ${chosenModel.replace(/:latest$/, '')}` });
-    let directWsSnapshot = '';
+    let directBlueprint = '';
     if (toolsCfg.osFiles) {
       try {
-        const ls = await localFiles.listDir('', workspace);
-        directWsSnapshot = ls.items.slice(0, 35).map((it) => (it.isDir ? `${it.name}/` : it.name)).join(', ');
+        const bp = await localFiles.projectBlueprint(workspace);
+        directBlueprint = bp.text || '';
       } catch {}
     }
     const ctxParts = [];
@@ -959,14 +1297,14 @@ async function runCoworkTurn({
     }
 
     const sys = [
-      `You are mx-Cowork, a context-aware local desktop AI copilot. Today: ${today}. Workspace: ${workspace}.`,
-      directWsSnapshot ? `Workspace top-level items: ${directWsSnapshot}` : '',
+      `You are mx-Cowork, a context-aware local desktop AI copilot & coding/office coworker. Today: ${today}. Workspace: ${workspace}.`,
+      directBlueprint ? `[Project Structure & Stack]\n${directBlueprint}\n[/Project Structure & Stack]` : '',
       globalCustomInstr,
       projectContextBlock,
       activeViewContextBlock,
       `Be crisp, structured, and actionable. Use Markdown.`,
       useNativeTools
-        ? `Use the attached tools (write_file, file_action, run_code, edit_table, save_memory) directly whenever creating/editing files or running code, and also write a clear Markdown explanation.`
+        ? `Use the attached tools directly: inspect with read_file/list_dir/search_files/git_inspect/inspect_spreadsheet first, then make surgical edits with edit_file (prefer over write_file for existing files), run tests/scripts with run_code, update/create Excel/CSV with edit_table (supports real =SUM/=IF formulas & multi-sheet ops), or create Word/Calendar docs with create_office_doc.`
         : noNativeToolHint,
       artifactHint,
       tableEditsHint,
@@ -986,22 +1324,43 @@ async function runCoworkTurn({
       onEvent('shield', shield.summary());
     }
 
-    let res = await endpoint.chatCompletion({
-      tier: mode,
-      model: chosenModel,
-      systemPrompt: maskedSys,
-      messages: msgs,
-      images,
-      tools: nativeTools,
-      think: mode === 'fast' ? 'off' : think,
-      priority: mode,
-      signal,
-      onEvent: (ev) => {
-        if (ev.type === 'queue') onEvent('queue', ev);
-        else if (ev.type === 'thinking') onEvent('thinking', { delta: ev.delta });
-        else if (ev.type === 'text') onEvent('text', { delta: ev.delta });
-      },
-    });
+    let res;
+    let activeMsgs = msgs;
+    if (useNativeTools && nativeTools.length) {
+      const loopOut = await runChatWithReadTools({
+        tier: mode,
+        model: chosenModel,
+        systemPrompt: maskedSys,
+        messages: msgs,
+        images,
+        tools: nativeTools,
+        think: mode === 'fast' ? 'off' : think,
+        priority: mode,
+        workspace,
+        mask,
+        signal,
+        onEvent,
+      });
+      res = loopOut.res;
+      activeMsgs = loopOut.finalMessages;
+    } else {
+      res = await endpoint.chatCompletion({
+        tier: mode,
+        model: chosenModel,
+        systemPrompt: maskedSys,
+        messages: msgs,
+        images,
+        tools: nativeTools,
+        think: mode === 'fast' ? 'off' : think,
+        priority: mode,
+        signal,
+        onEvent: (ev) => {
+          if (ev.type === 'queue') onEvent('queue', ev);
+          else if (ev.type === 'thinking') onEvent('thinking', { delta: ev.delta });
+          else if (ev.type === 'text') onEvent('text', { delta: ev.delta });
+        },
+      });
+    }
 
     // Guard against reasoning-only cutoffs OR premature narration-only stops ("Ich baue jetzt..." without calling any tool!)
     if (isPrematureIntentStop(res.content, res.toolCalls) && !signal?.aborted) {
@@ -1015,12 +1374,12 @@ async function runCoworkTurn({
         model: chosenModel,
         systemPrompt: maskedSys,
         messages: [
-          ...msgs,
+          ...activeMsgs,
           ...(partialTxt ? [{ role: 'assistant', content: mask(partialTxt) }] : []),
           {
             role: 'user',
             content: mask(
-              `${thoughtHint ? `Your internal plan was:\n${thoughtHint}\n\n` : ''}${isFakePrepared ? 'You wrote plain text "Prepared 1 code run..." instead of calling a tool.' : (partialTxt ? `You wrote "${partialTxt}" but stopped without calling any tool.` : 'You stopped after thinking without writing a visible answer or tool call.')} Call write_file / file_action / run_code RIGHT NOW (do NOT write "Prepared 1 code run..." as plain text).`
+              `${thoughtHint ? `Your internal plan was:\n${thoughtHint}\n\n` : ''}${isFakePrepared ? 'You wrote plain text "Prepared 1 code run..." instead of calling a tool.' : (partialTxt ? `You wrote "${partialTxt}" but stopped without calling any tool.` : 'You stopped after thinking without writing a visible answer or tool call.')} Call edit_file / write_file / file_action / edit_table / create_office_doc / run_code RIGHT NOW (do NOT write "Prepared 1 code run..." as plain text).`
             ),
           },
         ],
@@ -1101,10 +1460,12 @@ async function runCoworkTurn({
   onEvent('phase', { phase: 'planning', label: `${orchestratorLabel} planning…` });
 
   let wsSnapshot = '';
+  let wsBlueprint = '';
   if (toolsCfg.osFiles) {
     try {
-      const ls = await localFiles.listDir('', workspace);
-      wsSnapshot = ls.items.slice(0, 30).map((it) => (it.isDir ? `${it.name}/` : it.name)).join(', ');
+      const bp = await localFiles.projectBlueprint(workspace);
+      wsBlueprint = bp.text || '';
+      wsSnapshot = (bp.treeLines || []).slice(0, 35).join(', ');
     } catch {}
   }
 
@@ -1225,15 +1586,15 @@ Rules:
   const nativeTools = useNativeTools ? buildNativeTools(toolsCfg, resolvedExecTarget) : [];
 
   const synthSys = [
-    `You are mx-Cowork's ${orchestratorLabel} Orchestrator. Today: ${today}. Workspace: ${workspace}.`,
-    wsSnapshot ? `Workspace top-level items: ${wsSnapshot}` : '',
+    `You are mx-Cowork's ${orchestratorLabel} Orchestrator & Coding/Office Coworker. Today: ${today}. Workspace: ${workspace}.`,
+    wsBlueprint ? `[Project Structure & Stack]\n${wsBlueprint}\n[/Project Structure & Stack]` : (wsSnapshot ? `Workspace top-level items: ${wsSnapshot}` : ''),
     globalCustomInstr,
     projectContextBlock,
     activeViewContextBlock,
     `Your local tools and fast worker models retrieved the evidence below. Synthesize a crisp, deeply helpful, accurate response using Markdown.`,
     `Cite web sources as Markdown links and reference local files by relative path.`,
     useNativeTools
-      ? `Use the attached tools (write_file, file_action, run_code, edit_table, save_memory) directly whenever creating/editing files or running code, and also write a clear Markdown explanation.`
+      ? `Use the attached tools directly: inspect with read_file/list_dir/search_files/git_inspect/inspect_spreadsheet if you need exact lines or another sheet, make surgical code edits with edit_file (prefer over write_file for existing files), run tests/scripts with run_code, update/create Excel/CSV with edit_table (real =SUM/=IF formulas & multi-sheet ops), or create Word/Calendar docs with create_office_doc.`
       : noNativeToolHint,
     artifactHint,
     tableEditsHint,
@@ -1262,22 +1623,43 @@ Rules:
     onEvent('shield', shield.summary());
   }
 
-  let finalRes = await endpoint.chatCompletion({
-    tier: 'smart',
-    model: orchestratorModel,
-    systemPrompt: maskedSynthSys,
-    messages: synthMessages,
-    images,
-    tools: nativeTools,
-    think,
-    priority: 'smart',
-    signal,
-    onEvent: (ev) => {
-      if (ev.type === 'queue') onEvent('queue', ev);
-      else if (ev.type === 'thinking') onEvent('thinking', { delta: ev.delta });
-      else if (ev.type === 'text') onEvent('text', { delta: ev.delta });
-    },
-  });
+  let finalRes;
+  let activeSynthMsgs = synthMessages;
+  if (useNativeTools && nativeTools.length) {
+    const loopOut = await runChatWithReadTools({
+      tier: 'smart',
+      model: orchestratorModel,
+      systemPrompt: maskedSynthSys,
+      messages: synthMessages,
+      images,
+      tools: nativeTools,
+      think,
+      priority: 'smart',
+      workspace,
+      mask,
+      signal,
+      onEvent,
+    });
+    finalRes = loopOut.res;
+    activeSynthMsgs = loopOut.finalMessages;
+  } else {
+    finalRes = await endpoint.chatCompletion({
+      tier: 'smart',
+      model: orchestratorModel,
+      systemPrompt: maskedSynthSys,
+      messages: synthMessages,
+      images,
+      tools: nativeTools,
+      think,
+      priority: 'smart',
+      signal,
+      onEvent: (ev) => {
+        if (ev.type === 'queue') onEvent('queue', ev);
+        else if (ev.type === 'thinking') onEvent('thinking', { delta: ev.delta });
+        else if (ev.type === 'text') onEvent('text', { delta: ev.delta });
+      },
+    });
+  }
 
   // Guard against reasoning-only cutoffs OR premature narration-only stops in Copilot synthesis
   if (isPrematureIntentStop(finalRes.content, finalRes.toolCalls) && !signal?.aborted) {
@@ -1291,12 +1673,12 @@ Rules:
       model: orchestratorModel,
       systemPrompt: maskedSynthSys,
       messages: [
-        ...synthMessages,
+        ...activeSynthMsgs,
         ...(partialTxt ? [{ role: 'assistant', content: mask(partialTxt) }] : []),
         {
           role: 'user',
           content: mask(
-            `${thoughtHint ? `Your internal plan was:\n${thoughtHint}\n\n` : ''}${isFakePrepared ? 'You wrote plain text "Prepared 1 code run..." instead of calling a tool.' : (partialTxt ? `You wrote "${partialTxt}" but stopped without calling any tool.` : 'You stopped after thinking without writing a visible answer or tool call.')} Call write_file / file_action / run_code RIGHT NOW (do NOT write "Prepared 1 code run..." as plain text).`
+            `${thoughtHint ? `Your internal plan was:\n${thoughtHint}\n\n` : ''}${isFakePrepared ? 'You wrote plain text "Prepared 1 code run..." instead of calling a tool.' : (partialTxt ? `You wrote "${partialTxt}" but stopped without calling any tool.` : 'You stopped after thinking without writing a visible answer or tool call.')} Call edit_file / write_file / file_action / edit_table / create_office_doc / run_code RIGHT NOW (do NOT write "Prepared 1 code run..." as plain text).`
           ),
         },
       ],
@@ -1368,4 +1750,8 @@ Rules:
 
 module.exports = {
   runCoworkTurn,
+  buildNativeTools,
+  extractSpecialBlocks,
+  executeReadOnlyTool,
+  READ_ONLY_TOOL_NAMES,
 };

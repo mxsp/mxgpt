@@ -14,7 +14,13 @@ echo "=== Installing mx-Cowork Electron dependencies ==="
 npm install --no-audit --no-fund
 
 echo "=== Building native Linux (AppImage, .deb) and Windows GUI (.zip) apps ==="
-npm run build:all
+npm run build:linux
+if [[ "$(uname -s)" == Linux* ]]; then
+  echo "Note: Cross-building unsigned Windows zip from Linux; use GitHub Actions (windows-latest) for PE metadata, icon, and Authenticode signing."
+  npx electron-builder --win zip --x64 -c.win.signAndEditExecutable=false
+else
+  npm run build:win
+fi
 
 VERSION="$(node -p "require('$CW_DIR/package.json').version")"
 rm -f "$OUT_DIR"/*.AppImage "$OUT_DIR"/*.deb "$OUT_DIR"/*.zip "$OUT_DIR/SHA256SUMS.txt"
