@@ -128,6 +128,7 @@ function createWindow() {
       contextIsolation: true,
       nodeIntegration: false,
       sandbox: false,
+      webviewTag: true,
     },
   });
 
@@ -150,8 +151,55 @@ function createWindow() {
   });
 }
 
+// ---- Main <-> Renderer Integrated Browser Bridge
+const pendingBrowserCmds = new Map();
+let browserCmdSeq = 0;
+
+function browserExec(cmd, args = {}, timeoutMs = 20000) {
+  return new Promise((resolve) => {
+    if (!mainWindow || mainWindow.isDestroyed() || mainWindow.webContents.isDestroyed()) {
+      return resolve({ ok: false, error: 'Main window is not available' });
+    }
+    const reqId = `bcmd_${Date.now()}_${++browserCmdSeq}`;
+    const timer = setTimeout(() => {
+      pendingBrowserCmds.delete(reqId);
+      resolve({ ok: false, error: `Browser command "${cmd}" timed out after ${timeoutMs}ms` });
+    }, timeoutMs);
+    pendingBrowserCmds.set(reqId, (res) => {
+      clearTimeout(timer);
+      resolve(res || { ok: false, error: 'Empty browser response' });
+    });
+    mainWindow.webContents.send('browser:cmd', { reqId, cmd, args });
+  });
+}
+
 // ---- Native IPC Handlers (Zero HTTP Server)
 function registerIpc() {
+  ipcMain.on('browser:res', (_event, res) => {
+    if (!res || !res.reqId) return;
+    const fn = pendingBrowserCmds.get(res.reqId);
+    if (fn) {
+      pendingBrowserCmds.delete(res.reqId);
+      fn(res);
+    }
+  });
+
+  ipcMain.handle('browser:saveScreenshot', (_event, { dataUrl, filename } = {}) => {
+    try {
+      if (!dataUrl || typeof dataUrl !== 'string') return { ok: false, error: 'Missing image data' };
+      const b64 = dataUrl.replace(/^data:image\/\w+;base64,/, '');
+      const ws = storage.getSettings().workspace || storage.DATA_DIR;
+      const safeName = String(filename || `browser-${Date.now()}.png`).replace(/[^a-zA-Z0-9._-]/g, '_');
+      const finalName = safeName.endsWith('.png') ? safeName : `${safeName}.png`;
+      const outDir = path.join(ws, '.mx-cowork-screenshots');
+      fs.mkdirSync(outDir, { recursive: true });
+      const outPath = path.join(outDir, finalName);
+      fs.writeFileSync(outPath, Buffer.from(b64, 'base64'));
+      return { ok: true, path: outPath, relPath: `.mx-cowork-screenshots/${finalName}` };
+    } catch (e) {
+      return { ok: false, error: e.message };
+    }
+  });
   ipcMain.handle('app:info', () => ({
     ok: true,
     app: 'mx-Cowork',
@@ -581,9 +629,14 @@ function registerIpc() {
         },
         onUiAction: async (action, data) => {
           if (action === 'open_url' && data?.url && /^https?:\/\//i.test(data.url)) {
-            await shell.openExternal(data.url);
+            if (data.external) {
+              await shell.openExternal(data.url);
+            } else {
+              return await browserExec('open', { url: data.url });
+            }
           }
         },
+        onBrowserAction: async (cmd, args) => browserExec(cmd, args),
       });
 
       if (result.savedNotes?.length) {
@@ -1235,6 +1288,8 @@ app.whenReady().then(() => {
               hasOverboostApi: typeof window.cowork.unlockOverboost === 'function' && typeof window.cowork.lockOverboost === 'function' && Boolean(document.querySelector('#overboostUnlockBtn')),
               hasLimitInputsRemoved: !document.querySelector('#setSmartLimit4h') && !document.querySelector('#setSmartLimitWeekly'),
               hasArtifactCanvas: Boolean(document.querySelector('[data-pane="artifact"]')),
+              hasBrowserPane: Boolean(document.querySelector('[data-pane="browser"]') && document.querySelector('#browserWebview')),
+              hasBrowserApi: typeof window.cowork.onBrowserCmd === 'function' && typeof window.cowork.saveBrowserScreenshot === 'function',
               hasUsageApi: typeof window.cowork.getUsage === 'function',
               hasDiffApi: typeof window.cowork.compareFiles === 'function' && Boolean(document.querySelector('#compareModal')),
               hasExportApi: typeof window.cowork.exportDocx === 'function' && typeof window.cowork.exportXlsx === 'function' && typeof window.cowork.exportPdf === 'function' && typeof window.cowork.exportIcs === 'function',

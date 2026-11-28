@@ -195,4 +195,12 @@ contextBridge.exposeInMainWorld('cowork', {
     ipcRenderer.on('automations:event', listener);
     return () => ipcRenderer.removeListener('automations:event', listener);
   },
+  // Integrated Live Browser Bridge (Main <-> Renderer <webview>)
+  onBrowserCmd: (cb) => {
+    const listener = (_, msg) => cb(msg);
+    ipcRenderer.on('browser:cmd', listener);
+    return () => ipcRenderer.removeListener('browser:cmd', listener);
+  },
+  sendBrowserRes: (res) => ipcRenderer.send('browser:res', res),
+  saveBrowserScreenshot: (dataUrl, filename) => ipcRenderer.invoke('browser:saveScreenshot', { dataUrl, filename }),
 });

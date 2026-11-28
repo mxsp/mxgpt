@@ -205,6 +205,13 @@ const READ_ONLY_TOOL_NAMES = new Set([
   'open_url',
   'open_in_sidebar',
   'create_task',
+  'browser_open',
+  'browser_read',
+  'browser_click',
+  'browser_type',
+  'browser_eval',
+  'browser_navigate',
+  'browser_screenshot',
 ]);
 
 function buildNativeTools(toolsCfg, resolvedExecTarget = 'container') {
@@ -508,16 +515,116 @@ function buildNativeTools(toolsCfg, resolvedExecTarget = 'container') {
       },
     });
   }
-  // ---- Interconnected App & OS UI Tools (browser launch, sidebar navigation, tasks)
+  // ---- Integrated Live Browser & App UI Tools
+  tools.push({
+    type: 'function',
+    function: {
+      name: 'browser_open',
+      description: 'Open an http:// or https:// URL (such as a local dev server http://127.0.0.1:5000 or any website) directly inside mx-Cowork\'s integrated live browser panel.',
+      parameters: {
+        type: 'object',
+        properties: {
+          url: { type: 'string', description: 'Valid http:// or https:// URL to open in the integrated browser' },
+          reason: { type: 'string', description: 'Why opening this URL' },
+        },
+        required: ['url'],
+      },
+    },
+  });
+  tools.push({
+    type: 'function',
+    function: {
+      name: 'browser_read',
+      description: 'Inspect the currently open page in mx-Cowork\'s integrated browser: returns URL, title, visible text, interactive elements (buttons/links/inputs with CSS selectors), and console errors.',
+      parameters: {
+        type: 'object',
+        properties: {
+          mode: { type: 'string', enum: ['summary', 'text', 'elements', 'console'], description: 'What to focus on (default: summary)' },
+        },
+      },
+    },
+  });
+  tools.push({
+    type: 'function',
+    function: {
+      name: 'browser_click',
+      description: 'Click a button, link, or element in the integrated browser by CSS selector or visible text.',
+      parameters: {
+        type: 'object',
+        properties: {
+          selector: { type: 'string', description: 'CSS selector (e.g. "#submit-btn", "button.save")' },
+          text: { type: 'string', description: 'Fallback visible text of the button/link to click' },
+        },
+      },
+    },
+  });
+  tools.push({
+    type: 'function',
+    function: {
+      name: 'browser_type',
+      description: 'Type or fill text into an input or textarea in the integrated browser.',
+      parameters: {
+        type: 'object',
+        properties: {
+          selector: { type: 'string', description: 'CSS selector of the input/textarea' },
+          text: { type: 'string', description: 'Text value to enter' },
+          press_enter: { type: 'boolean', description: 'If true, submit/press Enter after typing' },
+        },
+        required: ['selector', 'text'],
+      },
+    },
+  });
+  tools.push({
+    type: 'function',
+    function: {
+      name: 'browser_eval',
+      description: 'Execute a JavaScript expression in the live integrated browser page and return its result.',
+      parameters: {
+        type: 'object',
+        properties: {
+          script: { type: 'string', description: 'JavaScript expression to evaluate in the page context' },
+        },
+        required: ['script'],
+      },
+    },
+  });
+  tools.push({
+    type: 'function',
+    function: {
+      name: 'browser_navigate',
+      description: 'Navigate or scroll the integrated browser (back, forward, reload, scroll_down, scroll_up).',
+      parameters: {
+        type: 'object',
+        properties: {
+          action: { type: 'string', enum: ['back', 'forward', 'reload', 'scroll_down', 'scroll_up'] },
+        },
+        required: ['action'],
+      },
+    },
+  });
+  tools.push({
+    type: 'function',
+    function: {
+      name: 'browser_screenshot',
+      description: 'Capture a PNG screenshot of the live integrated browser and save it into the workspace.',
+      parameters: {
+        type: 'object',
+        properties: {
+          filename: { type: 'string', description: 'Optional PNG filename (e.g. "dashboard.png")' },
+        },
+      },
+    },
+  });
   tools.push({
     type: 'function',
     function: {
       name: 'open_url',
-      description: 'Open an http:// or https:// URL (such as a running local dev server http://127.0.0.1:5000) directly in the user default web browser.',
+      description: 'Open an http:// or https:// URL in mx-Cowork\'s integrated browser (or OS default browser if external: true).',
       parameters: {
         type: 'object',
         properties: {
           url: { type: 'string', description: 'Valid http:// or https:// URL to open' },
+          external: { type: 'boolean', description: 'Set true to open in the OS external browser instead of the integrated browser' },
           reason: { type: 'string', description: 'Why opening this URL' },
         },
         required: ['url'],
@@ -528,11 +635,11 @@ function buildNativeTools(toolsCfg, resolvedExecTarget = 'container') {
     type: 'function',
     function: {
       name: 'open_in_sidebar',
-      description: 'Open a workspace file/spreadsheet or built-in panel (files, graph, tasks, notes, artifact) directly inside the mx-Cowork right sidebar.',
+      description: 'Open a workspace file/spreadsheet or built-in panel (browser, files, graph, tasks, notes, artifact) directly inside the mx-Cowork right sidebar.',
       parameters: {
         type: 'object',
         properties: {
-          panel: { type: 'string', enum: ['files', 'graph', 'tasks', 'notes', 'artifact'], description: 'Sidebar panel to open' },
+          panel: { type: 'string', enum: ['browser', 'files', 'graph', 'tasks', 'notes', 'artifact'], description: 'Sidebar panel to open' },
           path: { type: 'string', description: 'Optional relative file/spreadsheet path to open in the editor/Data Desk when panel is "files"' },
         },
         required: ['panel'],
@@ -559,7 +666,7 @@ function buildNativeTools(toolsCfg, resolvedExecTarget = 'container') {
   return tools;
 }
 
-async function executeReadOnlyTool(tc, { workspace, unmask = (s) => s, onEvent, onUiAction }) {
+async function executeReadOnlyTool(tc, { workspace, unmask = (s) => s, onEvent, onUiAction, onBrowserAction }) {
   const name = String(tc?.name || '').toLowerCase();
   const rawArgs = tc?.args && typeof tc.args === 'object' ? tc.args : {};
   const args = maskDeep(rawArgs, unmask);
@@ -576,6 +683,13 @@ async function executeReadOnlyTool(tc, { workspace, unmask = (s) => s, onEvent, 
     open_url: 'Open Browser',
     open_in_sidebar: 'Open Sidebar',
     create_task: 'Create Task',
+    browser_open: 'Browser Open',
+    browser_read: 'Browser Read',
+    browser_click: 'Browser Click',
+    browser_type: 'Browser Type',
+    browser_eval: 'Browser Eval',
+    browser_navigate: 'Browser Navigate',
+    browser_screenshot: 'Browser Screenshot',
   };
   const taskTitle = args.path || args.url || args.title || args.panel || args.query || args.focus || args.server_id || labelMap[name] || name;
   onEvent?.('worker_start', {
@@ -628,11 +742,56 @@ async function executeReadOnlyTool(tc, { workspace, unmask = (s) => s, onEvent, 
     } else if (name === 'open_url') {
       const u = String(args.url || '').trim();
       if (!/^https?:\/\/[^\s]+$/i.test(u)) throw new Error(`Invalid URL (must start with http:// or https://): ${u}`);
-      if (typeof onUiAction === 'function') await onUiAction('open_url', { url: u });
-      onEvent?.('ui_action', { action: 'open_url', url: u });
-      out = `✓ Opened ${u} in the user's web browser.`;
+      const res = typeof onUiAction === 'function' ? await onUiAction('open_url', { url: u, external: Boolean(args.external) }) : null;
+      onEvent?.('ui_action', { action: 'open_url', url: u, external: Boolean(args.external) });
+      out = args.external
+        ? `✓ Opened ${u} in the OS external browser.`
+        : (res && res.ok === false
+          ? `✗ Failed to open ${u} in integrated browser: ${res.error || 'unknown error'}`
+          : `✓ Opened ${u} in mx-Cowork's integrated live browser${res?.title ? ` (title: "${res.title}")` : ''}.`);
+    } else if (name === 'browser_open') {
+      const u = String(args.url || '').trim();
+      if (!/^https?:\/\/[^\s]+$/i.test(u)) throw new Error(`Invalid URL (must start with http:// or https://): ${u}`);
+      if (typeof onBrowserAction !== 'function') throw new Error('Integrated browser bridge is not available');
+      const r = await onBrowserAction('open', { url: u });
+      if (!r?.ok) throw new Error(r?.error || `Failed to load ${u}`);
+      out = `✓ Opened ${r.url || u} in mx-Cowork's integrated live browser.\nTitle: ${r.title || '(untitled)'}${r.note ? `\nNote: ${r.note}` : ''}`;
+    } else if (name === 'browser_read') {
+      if (typeof onBrowserAction !== 'function') throw new Error('Integrated browser bridge is not available');
+      const r = await onBrowserAction('read', { mode: args.mode || 'summary' });
+      if (!r?.ok) throw new Error(r?.error || 'Failed to read browser page');
+      const els = Array.isArray(r.interactive) ? r.interactive.slice(0, 30).map((e) => `  - <${e.tag}> ${e.selector}${e.label ? ` "${e.label}"` : ''}${e.href ? ` -> ${e.href}` : ''}`).join('\n') : '';
+      const errs = Array.isArray(r.consoleErrors) && r.consoleErrors.length
+        ? `\nConsole errors (${r.consoleErrors.length}):\n` + r.consoleErrors.map((e) => `  [${e.level}] ${e.message}`).join('\n')
+        : '';
+      out = `[Browser Page: ${r.title || '(untitled)'} | ${r.url}]\nVisible text:\n${String(r.text || '').slice(0, 4000)}${els ? `\n\nInteractive elements:\n${els}` : ''}${errs}`;
+    } else if (name === 'browser_click') {
+      if (typeof onBrowserAction !== 'function') throw new Error('Integrated browser bridge is not available');
+      const r = await onBrowserAction('click', { selector: args.selector || '', text: args.text || '' });
+      if (!r?.ok) throw new Error(r?.error || 'Click failed');
+      out = `✓ Clicked "${r.clicked || args.selector || args.text}" · Current URL: ${r.url} (title: "${r.title || ''}")`;
+    } else if (name === 'browser_type') {
+      if (typeof onBrowserAction !== 'function') throw new Error('Integrated browser bridge is not available');
+      const r = await onBrowserAction('type', { selector: args.selector || '', text: args.text ?? '', press_enter: Boolean(args.press_enter) });
+      if (!r?.ok) throw new Error(r?.error || 'Type failed');
+      out = `✓ Typed into ${args.selector} · Current URL: ${r.url}`;
+    } else if (name === 'browser_eval') {
+      if (typeof onBrowserAction !== 'function') throw new Error('Integrated browser bridge is not available');
+      const r = await onBrowserAction('eval', { script: args.script || '' });
+      if (!r?.ok) throw new Error(r?.error || 'Eval failed');
+      out = `[browser_eval result on ${r.url}]\n${typeof r.result === 'string' ? r.result : JSON.stringify(r.result, null, 2)}`.slice(0, 5000);
+    } else if (name === 'browser_navigate') {
+      if (typeof onBrowserAction !== 'function') throw new Error('Integrated browser bridge is not available');
+      const r = await onBrowserAction('navigate', { action: args.action || 'reload' });
+      if (!r?.ok) throw new Error(r?.error || 'Navigate failed');
+      out = `✓ Browser ${r.action} · URL: ${r.url} (title: "${r.title || ''}")`;
+    } else if (name === 'browser_screenshot') {
+      if (typeof onBrowserAction !== 'function') throw new Error('Integrated browser bridge is not available');
+      const r = await onBrowserAction('screenshot', { filename: args.filename || '' });
+      if (!r?.ok) throw new Error(r?.error || 'Screenshot failed');
+      out = `✓ Saved browser screenshot to ${r.relPath || r.path} (URL: ${r.url})`;
     } else if (name === 'open_in_sidebar') {
-      const panel = ['files', 'graph', 'tasks', 'notes', 'artifact'].includes(args.panel) ? args.panel : 'files';
+      const panel = ['browser', 'files', 'graph', 'tasks', 'notes', 'artifact'].includes(args.panel) ? args.panel : 'files';
       const relPath = args.path ? String(args.path).trim() : '';
       if (typeof onUiAction === 'function') await onUiAction('open_in_sidebar', { panel, path: relPath });
       onEvent?.('ui_action', { action: 'open_in_sidebar', panel, path: relPath });
@@ -772,6 +931,7 @@ async function runAgenticToolLoop({
   onEvent,
   onContainerOutput,
   onUiAction,
+  onBrowserAction,
   maxRounds = 48,
 }) {
   const cfg = storage.getSettings();
@@ -884,7 +1044,7 @@ async function runAgenticToolLoop({
 
       try {
         if (READ_ONLY_TOOL_NAMES.has(name)) {
-          toolResultText = await executeReadOnlyTool(tc, { workspace, unmask, onEvent, onUiAction });
+          toolResultText = await executeReadOnlyTool(tc, { workspace, unmask, onEvent, onUiAction, onBrowserAction });
           if (/^Tool error \(/i.test(toolResultText)) didFail = true;
         } else if (['write_file', 'edit_file', 'file_action', 'create_office_doc', 'fill_docx_template'].includes(name) && toolsCfg.osFiles) {
           const tmp = { fileActions: [], tableEdits: [], codeRuns: [], savedNotes: [], savedTasks: [] };
@@ -1402,7 +1562,9 @@ function buildSystemPrompt({
         ? '- Execute: run_code (one-shot), start_server / list_servers / read_server_logs / stop_server (background servers)'
         : '- Execute: run_code (isolated container at /workspace)') : '',
       toolsCfg.notes ? '- Memory: save_memory' : '',
-      '- App & OS Integration: open_url (launch http/https URLs directly in the browser), open_in_sidebar (open any file/spreadsheet/graph/tasks/artifact pane in the mx-Cowork sidebar), create_task (add tasks to the Project Tasks board)',
+      '- Integrated Live Browser: browser_open (open any http/https URL like http://127.0.0.1:5000 directly inside mx-Cowork\'s integrated browser pane), browser_read (inspect live DOM text, interactive elements & console errors), browser_click, browser_type, browser_eval, browser_navigate (back/forward/reload/scroll), browser_screenshot (capture PNG)',
+      '- App & OS Integration: open_url (opens in integrated browser by default, or OS browser with external:true), open_in_sidebar (open browser/files/graph/tasks/notes/artifact pane), create_task (add tasks to Project Tasks board)',
+      '- IMPORTANT: Whenever the user asks to open, preview, run, or test a web app/URL in the browser (or integrated browser), CALL browser_open(url) directly — NEVER tell the user to copy-paste the URL manually!',
       'CRITICAL: Never duplicate native tool calls as fenced ```file-actions, ```code-run, or ```table-edits JSON blocks in Markdown.',
     ].filter(Boolean).join('\n');
   } else {
@@ -1764,6 +1926,7 @@ async function runCoworkTurn({
   onEvent,
   onContainerOutput,
   onUiAction,
+  onBrowserAction,
 }) {
   const cfg = storage.getSettings();
   const toolsCfg = resolveEnabledTools(cfg, toolOverrides);
@@ -2007,6 +2170,7 @@ async function runCoworkTurn({
         onEvent,
         onContainerOutput,
         onUiAction,
+  onBrowserAction,
       });
       res = loopOut.res;
       activeMsgs = loopOut.finalMessages;
@@ -2353,6 +2517,7 @@ Rules:
       onEvent,
       onContainerOutput,
       onUiAction,
+  onBrowserAction,
       maxRounds: isPacific ? 96 : 48,
     });
     finalRes = loopOut.res;

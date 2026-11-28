@@ -158,7 +158,7 @@
         <span class="upd-dot" id="updDot" hidden></span>
         <svg><use href="#i-download"/></svg>
         <span id="updBtnLabel">Updates</span>
-        <span class="upd-ver" id="appVersionBadge">v1.9.0</span>
+        <span class="upd-ver" id="appVersionBadge">v2.0.0</span>
       </button>
       <div class="user-row">
         <button class="user-chip" id="openSettingsBtn" title="Endpoint, providers &amp; account settings">
@@ -190,6 +190,7 @@
         <span class="mapping-pill" id="graphMappingPill" hidden><span class="mini-spin"></span><span id="graphMappingTxt">Mapping…</span></span>
       </div>
       <div class="top-actions">
+        <button class="ghost-btn" data-panel="browser" title="Integrated Live Browser (with AI Browser Tools)"><svg><use href="#i-globe"/></svg><span>Browser</span></button>
         <button class="ghost-btn" data-panel="artifact" title="Live Artifact Preview Canvas (HTML, SVG, React, Mermaid)"><svg><use href="#i-code"/></svg><span>Artifact</span></button>
         <button class="ghost-btn" data-panel="files" title="Navigate OS folders, find &amp; edit local files"><svg><use href="#i-folder"/></svg><span>Files</span></button>
         <button class="ghost-btn" data-panel="graph" title="Interactive Project Knowledge Graph"><svg><use href="#i-graph"/></svg><span>Graph</span></button>
@@ -327,6 +328,37 @@
     </header>
 
     <div class="panel-body">
+      <!-- Integrated Live Browser Pane (Electron <webview> + AI Browser Tools) -->
+      <section class="pane" data-pane="browser" id="browserPane">
+        <div class="browser-bar">
+          <div class="browser-nav-btns">
+            <button type="button" class="icon-btn sm" id="browserBackBtn" title="Back">←</button>
+            <button type="button" class="icon-btn sm" id="browserFwdBtn" title="Forward">→</button>
+            <button type="button" class="icon-btn sm" id="browserReloadBtn" title="Reload"><svg><use href="#i-refresh"/></svg></button>
+          </div>
+          <form class="browser-url-form" id="browserUrlForm">
+            <input type="text" id="browserUrlInput" class="browser-url-input" placeholder="http://127.0.0.1:5000 or https://..." autocomplete="off" spellcheck="false" />
+            <button type="submit" class="btn tiny primary" id="browserGoBtn">Go</button>
+          </form>
+          <div class="browser-act-btns">
+            <button type="button" class="icon-btn sm" id="browserShotBtn" title="Capture Screenshot"><svg><use href="#i-download"/></svg></button>
+            <button type="button" class="icon-btn sm" id="browserDevtoolsBtn" title="Toggle DevTools"><svg><use href="#i-code"/></svg></button>
+            <button type="button" class="icon-btn sm" id="browserOpenExtBtn" title="Open in OS Browser"><svg><use href="#i-external"/></svg></button>
+          </div>
+        </div>
+        <div class="browser-stage" id="browserStage">
+          <div class="browser-empty" id="browserEmpty">
+            <div class="browser-empty-title">Integrated Live Browser</div>
+            <div class="browser-empty-sub">Enter a URL above (e.g. <code>http://127.0.0.1:5000</code>) or ask Copilot to open, test, click, or inspect any live web app here.</div>
+          </div>
+          <webview id="browserWebview" class="browser-webview" partition="persist:mxcowork-browser" allowpopups hidden></webview>
+        </div>
+        <div class="browser-status-bar" id="browserStatusBar">
+          <span id="browserStatusText">Ready</span>
+          <span id="browserConsoleCount" class="browser-console-badge" hidden>0 errors</span>
+        </div>
+      </section>
+
       <!-- Live Artifact Display Canvas (identical to mx-GPT webapp) -->
       <section class="pane" data-pane="artifact">
         <div class="art-panel-bar" id="artPanelBar">

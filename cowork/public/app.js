@@ -629,6 +629,7 @@ async function toggleTheme() {
 
 // ---- Right Slide-Out Panel (identical to mx-GPT webapp)
 const PANEL_META = {
+  browser: { title: 'Browser', icon: '#i-globe' },
   artifact: { title: 'Artifact', icon: '#i-code' },
   files: { title: 'OS Files & Editor', icon: '#i-folder' },
   graph: { title: 'Project Knowledge Graph', icon: '#i-graph' },
@@ -788,7 +789,7 @@ async function boot() {
   S.projects = projData?.projects || [];
   S.activeProject = projData?.activeProject || null;
 
-  $('#appVersionBadge').textContent = `v${info.version || '1.9.0'}`;
+  $('#appVersionBadge').textContent = `v${info.version || '2.0.0'}`;
   applyThemeUI(S.settings.theme || 'light');
   setMode(S.settings.defaultMode || 'copilot');
   setThink(S.settings.think || 'low');
@@ -5972,3 +5973,316 @@ projZoneDrop.addEventListener('drop', async (e) => {
 });
 
 boot().catch((e) => toast(`Startup error: ${e.message}`, 5000));
+
+/* ============================================================================
+ * Integrated Live Browser Pane + AI Browser Tools Bridge (v2.0.0)
+ * ============================================================================ */
+(() => {
+  const wv = document.getElementById('browserWebview');
+  const emptyEl = document.getElementById('browserEmpty');
+  const urlForm = document.getElementById('browserUrlForm');
+  const urlInput = document.getElementById('browserUrlInput');
+  const backBtn = document.getElementById('browserBackBtn');
+  const fwdBtn = document.getElementById('browserFwdBtn');
+  const reloadBtn = document.getElementById('browserReloadBtn');
+  const shotBtn = document.getElementById('browserShotBtn');
+  const devtoolsBtn = document.getElementById('browserDevtoolsBtn');
+  const openExtBtn = document.getElementById('browserOpenExtBtn');
+  const statusEl = document.getElementById('browserStatusText');
+  const consoleBadge = document.getElementById('browserConsoleCount');
+
+  if (!wv) return;
+
+  const browserState = {
+    url: '',
+    title: '',
+    loading: false,
+    consoleErrors: [],
+    ready: false,
+  };
+
+  function normalizeUrl(raw) {
+    let u = String(raw || '').trim();
+    if (!u) return '';
+    if (!/^[a-zA-Z][a-zA-Z0-9+.-]*:\/\//.test(u)) {
+      if (/^(localhost|127\.0\.0\.1|0\.0\.0\.0|\[::1\])(:\d+)?(\/|$)/i.test(u)) {
+        u = 'http://' + u;
+      } else {
+        u = 'https://' + u;
+      }
+    }
+    return u;
+  }
+
+  function updateConsoleBadge() {
+    if (!consoleBadge) return;
+    const n = browserState.consoleErrors.length;
+    consoleBadge.hidden = n === 0;
+    consoleBadge.textContent = `${n} error${n === 1 ? '' : 's'}`;
+  }
+
+  function setStatus(txt) {
+    if (statusEl) statusEl.textContent = txt;
+  }
+
+  function ensureWebviewVisible() {
+    if (emptyEl) emptyEl.hidden = true;
+    wv.hidden = false;
+  }
+
+  function navigateTo(rawUrl) {
+    const u = normalizeUrl(rawUrl);
+    if (!u) return Promise.resolve({ ok: false, error: 'Empty URL' });
+    openPanel('browser', false);
+    ensureWebviewVisible();
+    if (urlInput) urlInput.value = u;
+    browserState.url = u;
+    browserState.consoleErrors = [];
+    updateConsoleBadge();
+    setStatus(`Loading ${u}…`);
+
+    return new Promise((resolve) => {
+      let settled = false;
+      const done = (res) => {
+        if (settled) return;
+        settled = true;
+        clearTimeout(timer);
+        wv.removeEventListener('did-finish-load', onFinish);
+        wv.removeEventListener('did-fail-load', onFail);
+        resolve(res);
+      };
+      const onFinish = () => {
+        browserState.ready = true;
+        browserState.loading = false;
+        try { browserState.url = wv.getURL() || u; } catch {}
+        try { browserState.title = wv.getTitle() || ''; } catch {}
+        if (urlInput) urlInput.value = browserState.url;
+        setStatus(browserState.title ? `${browserState.title} · ${browserState.url}` : browserState.url);
+        done({ ok: true, url: browserState.url, title: browserState.title });
+      };
+      const onFail = (e) => {
+        if (e.errorCode === -3) return; // ERR_ABORTED on redirect
+        browserState.loading = false;
+        setStatus(`Failed (${e.errorCode}): ${e.errorDescription || u}`);
+        done({ ok: false, url: u, error: `${e.errorDescription || 'Load failed'} (${e.errorCode})` });
+      };
+      const timer = setTimeout(() => {
+        try { browserState.url = wv.getURL() || u; } catch {}
+        try { browserState.title = wv.getTitle() || ''; } catch {}
+        setStatus(browserState.url);
+        done({ ok: true, url: browserState.url, title: browserState.title, note: 'Loaded (timeout reached)' });
+      }, 12000);
+
+      wv.addEventListener('did-finish-load', onFinish);
+      wv.addEventListener('did-fail-load', onFail);
+      try {
+        if (wv.getAttribute('src')) {
+          wv.loadURL(u);
+        } else {
+          wv.setAttribute('src', u);
+        }
+      } catch {
+        wv.setAttribute('src', u);
+      }
+    });
+  }
+
+  wv.addEventListener('did-start-loading', () => {
+    browserState.loading = true;
+    setStatus('Loading…');
+  });
+  wv.addEventListener('did-stop-loading', () => {
+    browserState.loading = false;
+    browserState.ready = true;
+    try { browserState.url = wv.getURL() || browserState.url; } catch {}
+    try { browserState.title = wv.getTitle() || browserState.title; } catch {}
+    if (urlInput && browserState.url) urlInput.value = browserState.url;
+    setStatus(browserState.title ? `${browserState.title} · ${browserState.url}` : (browserState.url || 'Ready'));
+  });
+  wv.addEventListener('did-navigate', (e) => {
+    if (e.url) {
+      browserState.url = e.url;
+      if (urlInput) urlInput.value = e.url;
+    }
+  });
+  wv.addEventListener('did-navigate-in-page', (e) => {
+    if (e.url) {
+      browserState.url = e.url;
+      if (urlInput) urlInput.value = e.url;
+    }
+  });
+  wv.addEventListener('page-title-updated', (e) => {
+    if (e.title) {
+      browserState.title = e.title;
+      setStatus(`${e.title} · ${browserState.url}`);
+    }
+  });
+  wv.addEventListener('console-message', (e) => {
+    if (e.level >= 2) {
+      browserState.consoleErrors.push({
+        level: e.level === 3 ? 'error' : 'warn',
+        message: String(e.message || '').slice(0, 400),
+        line: e.line,
+      });
+      if (browserState.consoleErrors.length > 30) browserState.consoleErrors.shift();
+      updateConsoleBadge();
+    }
+  });
+
+  if (urlForm) {
+    urlForm.addEventListener('submit', (e) => {
+      e.preventDefault();
+      if (urlInput?.value) navigateTo(urlInput.value);
+    });
+  }
+  if (backBtn) backBtn.addEventListener('click', () => { try { if (wv.canGoBack()) wv.goBack(); } catch {} });
+  if (fwdBtn) fwdBtn.addEventListener('click', () => { try { if (wv.canGoForward()) wv.goForward(); } catch {} });
+  if (reloadBtn) reloadBtn.addEventListener('click', () => { try { wv.reload(); } catch {} });
+  if (devtoolsBtn) {
+    devtoolsBtn.addEventListener('click', () => {
+      try {
+        if (wv.isDevToolsOpened()) wv.closeDevTools();
+        else wv.openDevTools();
+      } catch {}
+    });
+  }
+  if (openExtBtn) {
+    openExtBtn.addEventListener('click', () => {
+      const u = browserState.url || urlInput?.value;
+      if (u && window.cowork?.openExternal) window.cowork.openExternal(normalizeUrl(u));
+    });
+  }
+
+  async function captureBrowserScreenshot(filename) {
+    if (wv.hidden || !browserState.url) return { ok: false, error: 'No page loaded in integrated browser' };
+    try {
+      const img = await wv.capturePage();
+      const dataUrl = img.toDataURL();
+      const saved = await window.cowork.saveBrowserScreenshot(dataUrl, filename || `browser-${Date.now()}.png`);
+      return { ...saved, url: browserState.url, title: browserState.title };
+    } catch (e) {
+      return { ok: false, error: e.message || String(e) };
+    }
+  }
+
+  if (shotBtn) {
+    shotBtn.addEventListener('click', async () => {
+      const r = await captureBrowserScreenshot();
+      if (r.ok) toast(`Screenshot saved: ${r.relPath || r.path}`);
+      else toast(`Screenshot failed: ${r.error || 'unknown error'}`);
+    });
+  }
+
+  async function runBrowserCommand(cmd, args = {}) {
+    if (cmd === 'open') {
+      return await navigateTo(args.url);
+    }
+    if (wv.hidden || !browserState.url) {
+      return { ok: false, error: 'Integrated browser has no page open yet. Call browser_open(url) first.' };
+    }
+    if (cmd === 'navigate') {
+      const act = String(args.action || 'reload').toLowerCase();
+      if (act === 'back' && wv.canGoBack()) wv.goBack();
+      else if (act === 'forward' && wv.canGoForward()) wv.goForward();
+      else if (act === 'reload') wv.reload();
+      else if (act === 'scroll_down') await wv.executeJavaScript('window.scrollBy(0, Math.round(window.innerHeight * 0.8)); true;');
+      else if (act === 'scroll_up') await wv.executeJavaScript('window.scrollBy(0, -Math.round(window.innerHeight * 0.8)); true;');
+      await new Promise((r) => setTimeout(r, 350));
+      return { ok: true, action: act, url: wv.getURL(), title: wv.getTitle() };
+    }
+    if (cmd === 'screenshot') {
+      return await captureBrowserScreenshot(args.filename);
+    }
+    if (cmd === 'read') {
+      const mode = String(args.mode || 'summary');
+      const data = await wv.executeJavaScript(`(() => {
+        const text = (document.body ? document.body.innerText : '').replace(/\\s+/g, ' ').trim().slice(0, 6000);
+        const els = [];
+        const nodes = document.querySelectorAll('a[href], button, input, select, textarea, [role="button"]');
+        for (let i = 0; i < nodes.length && els.length < 40; i++) {
+          const el = nodes[i];
+          const rect = el.getBoundingClientRect();
+          if (rect.width === 0 && rect.height === 0) continue;
+          const tag = el.tagName.toLowerCase();
+          const id = el.id ? '#' + el.id : '';
+          const name = el.getAttribute('name') ? '[name="' + el.getAttribute('name') + '"]' : '';
+          const label = (el.innerText || el.value || el.getAttribute('aria-label') || el.getAttribute('placeholder') || '').trim().slice(0, 80);
+          els.push({
+            tag,
+            selector: id || (name ? tag + name : tag),
+            type: el.getAttribute('type') || undefined,
+            label,
+            href: tag === 'a' ? el.getAttribute('href') : undefined,
+          });
+        }
+        return { url: location.href, title: document.title, text, interactive: els };
+      })()`);
+      return {
+        ok: true,
+        mode,
+        ...data,
+        consoleErrors: browserState.consoleErrors.slice(-15),
+      };
+    }
+    if (cmd === 'click') {
+      const sel = JSON.stringify(String(args.selector || ''));
+      const txt = JSON.stringify(String(args.text || '').toLowerCase());
+      const r = await wv.executeJavaScript(`(() => {
+        let el = null;
+        const sel = ${sel};
+        const txt = ${txt};
+        if (sel) { try { el = document.querySelector(sel); } catch {} }
+        if (!el && txt) {
+          const candidates = [...document.querySelectorAll('button, a, [role="button"], input[type="submit"], input[type="button"]')];
+          el = candidates.find(n => ((n.innerText || n.value || n.getAttribute('aria-label') || '').toLowerCase().includes(txt)));
+        }
+        if (!el) return { ok: false, error: 'Element not found' };
+        el.scrollIntoView({ block: 'center', behavior: 'instant' });
+        el.click();
+        return { ok: true, clicked: (el.innerText || el.value || el.tagName).trim().slice(0, 80) };
+      })()`);
+      await new Promise((res) => setTimeout(res, 400));
+      return { ...r, url: wv.getURL(), title: wv.getTitle() };
+    }
+    if (cmd === 'type') {
+      const sel = JSON.stringify(String(args.selector || ''));
+      const val = JSON.stringify(String(args.text ?? ''));
+      const pressEnter = Boolean(args.press_enter);
+      const r = await wv.executeJavaScript(`(() => {
+        const el = document.querySelector(${sel});
+        if (!el) return { ok: false, error: 'Input not found for selector: ' + ${sel} };
+        el.focus();
+        const proto = el.tagName === 'TEXTAREA' ? HTMLTextAreaElement.prototype : HTMLInputElement.prototype;
+        const setter = Object.getOwnPropertyDescriptor(proto, 'value')?.set;
+        if (setter) setter.call(el, ${val});
+        else el.value = ${val};
+        el.dispatchEvent(new Event('input', { bubbles: true }));
+        el.dispatchEvent(new Event('change', { bubbles: true }));
+        if (${pressEnter}) {
+          el.dispatchEvent(new KeyboardEvent('keydown', { key: 'Enter', code: 'Enter', bubbles: true }));
+          if (el.form) el.form.requestSubmit ? el.form.requestSubmit() : el.form.submit();
+        }
+        return { ok: true, value: String(el.value).slice(0, 120) };
+      })()`);
+      await new Promise((res) => setTimeout(res, 300));
+      return { ...r, url: wv.getURL(), title: wv.getTitle() };
+    }
+    if (cmd === 'eval') {
+      const script = String(args.script || '');
+      const result = await wv.executeJavaScript(`(async () => { return (${script}); })()`);
+      return { ok: true, result, url: wv.getURL(), title: wv.getTitle() };
+    }
+    return { ok: false, error: `Unknown browser command: ${cmd}` };
+  }
+
+  if (window.cowork?.onBrowserCmd) {
+    window.cowork.onBrowserCmd(async ({ reqId, cmd, args }) => {
+      try {
+        const res = await runBrowserCommand(cmd, args);
+        window.cowork.sendBrowserRes({ reqId, ...res });
+      } catch (e) {
+        window.cowork.sendBrowserRes({ reqId, ok: false, error: e.message || String(e) });
+      }
+    });
+  }
+})();
